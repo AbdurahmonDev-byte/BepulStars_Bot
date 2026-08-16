@@ -1,0 +1,15 @@
+[Unit]
+Description=ReferalBot Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/bot
+ExecStart=/opt/bot/venv/bin/python /opt/bot/bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
