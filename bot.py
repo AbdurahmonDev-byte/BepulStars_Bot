@@ -109,6 +109,12 @@ class AddChannelStates(StatesGroup):
     invite_link = State()
 
 
+class AddContactStates(StatesGroup):
+    """Aloqa kontaktini qo'shish."""
+    label = State()
+    username = State()
+
+
 # ============================================================
 #  MA'LUMOTLAR BAZASI (aiosqlite)
 # ============================================================
@@ -161,6 +167,13 @@ async def db_init() -> None:
                 invite_link TEXT NOT NULL
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS contacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT NOT NULL,
+                username TEXT NOT NULL
+            )
+        """)
 
         # Eski DB bo'lsa, yangi ustunlarni qo'shamiz (migratsiya)
         for alter_sql in (
@@ -194,6 +207,18 @@ async def db_init() -> None:
             INSERT OR IGNORE INTO shop_items (category, name, price_stars, price_uzs, description)
             SELECT 'premium', '💎 Premium 1 oy', 200, 30000, 'Telegram Premium 1 oy'
             WHERE NOT EXISTS (SELECT 1 FROM shop_items WHERE category = 'premium')
+        """)
+
+        # Default kontaktlar (faqat birinchi marta)
+        await db.execute("""
+            INSERT OR IGNORE INTO contacts (label, username)
+            SELECT '👨‍💻 Dasturchi', 'abdurahmondasturchi'
+            WHERE NOT EXISTS (SELECT 1 FROM contacts)
+        """)
+        await db.execute("""
+            INSERT OR IGNORE INTO contacts (label, username)
+            SELECT '👑 Bot egasi', 'Kottabolladan'
+            WHERE NOT EXISTS (SELECT 1 FROM contacts WHERE username = 'Kottabolladan')
         """)
 
         await db.commit()
@@ -380,6 +405,31 @@ async def delete_channel(channel_id_row: int) -> None:
         await db.commit()
 
 
+# ---------- Aloqa kontaktlari ----------
+
+async def get_contacts() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM contacts ORDER BY id")
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def add_contact(label: str, username: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO contacts (label, username) VALUES (?, ?)",
+            (label, username),
+        )
+        await db.commit()
+
+
+async def delete_contact(row_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM contacts WHERE id = ?", (row_id,))
+        await db.commit()
+
+
 # ============================================================
 #  YORDAMCHI FUNKSIYALAR
 # ============================================================
@@ -470,7 +520,7 @@ def main_menu_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     kb = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="👤 Profil"), KeyboardButton(text="🛍️ Do'kon")],
-            [KeyboardButton(text="🎰 Jekpot"), KeyboardButton(text="📞 Yordam")],
+            [KeyboardButton(text="🎰 Jekpot"), KeyboardButton(text="📞 Aloqa")],
             [KeyboardButton(text="🔗 Referal"), KeyboardButton(text="💸 Yulduz yechish")],
         ],
         resize_keyboard=True,
@@ -875,17 +925,26 @@ async def show_jackpot(answer_func, telegram_id: int) -> None:
     await answer_func(text, reply_markup=kb.as_markup())
 
 
-@router.message(F.text == "📞 Yordam")
-async def help_handler(message: Message) -> None:
-    await message.answer(
-        "📞 <b>Yordam</b>\n\n"
-        "👥 Do'stlaringizni taklif qiling va bonus yulduzlar oling.\n"
-        "🛍️ Do'kondan gift, yulduz va premium sotib oling.\n"
-        "🎰 Yulduzlaringiz bilan jekpot biletlarini xarid qiling va g'olib bo'ling!\n\n"
-        "💬 Savollaringiz bo'lsa, bog'laning:\n"
-        "👨‍💻 Dasturchi: @abdurahmondasturchi\n"
-        "👑 Bot egasi: @Kottabolladan",
+@router.message(F.text == "📞 Aloqa")
+async def contacts_handler(message: Message) -> None:
+    contacts = await get_contacts()
+
+    kb = InlineKeyboardBuilder()
+    for c in contacts:
+        kb.button(text=f"📩 {c['label']}", url=f"https://t.me/{c['username'].lstrip('@')}")
+    kb.adjust(1)
+
+    text = (
+        "📞 <b>Aloqa</b>\n\n"
+        "Savollaringiz bo'lsa, quyidagi kontaktlardan biriga murojaat qiling:\n\n"
     )
+    if contacts:
+        for c in contacts:
+            text += f"{c['label']} — <b>@{c['username'].lstrip('@')}</b>\n"
+    else:
+        text += "Kontaktlar hozircha yo'q.\n"
+
+    await message.answer(text, reply_markup=kb.as_markup())
 
 
 # ============================================================
@@ -1115,6 +1174,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     kb.button(text="🎯 Jekpot o'ynatish", callback_data="admin:jackpot")
     kb.button(text="📢 Rassilka", callback_data="admin:broadcast")
     kb.button(text="🔗 Kanallar", callback_data="admin:channels")
+    kb.button(text="📞 Aloqa boshqaruvi", callback_data="admin:contacts")
     kb.adjust(2)
     return kb.as_markup()
 
@@ -1597,6 +1657,76 @@ async def channel_link_received(message: Message, state: FSMContext) -> None:
     await add_channel(data["channel_id"], message.text.strip())
     await state.clear()
     await message.answer("✅ <b>Kanal qo'shildi!</b>\nEndi foydalanuvchilar shu kanalga a'zo bo'lmaguncha botdan foydalana olmaydi.", reply_markup=admin_keyboard())
+
+
+# ---------- Aloqa kontaktlari (admin) ----------
+
+@router.callback_query(F.data == "admin:contacts")
+async def admin_contacts(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    contacts = await get_contacts()
+
+    text = "📞 <b>Aloqa boshqaruvi</b>\n\n"
+    if contacts:
+        for i, c in enumerate(contacts, start=1):
+            text += f"{i}. {c['label']} — @{c['username']}\n"
+    else:
+        text += "Hozircha kontaktlar yo'q.\n"
+
+    kb = InlineKeyboardBuilder()
+    for c in contacts:
+        kb.button(text=f"🗑️ {c['label']}", callback_data=f"admin:cdel:{c['id']}")
+    kb.button(text="➕ Kontakt qo'shish", callback_data="admin:contact_add")
+    kb.button(text="🔙 Ortga", callback_data="admin")
+    kb.adjust(1)
+
+    await call.message.edit_text(text, reply_markup=kb.as_markup())
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin:cdel:"))
+async def admin_delete_contact(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    row_id = int(call.data.split(":")[2])
+    await delete_contact(row_id)
+    await call.answer("✅ Kontakt o'chirildi!", show_alert=True)
+    await admin_contacts(call)
+
+
+@router.callback_query(F.data == "admin:contact_add")
+async def admin_add_contact(call: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    await state.set_state(AddContactStates.label)
+    await call.message.edit_text(
+        "📞 <b>Kontakt yorlig'ini yuboring:</b>\n"
+        "(masalan: 🎁 Sponsor, 👨‍💻 Dasturchi)",
+    )
+    await call.answer()
+
+
+@router.message(AddContactStates.label)
+async def contact_label_received(message: Message, state: FSMContext) -> None:
+    await state.update_data(label=message.text.strip())
+    await state.set_state(AddContactStates.username)
+    await message.answer(
+        "📞 <b>Telegram username yuboring:</b>\n"
+        "(masalan: <code>mychannel</code> yoki <code>@mychannel</code>)",
+    )
+
+
+@router.message(AddContactStates.username)
+async def contact_username_received(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    username = message.text.strip().lstrip("@")
+    await add_contact(data["label"], username)
+    await state.clear()
+    await message.answer("✅ <b>Kontakt qo'shildi!</b>", reply_markup=admin_keyboard())
 
 
 # ---------- /cancel va umumiy boshqaruv ----------
