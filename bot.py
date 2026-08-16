@@ -678,18 +678,163 @@ async def withdraw_handler(message: Message) -> None:
         )
         return
 
+    # To'lov turini tanlash
     kb = InlineKeyboardBuilder()
-    kb.button(text="📩 @Kottabolladan", url="https://t.me/Kottabolladan")
+    kb.button(text="🎁 Gift sifatida", callback_data="withdraw:gift")
+    kb.button(text="⭐ Yulduz sifatida", callback_data="withdraw:stars")
+    kb.adjust(1)
 
     await message.answer(
         f"💸 <b>Yulduz yechish</b>\n\n"
         f"Balansingiz: <b>{user['balance_stars']} ⭐</b>\n"
         f"Minimal: <b>{min_withdraw} ⭐</b>\n\n"
-        f"Yulduzlarni yechish uchun bot egasiga murojaat qiling:\n"
-        f"👑 <b>@Kottabolladan</b>\n\n"
-        f"Yulduzlar yechib olinadi va kartangizga/telefoningizga o'tkaziladi.",
+        f"👇 <b>To'lov turini tanlang:</b>",
         reply_markup=kb.as_markup(),
     )
+
+
+async def process_stars_withdrawal(call: CallbackQuery, bot: Bot, amount: int) -> None:
+    """Yulduzlar yechiladi: balansdan ayriladi, egaga o'tkazish uchun avto buyurtma ketadi."""
+    user = await get_user(call.from_user.id)
+    if not user:
+        await call.answer("❌ Xatolik", show_alert=True)
+        return
+
+    if user["balance_stars"] < amount:
+        await call.answer("❌ Balans yetarli emas!", show_alert=True)
+        return
+
+    await deduct_stars(call.from_user.id, amount)
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"💸 <b>YULDUZ YECHISH!</b>\n\n"
+                f"👤 Foydalanuvchi: {call.from_user.first_name} (@{call.from_user.username or '—'})\n"
+                f"🆔 ID: <code>{call.from_user.id}</code>\n"
+                f"💰 Miqdor: <b>{amount} ⭐</b>\n"
+                f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"⚠️ Bot egasi ushbu yulduzlarni foydalanuvchiga o'tkazishi kerak!",
+            )
+        except TelegramForbiddenError:
+            pass
+
+    try:
+        await call.message.edit_text(
+            f"✅ <b>Yulduzlaringiz yechildi!</b>\n\n"
+            f"💰 Miqdor: <b>{amount} ⭐</b>\n\n"
+            f"📤 Yulduzlar bot egasidan hisobingizga o'tkaziladi.\n"
+            f"👑 Ega: <b>@Kottabolladan</b>",
+        )
+    except TelegramBadRequest:
+        await call.message.answer(
+            f"✅ <b>Yulduzlaringiz yechildi!</b>\n\n"
+            f"💰 Miqdor: <b>{amount} ⭐</b>\n\n"
+            f"📤 Yulduzlar bot egasidan hisobingizga o'tkaziladi.\n"
+            f"👑 Ega: <b>@Kottabolladan</b>",
+        )
+    await call.answer("✅ Yechildi!", show_alert=False)
+
+
+@router.callback_query(F.data == "withdraw:stars")
+async def withdraw_stars_callback(call: CallbackQuery, bot: Bot) -> None:
+    user = await get_user(call.from_user.id)
+    if not user:
+        await call.answer("❌ Avval /start ni bosing!", show_alert=True)
+        return
+    settings = await get_settings()
+    if user["balance_stars"] < settings["min_withdraw_stars"]:
+        await call.answer("❌ Minimal chegaraga yetmadingiz!", show_alert=True)
+        return
+    await process_stars_withdrawal(call, bot, user["balance_stars"])
+
+
+@router.callback_query(F.data == "withdraw:gift")
+async def withdraw_gift_callback(call: CallbackQuery) -> None:
+    user = await get_user(call.from_user.id)
+    if not user:
+        await call.answer("❌ Avval /start ni bosing!", show_alert=True)
+        return
+
+    settings = await get_settings()
+    if user["balance_stars"] < settings["min_withdraw_stars"]:
+        await call.answer("❌ Minimal chegaraga yetmadingiz!", show_alert=True)
+        return
+
+    # Balansga yetadigan giftlar (narxi 0 bo'lmagan)
+    gifts = [g for g in await get_shop_items("gift") if 0 < g["price_stars"] <= user["balance_stars"]]
+
+    if not gifts:
+        await call.answer(
+            "Gift uchun yulduzlaringiz yetarli emas. Yulduz sifatida yechib oling!",
+            show_alert=True,
+        )
+        return
+
+    kb = InlineKeyboardBuilder()
+    for g in gifts:
+        kb.button(text=f"{g['name']} — {g['price_stars']} ⭐", callback_data=f"withdraw_gift:{g['id']}")
+    kb.button(text="⭐ Yulduz sifatida yechish", callback_data="withdraw:stars")
+    kb.button(text="🔙 Ortga", callback_data="withdraw:gift")
+    kb.adjust(1)
+
+    await call.message.edit_text(
+        f"🎁 <b>Gift sifatida yechish</b>\n\n"
+        f"Balansingizga yetadigan giftlar:\n"
+        f"(Balans: {user['balance_stars']} ⭐)",
+        reply_markup=kb.as_markup(),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("withdraw_gift:"))
+async def withdraw_gift_confirm(call: CallbackQuery, bot: Bot) -> None:
+    item_id = int(call.data.split(":")[1])
+    user = await get_user(call.from_user.id)
+    item = await get_shop_item(item_id)
+
+    if not user or not item:
+        await call.answer("❌ Xatolik yuz berdi", show_alert=True)
+        return
+
+    if user["balance_stars"] < item["price_stars"]:
+        await call.answer("❌ Balans yetarli emas!", show_alert=True)
+        return
+
+    # Gift yechib olinadi — yulduz ayriladi
+    await deduct_stars(call.from_user.id, item["price_stars"])
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🎁 <b>GIFT YECHIB OLINDI!</b>\n\n"
+                f"👤 Foydalanuvchi: {call.from_user.first_name} (@{call.from_user.username or '—'})\n"
+                f"🆔 ID: <code>{call.from_user.id}</code>\n"
+                f"🎁 Gift: <b>{item['name']}</b>\n"
+                f"💰 Narxi: <b>{item['price_stars']} ⭐</b>\n"
+                f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"⚠️ Giftni foydalanuvchiga o'tkazing (Telegram'da yuborish mumkin)!",
+            )
+        except TelegramForbiddenError:
+            pass
+
+    try:
+        await call.message.edit_text(
+            f"✅ <b>Gift yechib olindi!</b>\n\n"
+            f"🎁 <b>{item['name']}</b>\n"
+            f"💰 {item['price_stars']} ⭐ ayirildi.\n\n"
+            f"Gift sizga Telegram'da yuboriladi. Egasi: @Kottabolladan",
+        )
+    except TelegramBadRequest:
+        await call.message.answer(
+            f"✅ <b>Gift yechib olindi!</b>\n\n"
+            f"🎁 <b>{item['name']}</b>\n"
+            f"💰 {item['price_stars']} ⭐ ayirildi.\n\n"
+            f"Gift sizga Telegram'da yuboriladi. Egasi: @Kottabolladan",
+        )
+    await call.answer("✅ Gift oldingiz!", show_alert=False)
 
 
 @router.message(F.text == "🛍️ Do'kon")
