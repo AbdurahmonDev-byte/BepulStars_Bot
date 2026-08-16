@@ -371,25 +371,16 @@ async def set_daily_box_used(telegram_id: int, date_str: str) -> None:
         await db.commit()
 
 
-def weighted_pick(items: list[dict]) -> dict:
-    """Do'kondan gift tanlash — arzon giftlar yuqori foiz, qimmatlari judayam past foiz."""
-    weights = [1.0 / ((item["price_stars"] + 10) ** 1.5) for item in items]
-    total = sum(weights)
-    r = random.uniform(0, total)
-    cum = 0.0
-    for item, w in zip(items, weights):
-        cum += w
-        if r <= cum:
-            return item
-    return items[-1]
-
-
 async def pick_shop_gifts(category: str, count: int) -> list[dict]:
-    """Do'kondan vaznli (arzon afzal) giftlarni tanlaydi."""
-    items = [i for i in await get_all_shop_items() if i["category"] == category and i["price_stars"] > 0]
+    """Do'kondan eng arzon 2 tasidan bittasini tanlaydi (count marta)."""
+    items = sorted(
+        (i for i in await get_all_shop_items() if i["category"] == category and i["price_stars"] > 0),
+        key=lambda x: x["price_stars"],
+    )
     if not items:
         return []
-    return [weighted_pick(items) for _ in range(count)]
+    cheapest = items[:2]  # eng arzon 2 ta
+    return [random.choice(cheapest) for _ in range(count)]
 
 
 # ---------- Majburiy kanallar ----------
@@ -954,19 +945,19 @@ BOXES = [
         "id": "gift",
         "name": "🎁 Gift box",
         "cost": 50,
-        "desc": "Mukofot: 10–60 ⭐ yoki 2 ta gift",
+        "desc": "Mukofot: 10–60 ⭐ yoki arzon gift",
     },
     {
         "id": "nft",
         "name": "🖼 NFT box",
         "cost": 100,
-        "desc": "Mukofot: 60–120 ⭐, 4 ta gift yoki premium",
+        "desc": "Mukofot: 60–120 ⭐, arzon gift yoki premium",
     },
     {
         "id": "mega",
         "name": "💎 Mega box",
         "cost": 200,
-        "desc": "Mukofot: 120–250 ⭐ yoki premium",
+        "desc": "Mukofot: 120–250 ⭐ yoki arzon gift",
     },
 ]
 
@@ -979,19 +970,19 @@ STAR_RANGES = {
 }
 GIFT_DROP_PROB = {
     "daily": 0.0,   # kunlik box faqat stars beradi
-    "gift": 0.5,    # 50% stars, 50% 2 ta gift
-    "nft": 0.5,     # 50% stars, 50% 4 ta gift
-    "mega": 0.5,    # 50% stars, 50% premium gift
+    "gift": 0.5,    # 50% stars, 50% arzon gift
+    "nft": 0.5,     # 50% stars, 50% arzon gift
+    "mega": 0.5,    # 50% stars, 50% arzon gift
 }
 GIFT_COUNTS = {
-    "gift": 2,
-    "nft": 4,
+    "gift": 1,
+    "nft": 1,
     "mega": 1,
 }
 GIFT_CATEGORY = {
     "gift": "gift",
     "nft": "gift",
-    "mega": "premium",
+    "mega": "gift",
 }
 
 
