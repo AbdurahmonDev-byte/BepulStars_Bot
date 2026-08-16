@@ -2324,6 +2324,7 @@ async def main() -> None:
         logger.info("Webhook server ishga tushdi: %s:%s%s", WEBAPP_HOST, WEBAPP_PORT, WEBHOOK_PATH)
         await asyncio.Event().wait()
     else:
+        await on_startup(bot)          # <-- shu qatorni qo'shing
         await start_web_server()
         await dp.start_polling(bot)
 
