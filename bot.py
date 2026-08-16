@@ -458,7 +458,7 @@ def main_menu_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="👤 Profil"), KeyboardButton(text="🛍️ Do'kon")],
             [KeyboardButton(text="🎰 Jekpot"), KeyboardButton(text="📞 Yordam")],
-            [KeyboardButton(text="🔗 Referal")],
+            [KeyboardButton(text="🔗 Referal"), KeyboardButton(text="💸 Yulduz yechish")],
         ],
         resize_keyboard=True,
     )
@@ -634,6 +634,26 @@ async def referral_handler(message: Message, bot: Bot) -> None:
     )
 
 
+@router.message(F.text == "💸 Yulduz yechish")
+async def withdraw_handler(message: Message) -> None:
+    user = await get_user(message.from_user.id)
+    if not user:
+        await message.answer("❌ Avval /start ni bosing!")
+        return
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📩 @Kottabolladan", url="https://t.me/Kottabolladan")
+
+    await message.answer(
+        f"💸 <b>Yulduz yechish</b>\n\n"
+        f"Balansingiz: <b>{user['balance_stars']} ⭐</b>\n\n"
+        f"Yulduzlarni yechish uchun bot egasiga murojaat qiling:\n"
+        f"👑 <b>@Kottabolladan</b>\n\n"
+        f"Yulduzlar yechib olinadi va kartangizga/telefoningizga o'tkaziladi.",
+        reply_markup=kb.as_markup(),
+    )
+
+
 @router.message(F.text == "🛍️ Do'kon")
 async def shop_handler(message: Message) -> None:
     await message.answer(
@@ -679,9 +699,9 @@ async def help_handler(message: Message) -> None:
         "👥 Do'stlaringizni taklif qiling va bonus yulduzlar oling.\n"
         "🛍️ Do'kondan gift, yulduz va premium sotib oling.\n"
         "🎰 Yulduzlaringiz bilan jekpot biletlarini xarid qiling va g'olib bo'ling!\n\n"
-        "💬 Savollaringiz bo'lsa, admin bilan bog'laning:\n"
-        "👨‍💻 @abdurahmondasturchi\n"
-        "👨‍💻 @Kottabolladan",
+        "💬 Savollaringiz bo'lsa, bog'laning:\n"
+        "👨‍💻 Dasturchi: @abdurahmondasturchi\n"
+        "👑 Bot egasi: @Kottabolladan",
     )
 
 
