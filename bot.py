@@ -679,7 +679,9 @@ async def help_handler(message: Message) -> None:
         "👥 Do'stlaringizni taklif qiling va bonus yulduzlar oling.\n"
         "🛍️ Do'kondan gift, yulduz va premium sotib oling.\n"
         "🎰 Yulduzlaringiz bilan jekpot biletlarini xarid qiling va g'olib bo'ling!\n\n"
-        "Qo'shimcha savollar uchun admin bilan bog'laning.",
+        "💬 Savollaringiz bo'lsa, admin bilan bog'laning:\n"
+        "👨‍💻 @abdurahmondasturchi\n"
+        "👨‍💻 @Kottabolladan",
     )
 
 
