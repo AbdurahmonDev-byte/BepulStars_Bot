@@ -15,3 +15,5 @@ services:
         sync: false
       - key: DB_PATH
         value: bot.db
+      - key: PYTHON_VERSION
+        value: 3.12.6
