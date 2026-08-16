@@ -90,6 +90,7 @@ class SettingsStates(StatesGroup):
     jackpot_cost = State()    # jekpot bilet narxi
     min_withdraw = State()    # yulduz yechish uchun minimal
     pay_card = State()        # to'lov karta raqami
+    reviews_channel = State() # otziv kanali
 
 
 class AddItemStates(StatesGroup):
@@ -147,7 +148,8 @@ async def db_init() -> None:
                 jackpot_ticket_cost INTEGER NOT NULL DEFAULT 10,
                 jackpot_fund INTEGER NOT NULL DEFAULT 0,
                 min_withdraw_stars INTEGER NOT NULL DEFAULT 100,
-                pay_card TEXT NOT NULL DEFAULT '9860180104681937'
+                pay_card TEXT NOT NULL DEFAULT '9860180104681937',
+                reviews_channel TEXT DEFAULT ''
             )
         """)
         await db.execute("""
@@ -205,6 +207,7 @@ async def db_init() -> None:
             "ALTER TABLE shop_items ADD COLUMN price_uzs INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE settings ADD COLUMN pay_card TEXT NOT NULL DEFAULT '9860180104681937'",
             "ALTER TABLE shop_items ADD COLUMN deliver_stars INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE settings ADD COLUMN reviews_channel TEXT DEFAULT ''",
         ):
             try:
                 await db.execute(alter_sql)
@@ -257,7 +260,7 @@ async def get_settings() -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT ref_reward_stars, min_referals_required, jackpot_ticket_cost, jackpot_fund, min_withdraw_stars, pay_card FROM settings WHERE id = 1"
+            "SELECT ref_reward_stars, min_referals_required, jackpot_ticket_cost, jackpot_fund, min_withdraw_stars, pay_card, reviews_channel FROM settings WHERE id = 1"
         )
         row = await cur.fetchone()
         return dict(row) if row else None
@@ -576,7 +579,8 @@ def main_menu_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="👤 Profil"), KeyboardButton(text="🛍️ Do'kon")],
             [KeyboardButton(text="🎰 Jekpot"), KeyboardButton(text="📞 Aloqa")],
-            [KeyboardButton(text="🔗 Referal"), KeyboardButton(text="💸 Yulduz yechish")],
+            [KeyboardButton(text="⭐ Otziv"), KeyboardButton(text="💸 Yulduz yechish")],
+            [KeyboardButton(text="🔗 Referal")],
         ],
         resize_keyboard=True,
     )
@@ -1002,6 +1006,32 @@ async def contacts_handler(message: Message) -> None:
     await message.answer(text, reply_markup=kb.as_markup())
 
 
+def channel_url(value: str) -> str:
+    """Kanal username/havolasini t.me URL'iga aylantiradi."""
+    value = value.strip().lstrip("@")
+    if value.startswith("http://") or value.startswith("https://"):
+        return value
+    return f"https://t.me/{value}"
+
+
+@router.message(F.text == "⭐ Otziv")
+async def reviews_handler(message: Message) -> None:
+    s = await get_settings()
+
+    text = (
+        "⭐ <b>Otziv</b>\n\n"
+        "Bizning kanalda fikringizni qoldiring:\n"
+        "mahsulot sifati, yetkazish tezligi va xizmat haqida.\n\n"
+        "Sizning fikringiz biz uchun juda muhim! 💛"
+    )
+    kb = InlineKeyboardBuilder()
+    if s["reviews_channel"]:
+        kb.button(text="✍️ Otziv qoldirish", url=channel_url(s["reviews_channel"]))
+    kb.adjust(1)
+
+    await message.answer(text, reply_markup=kb.as_markup() if s["reviews_channel"] else None)
+
+
 # ============================================================
 #  DO'KON (SHOP) — INLINE
 # ============================================================
@@ -1140,6 +1170,14 @@ async def buy_item_callback(call: CallbackQuery, bot: Bot) -> None:
     await call.answer("✅ Sotib olindi!", show_alert=False)
 
 
+def format_card(card: str) -> str:
+    """Karta raqamini chiroyli ko'rsatadi. Emoji/yozuv bo'lsa, o'zidek qaytaradi."""
+    digits = card.replace(" ", "")
+    if digits.isdigit():
+        return " ".join(digits[i:i + 4] for i in range(0, len(digits), 4))
+    return card
+
+
 @router.callback_query(F.data.startswith("buy_uzs:"))
 async def buy_item_uzs_callback(call: CallbackQuery) -> None:
     """Har qanday mahsulotni UZS (so'm) bilan sotib olish — karta raqamiga to'lov."""
@@ -1156,8 +1194,7 @@ async def buy_item_uzs_callback(call: CallbackQuery) -> None:
         return
 
     settings = await get_settings()
-    card = settings["pay_card"]
-    card_display = " ".join(card[i:i + 4] for i in range(0, len(card), 4))
+    card_display = format_card(settings["pay_card"])
     label = CATEGORIES.get(item["category"], item["category"])
 
     kb = InlineKeyboardBuilder()
@@ -1191,8 +1228,7 @@ async def uzs_paid_callback(call: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(item_id=item_id)
 
     settings = await get_settings()
-    card = settings["pay_card"]
-    card_display = " ".join(card[i:i + 4] for i in range(0, len(card), 4))
+    card_display = format_card(settings["pay_card"])
 
     await call.message.edit_text(
         f"📸 <b>Chek yuboring</b>\n\n"
@@ -1448,6 +1484,7 @@ def settings_keyboard() -> InlineKeyboardMarkup:
     kb.button(text="🎟️ Jekpot bilet narxi", callback_data="admin:set:jackpot_cost")
     kb.button(text="💸 Yulduz yechish minimumi", callback_data="admin:set:min_withdraw")
     kb.button(text="💳 To'lov kartasi", callback_data="admin:set:pay_card")
+    kb.button(text="⭐ Otziv kanali", callback_data="admin:set:reviews_channel")
     kb.button(text="🔙 Ortga", callback_data="admin")
     kb.adjust(1)
     return kb.as_markup()
@@ -1459,13 +1496,15 @@ async def admin_settings(call: CallbackQuery) -> None:
         await call.answer("❌ Siz admin emassiz!", show_alert=True)
         return
     s = await get_settings()
+    reviews_display = s["reviews_channel"] or "❌ o'rnatilmagan"
     text = (
         f"⚙️ <b>Sozlamalar</b>\n\n"
         f"⭐ Referal mukofoti: <b>{s['ref_reward_stars']} ⭐</b>\n"
         f"👥 Xarid uchun min. referallar: <b>{s['min_referals_required']}</b>\n"
         f"🎟️ Jekpot bilet narxi: <b>{s['jackpot_ticket_cost']} ⭐</b>\n"
         f"💸 Yulduz yechish minimumi: <b>{s['min_withdraw_stars']} ⭐</b>\n"
-        f"💳 To'lov kartasi: <code>{s['pay_card']}</code>\n\n"
+        f"💳 To'lov kartasi: <code>{s['pay_card']}</code>\n"
+        f"⭐ Otziv: {reviews_display}\n\n"
         f"O'zgartirmoqchi bo'lgan qiymatni tanlang:"
     )
     await call.message.edit_text(text, reply_markup=settings_keyboard())
@@ -1564,21 +1603,46 @@ async def min_withdraw_input(message: Message, state: FSMContext) -> None:
 async def set_pay_card(call: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(SettingsStates.pay_card)
     await call.message.edit_text(
-        "💳 <b>Yangi to'lov karta raqamini yozing:</b>\n"
-        "(faqat raqamlar, masalan: <code>9860180104681937</code>)",
+        "💳 <b>Yangi to'lov ma'lumotlarini yozing:</b>\n"
+        "Karta raqami, emojilar va yozuvlar qo'shishingiz mumkin.\n"
+        "Masalan:\n"
+        "<code>9860 1801 0468 1937</code>\n"
+        "yoki\n"
+        "⭐ <code>9860 1801 0468 1937</code> 💎 Humo — rahmat! 🙏",
     )
     await call.answer()
 
 
 @router.message(SettingsStates.pay_card)
 async def pay_card_input(message: Message, state: FSMContext) -> None:
-    raw = message.text.replace(" ", "")
-    if not raw.isdigit():
-        await message.answer("❌ Iltimos, faqat raqamdan iborat karta raqamini yozing!")
+    raw = message.text.strip()
+    if len(raw) < 3:
+        await message.answer("❌ Iltimos, kamida 3 ta belgi kiriting!")
         return
     await update_settings(pay_card=raw)
     await state.clear()
-    await message.answer(f"✅ To'lov kartasi <code>{raw}</code> qilib o'rnatildi.", reply_markup=admin_keyboard())
+    await message.answer(f"✅ To'lov ma'lumotlari saqlandi:\n\n💳 <code>{raw}</code>", reply_markup=admin_keyboard())
+
+
+@router.callback_query(F.data == "admin:set:reviews_channel")
+async def set_reviews_channel(call: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(SettingsStates.reviews_channel)
+    await call.message.edit_text(
+        "⭐ <b>Otziv kanalini yuboring:</b>\n"
+        "(masalan: <code>@mychannel</code> yoki <code>https://t.me/mychannel</code>)",
+    )
+    await call.answer()
+
+
+@router.message(SettingsStates.reviews_channel)
+async def reviews_channel_input(message: Message, state: FSMContext) -> None:
+    raw = message.text.strip()
+    if len(raw) < 3:
+        await message.answer("❌ Iltimos, to'g'ri havola yuboring!")
+        return
+    await update_settings(reviews_channel=raw)
+    await state.clear()
+    await message.answer(f"✅ Otziv kanali saqlandi: <b>{raw}</b>", reply_markup=admin_keyboard())
 
 
 # ---------- Savdo boshqaruvi ----------
