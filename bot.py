@@ -17,6 +17,7 @@ Ishga tushirish:
 Render uchun: WEBHOOK_URL o'rnatilsa — webhook rejimi, aks holda polling.
 """
 
+import asyncio
 import logging
 import os
 import random
@@ -1389,7 +1390,7 @@ async def order_reject_callback(call: CallbackQuery, bot: Bot) -> None:
 # ============================================================
 
 @router.callback_query(F.data.startswith("jackpot_buy:"))
-async def jackpot_buy_callback(call: CallbackQuery, bot: Bot) -> None:
+async def jackpot_buy_callback(call: CallbackQuery) -> None:
     qty = int(call.data.split(":")[1])
     user = await get_user(call.from_user.id)
     if not user:
@@ -1528,6 +1529,9 @@ async def ref_reward_input(message: Message, state: FSMContext) -> None:
     except ValueError:
         await message.answer("❌ Iltimos, butun son kiriting!")
         return
+    if value < 0:
+        await message.answer("❌ Mukofot manfiy bo'lishi mumkin emas!")
+        return
     await update_settings(ref_reward_stars=value)
     await state.clear()
     await message.answer(f"✅ Referal mukofoti <b>{value} ⭐</b> qilib o'rnatildi.", reply_markup=admin_keyboard())
@@ -1549,6 +1553,9 @@ async def min_ref_input(message: Message, state: FSMContext) -> None:
         value = int(message.text)
     except ValueError:
         await message.answer("❌ Iltimos, butun son kiriting!")
+        return
+    if value < 0:
+        await message.answer("❌ Minimal manfiy bo'lishi mumkin emas!")
         return
     await update_settings(min_referals_required=value)
     await state.clear()
@@ -1572,6 +1579,9 @@ async def jackpot_cost_input(message: Message, state: FSMContext) -> None:
     except ValueError:
         await message.answer("❌ Iltimos, butun son kiriting!")
         return
+    if value < 1:
+        await message.answer("❌ Bilet narxi kamida 1 ⭐ bo'lishi kerak!")
+        return
     await update_settings(jackpot_ticket_cost=value)
     await state.clear()
     await message.answer(f"✅ Jekpot bilet narxi <b>{value} ⭐</b> qilib o'rnatildi.", reply_markup=admin_keyboard())
@@ -1593,6 +1603,9 @@ async def min_withdraw_input(message: Message, state: FSMContext) -> None:
         value = int(message.text)
     except ValueError:
         await message.answer("❌ Iltimos, butun son kiriting!")
+        return
+    if value < 0:
+        await message.answer("❌ Minimal manfiy bo'lishi mumkin emas!")
         return
     await update_settings(min_withdraw_stars=value)
     await state.clear()
@@ -1811,6 +1824,9 @@ async def admin_jackpot(call: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "admin:jackpot_confirm")
 async def admin_jackpot_confirm(call: CallbackQuery, bot: Bot) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
     settings = await get_settings()
     participants = await get_participants()
     if not participants:
@@ -1818,12 +1834,24 @@ async def admin_jackpot_confirm(call: CallbackQuery, bot: Bot) -> None:
         return
 
     fund = settings["jackpot_fund"]
+    if fund <= 0:
+        await call.answer("❌ Jekpot fondi bo'sh (0 ⭐)! Avval biletlar sotilishi kerak.", show_alert=True)
+        return
 
-    # Og'irlik bo'yicha g'olib tanlash (tickets_count imkoniyati)
-    pool = []
+    # Og'irlik bo'yicha g'olib tanlash (har bilet = 1 imkoniyat) — samarali usul
+    total = sum(p["tickets_count"] for p in participants)
+    r = random.randint(1, total)
+    winner_id = None
+    cum = 0
     for p in participants:
-        pool.extend([p["telegram_id"]] * p["tickets_count"])
-    winner_id = random.choice(pool)
+        cum += p["tickets_count"]
+        if r <= cum:
+            winner_id = p["telegram_id"]
+            break
+
+    if winner_id is None:
+        await call.answer("❌ G'olib tanlashda xatolik!", show_alert=True)
+        return
 
     # G'olibga fondni o'tkazamiz
     await add_stars(winner_id, fund)
@@ -1857,13 +1885,16 @@ async def admin_jackpot_confirm(call: CallbackQuery, bot: Bot) -> None:
 
     # Barchaga e'lon
     users = await get_all_users()
-    for u in users:
+    for i, u in enumerate(users):
         if u["telegram_id"] == winner_id:
             continue
         try:
             await bot.send_message(u["telegram_id"], announcement)
         except (TelegramBadRequest, TelegramForbiddenError):
             continue
+        # Telegram flood'iga tushmaslik uchun kichik pauza
+        if i % 20 == 19:
+            await asyncio.sleep(1)
 
 
 # ---------- Rassilka ----------
