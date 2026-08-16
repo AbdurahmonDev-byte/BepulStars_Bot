@@ -50,7 +50,10 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.strip()]
-DB_PATH = os.getenv("DB_PATH", "bot.db")
+
+# DB fayli qayerdan ishga tushirilishidan qat'i nazar, bot.py yonida bo'ladi
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.getenv("DB_PATH", os.path.join(BASE_DIR, "bot.db"))
 
 # Render / webhook sozlamalari
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
@@ -1316,8 +1319,16 @@ async def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN sozlanmagan! .env faylini tekshiring.")
 
+    # DB jadvallarini darhol yaratamiz (startup hooklarga tayanmasdan)
+    await db_init()
+
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp.include_router(router)
+
+    # Aiogram 3.x da on_startup/on_shutdown start_polling kwarg'i emas,
+    # alohida register qilinadi:
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
 
     if WEBHOOK_URL:
         # Render/webhook rejimi
@@ -1336,7 +1347,7 @@ async def main() -> None:
         logger.info("Webhook server ishga tushdi: %s:%s%s", WEBAPP_HOST, WEBAPP_PORT, WEBHOOK_PATH)
         await asyncio.Event().wait()
     else:
-        await dp.start_polling(bot, on_startup=on_startup, on_shutdown=on_shutdown)
+        await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
