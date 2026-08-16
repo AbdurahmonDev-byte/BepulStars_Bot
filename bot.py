@@ -123,6 +123,11 @@ class UzsPaymentStates(StatesGroup):
     proof = State()
 
 
+class BoxStates(StatesGroup):
+    """Admin box sozlamalarini o'zgartirishi."""
+    input = State()
+
+
 # ============================================================
 #  MA'LUMOTLAR BAZASI (aiosqlite)
 # ============================================================
@@ -199,6 +204,21 @@ async def db_init() -> None:
                 created_at TEXT NOT NULL
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS boxes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                box_id TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                cost INTEGER NOT NULL DEFAULT 0,
+                star_min INTEGER NOT NULL DEFAULT 0,
+                star_max INTEGER NOT NULL DEFAULT 0,
+                gift_drop_prob REAL NOT NULL DEFAULT 0.5,
+                gift_pool_size INTEGER NOT NULL DEFAULT 1,
+                gift_category TEXT NOT NULL DEFAULT 'gift',
+                once_per_day INTEGER NOT NULL DEFAULT 0,
+                desc_text TEXT NOT NULL DEFAULT ''
+            )
+        """)
 
         # Eski DB bo'lsa, yangi ustunlarni qo'shamiz (migratsiya)
         for alter_sql in (
@@ -220,6 +240,18 @@ async def db_init() -> None:
             INSERT OR IGNORE INTO settings (id, ref_reward_stars, min_referals_required,
                                             min_withdraw_stars, pay_card)
             VALUES (1, 5, 3, 100, '9860180104681937')
+        """)
+
+        # Default boxlar (faqat birinchi marta)
+        await db.execute("""
+            INSERT OR IGNORE INTO boxes (box_id, name, cost, star_min, star_max,
+                                         gift_drop_prob, gift_pool_size, gift_category,
+                                         once_per_day, desc_text)
+            VALUES
+                ('daily', '📦 Kunlik box', 1, 0, 10, 0.0, 1, 'gift', 1, 'Mukofot: 0–10 ⭐'),
+                ('gift', '🎁 Gift box', 50, 10, 60, 0.5, 2, 'gift', 0, 'Mukofot: 10–60 ⭐ yoki arzonroq 2 giftdan biri'),
+                ('nft', '🖼 NFT box', 100, 60, 120, 0.5, 4, 'gift', 0, 'Mukofot: 60–120 ⭐ yoki arzonroq 4 giftdan biri'),
+                ('mega', '💎 Mega box', 200, 120, 250, 0.5, 4, 'premium', 0, 'Mukofot: 120–250 ⭐ yoki premium')
         """)
 
         # Namuna mahsulotlar (faqat birinchi marta)
@@ -364,6 +396,30 @@ async def delete_shop_item(item_id: int) -> None:
 
 # ---------- Boxlar (Jekpot) ----------
 
+async def get_all_boxes() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM boxes ORDER BY id")
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_box(box_id: str) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM boxes WHERE box_id = ?", (box_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def update_box(box_id: str, **kwargs) -> None:
+    keys = ", ".join(f"{k} = ?" for k in kwargs)
+    vals = list(kwargs.values())
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(f"UPDATE boxes SET {keys} WHERE box_id = ?", vals + [box_id])
+        await db.commit()
+
+
 async def set_daily_box_used(telegram_id: int, date_str: str) -> None:
     """Foydalanuvchining kunlik box ochgan sanasini saqlaydi."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -371,16 +427,18 @@ async def set_daily_box_used(telegram_id: int, date_str: str) -> None:
         await db.commit()
 
 
-async def pick_shop_gifts(category: str, count: int) -> list[dict]:
-    """Do'kondan eng arzon 2 tasidan bittasini tanlaydi (count marta)."""
+async def pick_shop_gifts(category: str, pool_size: int) -> list[dict]:
+    """Do'kondan eng arzon `pool_size` tasidan bittasini tanlaydi."""
     items = sorted(
         (i for i in await get_all_shop_items() if i["category"] == category and i["price_stars"] > 0),
         key=lambda x: x["price_stars"],
     )
     if not items:
         return []
-    cheapest = items[:2]  # eng arzon 2 ta
-    return [random.choice(cheapest) for _ in range(count)]
+    if pool_size < 1:
+        pool_size = 1
+    pool = items[:pool_size]  # eng arzon N tasi
+    return [random.choice(pool)]
 
 
 # ---------- Majburiy kanallar ----------
@@ -931,78 +989,22 @@ async def shop_handler(message: Message) -> None:
 # ============================================================
 #  BOXLAR (JEKPOT) — lootbox tizimi
 # ============================================================
-# Tushish ehtimoli: qimmat giftlar judayam past foizda tushadi.
-
-BOXES = [
-    {
-        "id": "daily",
-        "name": "📦 Kunlik box",
-        "cost": 1,
-        "once_per_day": True,
-        "desc": "Mukofot: 0–10 ⭐",
-    },
-    {
-        "id": "gift",
-        "name": "🎁 Gift box",
-        "cost": 50,
-        "desc": "Mukofot: 10–60 ⭐ yoki arzon gift",
-    },
-    {
-        "id": "nft",
-        "name": "🖼 NFT box",
-        "cost": 100,
-        "desc": "Mukofot: 60–120 ⭐, arzon gift yoki premium",
-    },
-    {
-        "id": "mega",
-        "name": "💎 Mega box",
-        "cost": 200,
-        "desc": "Mukofot: 120–250 ⭐ yoki arzon gift",
-    },
-]
-
-# Har bir box uchun star diapazoni va gift tushish foizi
-STAR_RANGES = {
-    "daily": (0, 10),
-    "gift": (10, 60),
-    "nft": (60, 120),
-    "mega": (120, 250),
-}
-GIFT_DROP_PROB = {
-    "daily": 0.0,   # kunlik box faqat stars beradi
-    "gift": 0.5,    # 50% stars, 50% arzon gift
-    "nft": 0.5,     # 50% stars, 50% arzon gift
-    "mega": 0.5,    # 50% stars, 50% arzon gift
-}
-GIFT_COUNTS = {
-    "gift": 1,
-    "nft": 1,
-    "mega": 1,
-}
-GIFT_CATEGORY = {
-    "gift": "gift",
-    "nft": "gift",
-    "mega": "gift",
-}
+# Boxlar sozlamalari DB'da (boxes jadvali) saqlanadi, admin o'zgartiradi.
+# Har bir box uchun: narx, star diapazoni, gift tushish foizi,
+# eng arzon N ta giftdan biri, gift toifasi, kunlik cheklov, tavsif.
 
 
 async def roll_box(box: dict) -> dict:
     """Box ochish natijasini hisoblaydi. {'kind': 'stars'|'gifts', 'amount', 'gifts'}"""
-    box_id = box["id"]
-    kind = "stars"
-    if GIFT_DROP_PROB.get(box_id, 0) and random.random() < GIFT_DROP_PROB[box_id]:
-        kind = "gifts"
+    if box["gift_drop_prob"] > 0 and random.random() < box["gift_drop_prob"]:
+        gifts = await pick_shop_gifts(box["gift_category"], box["gift_pool_size"])
+        if gifts:
+            return {"kind": "gifts", "amount": 0, "gifts": gifts}
 
-    if kind == "stars":
-        lo, hi = STAR_RANGES[box_id]
-        return {"kind": "stars", "amount": random.randint(lo, hi), "gifts": []}
-
-    gifts = await pick_shop_gifts(GIFT_CATEGORY[box_id], GIFT_COUNTS[box_id])
-    if not gifts:
-        # Do'konda gift/premium yo'q bo'lsa — stars beriladi
-        lo, hi = STAR_RANGES[box_id]
-        return {"kind": "stars", "amount": random.randint(lo, hi), "gifts": []}
-    return {"kind": "gifts", "amount": 0, "gifts": gifts}
+    lo, hi = box["star_min"], box["star_max"]
+    if hi < lo:
+        hi = lo
+    return {"kind": "stars", "amount": random.randint(lo, hi), "gifts": []}
 
 
 @router.message(F.text == "🎰 Jekpot")
@@ -1014,17 +1016,18 @@ async def show_boxes(answer_func, telegram_id: int, result_text: str | None = No
     """Boxlar menyusini ko'rsatadi."""
     user = await get_user(telegram_id)
     today = datetime.now().strftime("%Y-%m-%d")
+    boxes = await get_all_boxes()
 
     kb = InlineKeyboardBuilder()
-    for b in BOXES:
-        kb.button(text=f"{b['name']} — {b['cost']} ⭐", callback_data=f"box_open:{b['id']}")
+    for b in boxes:
+        kb.button(text=f"{b['name']} — {b['cost']} ⭐", callback_data=f"box_open:{b['box_id']}")
     kb.button(text="🔙 Bosh menyu", callback_data="main_menu")
     kb.adjust(1)
 
     text = "🎰 <b>BOXLAR</b>\n\nQaysi boxni ochasiz?\n\n"
-    for b in BOXES:
-        line = f"{b['name']} — <b>{b['cost']} ⭐</b>\n{b['desc']}"
-        if b.get("once_per_day"):
+    for b in boxes:
+        line = f"{b['name']} — <b>{b['cost']} ⭐</b>\n{b['desc_text']}"
+        if b["once_per_day"]:
             if user and user["last_daily_box"] == today:
                 line = f"✅ {line}\n(Bugun ishlatilgan — ertaga qayta ochiladi)"
             else:
@@ -1043,7 +1046,7 @@ async def show_boxes(answer_func, telegram_id: int, result_text: str | None = No
 @router.callback_query(F.data.startswith("box_open:"))
 async def box_open_callback(call: CallbackQuery, bot: Bot) -> None:
     box_id = call.data.split(":")[1]
-    box = next((b for b in BOXES if b["id"] == box_id), None)
+    box = await get_box(box_id)
     if not box:
         await call.answer("❌ Box topilmadi!", show_alert=True)
         return
@@ -1054,7 +1057,7 @@ async def box_open_callback(call: CallbackQuery, bot: Bot) -> None:
         return
 
     today = datetime.now().strftime("%Y-%m-%d")
-    if box.get("once_per_day"):
+    if box["once_per_day"]:
         if user["last_daily_box"] == today:
             await call.answer("❌ Kunlik boxni bugun ishlatgansiz! Ertaga qayta oching.", show_alert=True)
             return
@@ -1065,7 +1068,7 @@ async def box_open_callback(call: CallbackQuery, bot: Bot) -> None:
 
     # Box narxini ayiramiz
     await deduct_stars(call.from_user.id, box["cost"])
-    if box.get("once_per_day"):
+    if box["once_per_day"]:
         await set_daily_box_used(call.from_user.id, today)
 
     prize = await roll_box(box)
@@ -1078,11 +1081,11 @@ async def box_open_callback(call: CallbackQuery, bot: Bot) -> None:
             f"Yulduzlar hisobingizga qo'shildi!"
         )
     else:
-        gift_lines = "\n".join(f"• {g['name']} — {g['price_stars']} ⭐" for g in prize["gifts"])
+        gift = prize["gifts"][0]
         result_text = (
             f"🎉 <b>{box['name']}</b> ochildi!\n\n"
-            f"🎁 Yutgan gifflaringiz:\n{gift_lines}\n\n"
-            f"Giftlar sizga admin tomonidan yuboriladi!"
+            f"🎁 Yutgan giftingiz: <b>{gift['name']}</b> ({gift['price_stars']} ⭐)\n\n"
+            f"Gift sizga admin tomonidan yuboriladi!"
         )
         for admin_id in ADMIN_IDS:
             try:
@@ -1092,8 +1095,8 @@ async def box_open_callback(call: CallbackQuery, bot: Bot) -> None:
                     f"👤 Foydalanuvchi: {call.from_user.first_name} (@{call.from_user.username or '—'})\n"
                     f"🆔 ID: <code>{call.from_user.id}</code>\n"
                     f"📦 Box: <b>{box['name']}</b>\n"
-                    f"🎁 Gifflar:\n{gift_lines}\n\n"
-                    f"⚠️ Giftlarni foydalanuvchiga o'tkazing (Telegram'da yuborish mumkin)!",
+                    f"🎁 Gift: <b>{gift['name']}</b> ({gift['price_stars']} ⭐)\n\n"
+                    f"⚠️ Giftni foydalanuvchiga o'tkazing (Telegram'da yuborish mumkin)!",
                 )
             except TelegramForbiddenError:
                 pass
@@ -1515,6 +1518,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     kb.button(text="📊 Statistika", callback_data="admin:stats")
     kb.button(text="⚙️ Sozlamalar", callback_data="admin:settings")
     kb.button(text="🛒 Savdo boshqaruvi", callback_data="admin:shop")
+    kb.button(text="📦 Boxlar boshqaruvi", callback_data="admin:boxes")
     kb.button(text="📢 Rassilka", callback_data="admin:broadcast")
     kb.button(text="🔗 Kanallar", callback_data="admin:channels")
     kb.button(text="📞 Aloqa boshqaruvi", callback_data="admin:contacts")
@@ -1842,6 +1846,198 @@ async def admin_delete_item(call: CallbackQuery) -> None:
     await delete_shop_item(item_id)
     await call.answer("✅ O'chirildi!", show_alert=True)
     await call.message.edit_text("🗑️ <b>Yana mahsulot o'chirasizmi?</b>", reply_markup=shop_management_keyboard())
+
+
+# ---------- Boxlar boshqaruvi ----------
+
+def box_detail_text(b: dict) -> str:
+    prob = f"{b['gift_drop_prob'] * 100:.0f}%"
+    daily = "✅ Ha" if b["once_per_day"] else "❌ Yo'q"
+    return (
+        f"📦 <b>{b['name']}</b>\n\n"
+        f"💰 Narxi: <b>{b['cost']} ⭐</b>\n"
+        f"⭐ Star diapazoni: <b>{b['star_min']}–{b['star_max']}</b>\n"
+        f"🎁 Gift tushish foizi: <b>{prob}</b>\n"
+        f"🎟️ Gift tanlovi: eng arzon <b>{b['gift_pool_size']}</b> tasidan biri\n"
+        f"📂 Gift toifasi: <b>{b['gift_category']}</b>\n"
+        f"⏳ Kuniga 1 marta: {daily}\n"
+        f"📝 Tavsif: {b['desc_text']}"
+    )
+
+
+def box_edit_keyboard(box_id: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✏️ Nom", callback_data=f"admin:box:field:name:{box_id}")
+    kb.button(text="💰 Narx", callback_data=f"admin:box:field:cost:{box_id}")
+    kb.button(text="⭐ Star min", callback_data=f"admin:box:field:starmin:{box_id}")
+    kb.button(text="⭐ Star max", callback_data=f"admin:box:field:starmax:{box_id}")
+    kb.button(text="🎁 Gift foizi %", callback_data=f"admin:box:field:prob:{box_id}")
+    kb.button(text="🎟️ Gift soni (N)", callback_data=f"admin:box:field:pool:{box_id}")
+    kb.button(text="📂 Gift toifasi", callback_data=f"admin:box:cat:{box_id}")
+    kb.button(text="⏳ Kunlik cheklov", callback_data=f"admin:box:daily:{box_id}")
+    kb.button(text="📝 Tavsif", callback_data=f"admin:box:field:desc:{box_id}")
+    kb.button(text="🔙 Ortga", callback_data="admin:boxes")
+    kb.adjust(2)
+    return kb.as_markup()
+
+
+@router.callback_query(F.data == "admin:boxes")
+async def admin_boxes(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    boxes = await get_all_boxes()
+    kb = InlineKeyboardBuilder()
+    for b in boxes:
+        kb.button(text=b["name"], callback_data=f"admin:box:edit:{b['box_id']}")
+    kb.button(text="🔙 Ortga", callback_data="admin")
+    kb.adjust(1)
+    await call.message.edit_text("📦 <b>Boxlar boshqaruvi</b>\n\nSozlamoqchi bo'lgan boxni tanlang:", reply_markup=kb.as_markup())
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin:box:edit:"))
+async def admin_box_edit(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    box_id = call.data.split(":")[3]
+    box = await get_box(box_id)
+    if not box:
+        await call.answer("❌ Box topilmadi!", show_alert=True)
+        return
+    await call.message.edit_text(box_detail_text(box), reply_markup=box_edit_keyboard(box_id))
+    await call.answer()
+
+
+BOX_FIELD_PROMPTS = {
+    "name": "✏️ <b>Yangi nomni yozing:</b>",
+    "cost": "💰 <b>Yangi narxni yozing (yulduz):</b>",
+    "starmin": "⭐ <b>Yangi star minimumini yozing:</b>",
+    "starmax": "⭐ <b>Yangi star maksimumini yozing:</b>",
+    "prob": "🎁 <b>Gift tushish foizini yozing (0–100):</b>\nMasalan: 50 — 50% gift, 50% stars. 0 yozsangiz, faqat stars tushadi.",
+    "pool": "🎟️ <b>Gift tanlovi sonini yozing:</b>\nDo'kondagi eng arzon shuncha giftdan biri tushadi. Masalan: 2",
+    "desc": "📝 <b>Yangi tavsifni yozing:</b>",
+}
+
+@router.callback_query(F.data.startswith("admin:box:field:"))
+async def admin_box_field(call: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    parts = call.data.split(":")
+    field = parts[3]
+    box_id = parts[4]
+    await state.set_state(BoxStates.input)
+    await state.update_data(box_id=box_id, field=field)
+    await call.message.edit_text(BOX_FIELD_PROMPTS.get(field, "✏️ Qiymatni yozing:"))
+    await call.answer()
+
+
+@router.message(BoxStates.input)
+async def box_field_input(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        await message.answer("❌ Siz admin emassiz!")
+        return
+    data = await state.get_data()
+    box_id = data.get("box_id")
+    field = data.get("field")
+    raw = message.text.strip()
+
+    value = raw
+    if field in ("cost", "starmin", "starmax", "pool"):
+        try:
+            value = int(raw)
+        except ValueError:
+            await message.answer("❌ Iltimos, butun son kiriting!")
+            return
+        if value < 0:
+            await message.answer("❌ Manfiy bo'lishi mumkin emas!")
+            return
+        if field == "pool" and value < 1:
+            await message.answer("❌ Kamida 1 bo'lishi kerak!")
+            return
+    elif field == "prob":
+        try:
+            value = float(raw.replace("%", "").replace(",", "."))
+        except ValueError:
+            await message.answer("❌ Iltimos, son kiriting (0–100)!")
+            return
+        if value < 0 or value > 100:
+            await message.answer("❌ Foiz 0 dan 100 gacha bo'lishi kerak!")
+            return
+        value = value / 100.0
+    else:
+        if len(raw) < 1:
+            await message.answer("❌ Bo'sh bo'lishi mumkin emas!")
+            return
+
+    if field == "starmax":
+        box = await get_box(box_id)
+        if box and value < box["star_min"]:
+            await message.answer("❌ Star max, star min dan kichik bo'lishi mumkin emas!")
+            return
+
+    column = {
+        "name": "name",
+        "cost": "cost",
+        "starmin": "star_min",
+        "starmax": "star_max",
+        "prob": "gift_drop_prob",
+        "pool": "gift_pool_size",
+        "desc": "desc_text",
+    }[field]
+    await update_box(box_id, **{column: value})
+    await state.clear()
+
+    box = await get_box(box_id)
+    await message.answer(box_detail_text(box), reply_markup=box_edit_keyboard(box_id))
+
+
+@router.callback_query(F.data.startswith("admin:box:cat:"))
+async def admin_box_cat(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    box_id = call.data.split(":")[3]
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🎁 Gift", callback_data=f"admin:box:catset:{box_id}:gift")
+    kb.button(text="💎 Premium", callback_data=f"admin:box:catset:{box_id}:premium")
+    kb.button(text="🔙 Ortga", callback_data=f"admin:box:edit:{box_id}")
+    kb.adjust(2)
+    await call.message.edit_text("📂 <b>Gift toifasini tanlang:</b>", reply_markup=kb.as_markup())
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin:box:catset:"))
+async def admin_box_catset(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    parts = call.data.split(":")
+    box_id, cat = parts[3], parts[4]
+    await update_box(box_id, gift_category=cat)
+    box = await get_box(box_id)
+    await call.message.edit_text(box_detail_text(box), reply_markup=box_edit_keyboard(box_id))
+    await call.answer("✅ Saqlandi!", show_alert=False)
+
+
+@router.callback_query(F.data.startswith("admin:box:daily:"))
+async def admin_box_daily(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    box_id = call.data.split(":")[3]
+    box = await get_box(box_id)
+    if not box:
+        await call.answer("❌ Box topilmadi!", show_alert=True)
+        return
+    new = 0 if box["once_per_day"] else 1
+    await update_box(box_id, once_per_day=new)
+    box = await get_box(box_id)
+    await call.message.edit_text(box_detail_text(box), reply_markup=box_edit_keyboard(box_id))
+    await call.answer("✅ Saqlandi!", show_alert=False)
 
 
 # ---------- Rassilka ----------
