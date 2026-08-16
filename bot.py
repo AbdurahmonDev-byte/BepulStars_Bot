@@ -21,6 +21,7 @@ import logging
 import os
 import random
 from datetime import datetime
+from urllib.parse import quote
 
 import aiosqlite
 from dotenv import load_dotenv
@@ -90,12 +91,10 @@ class SettingsStates(StatesGroup):
 
 
 class AddItemStates(StatesGroup):
-    """Do'konga yangi mahsulot qo'shish."""
+    """Do'konga yangi mahsulot qo'shish (faqat nom va narx)."""
     category = State()
     name = State()
     price = State()
-    description = State()
-    image = State()
 
 
 class BroadcastStates(StatesGroup):
@@ -391,7 +390,7 @@ async def check_subscriptions(bot: Bot, telegram_id: int, channels: list[dict]) 
     return not_subscribed
 
 
-async def register_user_with_referral(telegram_id: int, referrer_id: int | None) -> dict:
+async def register_user_with_referral(telegram_id: int, referrer_id: int | None, friend_name: str = "") -> dict:
     """Yangi foydalanuvchini ro'yxatga oladi va referal mukofotini to'laydi."""
     user = await get_user(telegram_id)
     if user:
@@ -412,7 +411,7 @@ async def register_user_with_referral(telegram_id: int, referrer_id: int | None)
         await add_stars(referrer["telegram_id"], reward)
         await increment_referals(referrer["telegram_id"])
         try:
-            await bot_notify_referrer(referrer["telegram_id"], telegram_id, reward)
+            await bot_notify_referrer(referrer["telegram_id"], friend_name or str(telegram_id), reward)
         except Exception as e:
             logger.warning("Referrer ogohlantirish xatosi: %s", e)
 
@@ -423,15 +422,31 @@ async def register_user_with_referral(telegram_id: int, referrer_id: int | None)
 _bot: Bot | None = None
 
 
-async def bot_notify_referrer(referrer_id: int, new_user_id: int, reward: int) -> None:
+async def bot_notify_referrer(referrer_id: int, friend_name: str, reward: int) -> None:
+    """Referal qabul qilinganda referrerga xabar (ism-familiya bilan)."""
     if _bot is None:
         return
     try:
         await _bot.send_message(
             referrer_id,
             f"🎉 <b>Tabriklaymiz!</b>\n"
-            f"Yangicha taklif qildingiz: <code>{new_user_id}</code>\n"
+            f"Yangicha taklif qildingiz: <b>{friend_name}</b>\n"
             f"Bonus: <b>+{reward} ⭐</b>",
+        )
+    except TelegramForbiddenError:
+        pass
+
+
+async def bot_notify_pending_referral(referrer_id: int, friend_name: str) -> None:
+    """Do'st hali kanallarga a'zo bo'lmaganida referrerga xabar."""
+    if _bot is None:
+        return
+    try:
+        await _bot.send_message(
+            referrer_id,
+            f"🔔 <b>Yangi referal!</b>\n\n"
+            f"Do'stingiz <b>{friend_name}</b> havolangiz orqali kirdi.\n"
+            f"Agar u majburiy kanallarga a'zo bo'lsa, referal qabul qilinadi va bonus olasiz! 🎁",
         )
     except TelegramForbiddenError:
         pass
@@ -443,6 +458,7 @@ def main_menu_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="👤 Profil"), KeyboardButton(text="🛍️ Do'kon")],
             [KeyboardButton(text="🎰 Jekpot"), KeyboardButton(text="📞 Yordam")],
+            [KeyboardButton(text="🔗 Referal")],
         ],
         resize_keyboard=True,
     )
@@ -512,6 +528,13 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext) -> None:
             # Referrer ehtiyojini saqlaymiz — tekshirishdan keyin berish uchun
             if referrer_id and referrer_id != message.from_user.id:
                 pending_ref[message.from_user.id] = referrer_id
+                # Referrerga xabar: do'st kanallarga a'zo bo'lsagina referal qabul qilinadi
+                referrer = await get_user(referrer_id)
+                if referrer:
+                    try:
+                        await bot_notify_pending_referral(referrer_id, message.from_user.full_name)
+                    except Exception as e:
+                        logger.warning("Referrer xabarnoma xatosi: %s", e)
             await message.answer(
                 "❌ <b>Botdan foydalanish uchun quyidagi kanallarga a'zo bo'ling:</b>",
                 reply_markup=channels_keyboard(not_sub),
@@ -519,7 +542,7 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext) -> None:
             return
 
     # Foydalanuvchi ro'yxatga olinadi + referal mukofoti to'lanadi
-    await register_user_with_referral(message.from_user.id, referrer_id)
+    await register_user_with_referral(message.from_user.id, referrer_id, message.from_user.full_name)
     pending_ref.pop(message.from_user.id, None)
 
     await message.answer(
@@ -546,7 +569,7 @@ async def check_sub_handler(call: CallbackQuery, bot: Bot, state: FSMContext) ->
     ref = pending_ref.get(call.from_user.id)
     user = await get_user(call.from_user.id)
     if not user:
-        await register_user_with_referral(call.from_user.id, ref)
+        await register_user_with_referral(call.from_user.id, ref, call.from_user.full_name)
     pending_ref.pop(call.from_user.id, None)
 
     try:
@@ -583,6 +606,31 @@ async def profile_handler(message: Message, bot: Bot) -> None:
         f"👥 Taklif qilganlar: <b>{user['referals_count']}</b>\n\n"
         f"🔗 <b>Shaxsiy havolangiz:</b>\n<code>{ref_link}</code>\n\n"
         f"Shu havolani do'stlaringizga yuboring, ular a'zo bo'lganda bonus olasiz!",
+    )
+
+
+@router.message(F.text == "🔗 Referal")
+async def referral_handler(message: Message, bot: Bot) -> None:
+    global _bot
+    _bot = bot
+    user = await get_user(message.from_user.id)
+    if not user:
+        await message.answer("❌ Avval /start ni bosing!")
+        return
+
+    bot_username = (await bot.me()).username
+    ref_link = f"https://t.me/{bot_username}?start={user['telegram_id']}"
+    share_text = "Men bu bot orqali yulduzlar yig'ib, sovg'alar olaman! Qo'shil! 🎁"
+    share_url = f"https://t.me/share/url?url={quote(ref_link)}&text={quote(share_text)}"
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📤 Do'stlarga ulashish", url=share_url)
+    kb.button(text="🔗 Havolani nusxalash", url=ref_link)
+
+    await message.answer(
+        f"🔗 <b>Referal havolangiz</b>\n\n"
+        f"{ref_link}\n\n"
+        f"Shu havolani do'stlaringizga yuboring. Har bir yangi a'zo uchun bonus olasiz! ⭐",
+        reply_markup=kb.as_markup(),
     )
 
 
@@ -677,13 +725,14 @@ async def item_detail_callback(call: CallbackQuery, bot: Bot) -> None:
         return
 
     label = CATEGORIES.get(item["category"], item["category"])
-    description = item["description"] or "Tavsif yo'q."
+    description = item["description"] or ""
     text = (
         f"{label}\n\n"
         f"<b>{item['name']}</b>\n"
-        f"💰 Narxi: <b>{item['price_stars']} ⭐</b>\n\n"
-        f"{description}"
+        f"💰 Narxi: <b>{item['price_stars']} ⭐</b>"
     )
+    if description:
+        text += f"\n\n{description}"
     kb = product_keyboard(item_id)
 
     if item["image_file_id"]:
@@ -987,48 +1036,16 @@ async def add_item_price(message: Message, state: FSMContext) -> None:
     except ValueError:
         await message.answer("❌ Iltimos, butun son kiriting!")
         return
-    await state.update_data(price=price)
-    await state.set_state(AddItemStates.price)
-    await message.answer("📝 <b>Tavsifini yozing:</b>")
-
-
-@router.message(AddItemStates.price)
-async def add_item_description(message: Message, state: FSMContext) -> None:
-    await state.update_data(description=message.text.strip())
-    await state.set_state(AddItemStates.description)
-    kb = InlineKeyboardBuilder()
-    kb.button(text="⏭️ Rasm kiritmasdan davom etish", callback_data="admin:item_noimg")
-    await message.answer("🖼️ <b>Rasm yuboring</b> (ixtiyoriy):", reply_markup=kb.as_markup())
-
-
-async def save_new_item(state: FSMContext, image_id: str | None) -> None:
-    """FSM state-dan mahsulot ma'lumotlarini olib, bazaga yozadi."""
     data = await state.get_data()
     await add_shop_item(
         category=data["category"],
         name=data["name"],
-        price_stars=data["price"],
-        description=data["description"],
-        image_file_id=image_id,
+        price_stars=price,
+        description="",
+        image_file_id=None,
     )
-
-
-@router.callback_query(F.data == "admin:item_noimg")
-async def add_item_no_image(call: CallbackQuery, state: FSMContext) -> None:
-    await save_new_item(state, None)
     await state.clear()
-    await call.message.edit_text("✅ Mahsulot qo'shildi!", reply_markup=admin_keyboard())
-    await call.answer()
-
-
-@router.message(AddItemStates.description)
-async def add_item_image(message: Message, state: FSMContext) -> None:
-    image_id = None
-    if message.photo:
-        image_id = message.photo[-1].file_id
-    await save_new_item(state, image_id)
-    await state.clear()
-    await message.answer("✅ Mahsulot qo'shildi!", reply_markup=admin_keyboard())
+    await message.answer(f"✅ Mahsulot qo'shildi!\n\n{data['name']} — {price} ⭐", reply_markup=admin_keyboard())
 
 
 # --- Mahsulot o'chirish ---
