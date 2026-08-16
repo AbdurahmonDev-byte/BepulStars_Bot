@@ -88,6 +88,7 @@ class SettingsStates(StatesGroup):
     ref_reward = State()      # bitta referal uchun yulduz
     min_referals = State()    # xarid uchun minimal referallar
     jackpot_cost = State()    # jekpot bilet narxi
+    min_withdraw = State()    # yulduz yechish uchun minimal
 
 
 class AddItemStates(StatesGroup):
@@ -131,7 +132,8 @@ async def db_init() -> None:
                 ref_reward_stars INTEGER NOT NULL DEFAULT 5,
                 min_referals_required INTEGER NOT NULL DEFAULT 3,
                 jackpot_ticket_cost INTEGER NOT NULL DEFAULT 10,
-                jackpot_fund INTEGER NOT NULL DEFAULT 0
+                jackpot_fund INTEGER NOT NULL DEFAULT 0,
+                min_withdraw_stars INTEGER NOT NULL DEFAULT 100
             )
         """)
         await db.execute("""
@@ -139,7 +141,8 @@ async def db_init() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 category TEXT NOT NULL,
                 name TEXT NOT NULL,
-                price_stars INTEGER NOT NULL,
+                price_stars INTEGER NOT NULL DEFAULT 0,
+                price_uzs INTEGER NOT NULL DEFAULT 0,
                 description TEXT DEFAULT '',
                 image_file_id TEXT DEFAULT NULL
             )
@@ -159,27 +162,37 @@ async def db_init() -> None:
             )
         """)
 
+        # Eski DB bo'lsa, yangi ustunlarni qo'shamiz (migratsiya)
+        for alter_sql in (
+            "ALTER TABLE settings ADD COLUMN min_withdraw_stars INTEGER NOT NULL DEFAULT 100",
+            "ALTER TABLE shop_items ADD COLUMN price_uzs INTEGER NOT NULL DEFAULT 0",
+        ):
+            try:
+                await db.execute(alter_sql)
+            except aiosqlite.OperationalError:
+                pass  # ustun allaqachon mavjud
+
         # Default sozlamalar (faqat birinchi marta)
         await db.execute("""
             INSERT OR IGNORE INTO settings (id, ref_reward_stars, min_referals_required,
-                                            jackpot_ticket_cost, jackpot_fund)
-            VALUES (1, 5, 3, 10, 0)
+                                            jackpot_ticket_cost, jackpot_fund, min_withdraw_stars)
+            VALUES (1, 5, 3, 10, 0, 100)
         """)
 
         # Namuna mahsulotlar (faqat birinchi marta)
         await db.execute("""
-            INSERT OR IGNORE INTO shop_items (category, name, price_stars, description)
-            SELECT 'gift', '🎁 Oltin Gift', 100, 'Eng zo''r sovg''a!'
+            INSERT OR IGNORE INTO shop_items (category, name, price_stars, price_uzs, description)
+            SELECT 'gift', '🎁 Oltin Gift', 100, 20000, 'Eng zo''r sovg''a!'
             WHERE NOT EXISTS (SELECT 1 FROM shop_items)
         """)
         await db.execute("""
-            INSERT OR IGNORE INTO shop_items (category, name, price_stars, description)
-            SELECT 'star', '⭐ 1000 Yulduz', 50, 'Hisobingizga 1000 yulduz'
+            INSERT OR IGNORE INTO shop_items (category, name, price_stars, price_uzs, description)
+            SELECT 'star', '⭐ 1000 Yulduz', 0, 15000, 'Hisobingizga 1000 yulduz'
             WHERE NOT EXISTS (SELECT 1 FROM shop_items WHERE category = 'star')
         """)
         await db.execute("""
-            INSERT OR IGNORE INTO shop_items (category, name, price_stars, description)
-            SELECT 'premium', '💎 Premium 1 oy', 200, 'Telegram Premium 1 oy'
+            INSERT OR IGNORE INTO shop_items (category, name, price_stars, price_uzs, description)
+            SELECT 'premium', '💎 Premium 1 oy', 200, 30000, 'Telegram Premium 1 oy'
             WHERE NOT EXISTS (SELECT 1 FROM shop_items WHERE category = 'premium')
         """)
 
@@ -193,7 +206,7 @@ async def get_settings() -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT ref_reward_stars, min_referals_required, jackpot_ticket_cost, jackpot_fund FROM settings WHERE id = 1"
+            "SELECT ref_reward_stars, min_referals_required, jackpot_ticket_cost, jackpot_fund, min_withdraw_stars FROM settings WHERE id = 1"
         )
         row = await cur.fetchone()
         return dict(row) if row else None
@@ -293,11 +306,11 @@ async def get_shop_item(item_id: int) -> dict | None:
         return dict(row) if row else None
 
 
-async def add_shop_item(category: str, name: str, price_stars: int, description: str, image_file_id: str | None) -> None:
+async def add_shop_item(category: str, name: str, price_stars: int, price_uzs: int, description: str = "", image_file_id: str | None = None) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO shop_items (category, name, price_stars, description, image_file_id) VALUES (?, ?, ?, ?, ?)",
-            (category, name, price_stars, description, image_file_id),
+            "INSERT INTO shop_items (category, name, price_stars, price_uzs, description, image_file_id) VALUES (?, ?, ?, ?, ?, ?)",
+            (category, name, price_stars, price_uzs, description, image_file_id),
         )
         await db.commit()
 
@@ -480,9 +493,19 @@ def inline_btn(text: str, data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=text, callback_data=data)
 
 
-def product_keyboard(item_id: int) -> InlineKeyboardMarkup:
+def product_keyboard(item: dict) -> InlineKeyboardMarkup:
+    """Mahsulot uchun to'lov tugmalari (toifaga qarab ⭐ va/yo UZS)."""
     kb = InlineKeyboardBuilder()
-    kb.button(text="🛒 Sotib olish", callback_data=f"buy:{item_id}")
+    if item["category"] == "star":
+        # Yulduzlar faqat UZS bilan sotib olinadi
+        if item["price_uzs"] > 0:
+            kb.button(text=f"💳 UZSda sotib olish ({item['price_uzs']:,} so'm)", callback_data=f"buy_uzs:{item['id']}")
+    else:
+        # Gift va Premium: ham yulduz, ham UZS ishlaydi
+        if item["price_stars"] > 0:
+            kb.button(text=f"⭐ Yulduzda ({item['price_stars']} ⭐)", callback_data=f"buy:{item['id']}")
+        if item["price_uzs"] > 0:
+            kb.button(text=f"💳 UZSda ({item['price_uzs']:,} so'm)", callback_data=f"buy_uzs:{item['id']}")
     kb.button(text="🔙 Ortga", callback_data="shop")
     return kb.as_markup()
 
@@ -641,12 +664,27 @@ async def withdraw_handler(message: Message) -> None:
         await message.answer("❌ Avval /start ni bosing!")
         return
 
+    settings = await get_settings()
+    min_withdraw = settings["min_withdraw_stars"]
+
+    if user["balance_stars"] < min_withdraw:
+        need = min_withdraw - user["balance_stars"]
+        await message.answer(
+            f"💸 <b>Yulduz yechish</b>\n\n"
+            f"Balansingiz: <b>{user['balance_stars']} ⭐</b>\n\n"
+            f"❌ Yechib olish uchun minimal <b>{min_withdraw} ⭐</b> bo'lishi kerak.\n"
+            f"Sizga yana <b>{need} ⭐</b> kerak.\n"
+            f"Yana odam taklif qiling yoki bot egasi bilan bog'laning: @Kottabolladan",
+        )
+        return
+
     kb = InlineKeyboardBuilder()
     kb.button(text="📩 @Kottabolladan", url="https://t.me/Kottabolladan")
 
     await message.answer(
         f"💸 <b>Yulduz yechish</b>\n\n"
-        f"Balansingiz: <b>{user['balance_stars']} ⭐</b>\n\n"
+        f"Balansingiz: <b>{user['balance_stars']} ⭐</b>\n"
+        f"Minimal: <b>{min_withdraw} ⭐</b>\n\n"
         f"Yulduzlarni yechish uchun bot egasiga murojaat qiling:\n"
         f"👑 <b>@Kottabolladan</b>\n\n"
         f"Yulduzlar yechib olinadi va kartangizga/telefoningizga o'tkaziladi.",
@@ -730,7 +768,11 @@ async def shop_category_callback(call: CallbackQuery) -> None:
 
     kb = InlineKeyboardBuilder()
     for item in items:
-        kb.button(text=f"{item['name']} — {item['price_stars']} ⭐", callback_data=f"item:{item['id']}")
+        if item["category"] == "star":
+            btn_text = f"{item['name']} — {item['price_uzs']:,} so'm"
+        else:
+            btn_text = f"{item['name']} — {item['price_stars']} ⭐ / {item['price_uzs']:,} so'm"
+        kb.button(text=btn_text, callback_data=f"item:{item['id']}")
     kb.button(text="🔙 Ortga", callback_data="shop")
     kb.adjust(1)
 
@@ -748,14 +790,18 @@ async def item_detail_callback(call: CallbackQuery, bot: Bot) -> None:
 
     label = CATEGORIES.get(item["category"], item["category"])
     description = item["description"] or ""
+    if item["category"] == "star":
+        price_line = f"💰 Narxi: <b>{item['price_uzs']:,} so'm</b>"
+    else:
+        price_line = f"💰 Narxi: <b>{item['price_stars']} ⭐</b> yoki <b>{item['price_uzs']:,} so'm</b>"
     text = (
         f"{label}\n\n"
         f"<b>{item['name']}</b>\n"
-        f"💰 Narxi: <b>{item['price_stars']} ⭐</b>"
+        f"{price_line}"
     )
     if description:
         text += f"\n\n{description}"
-    kb = product_keyboard(item_id)
+    kb = product_keyboard(item)
 
     if item["image_file_id"]:
         try:
@@ -770,6 +816,7 @@ async def item_detail_callback(call: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(F.data.startswith("buy:"))
 async def buy_item_callback(call: CallbackQuery, bot: Bot) -> None:
+    """Gift/Premiumni yulduz (⭐) bilan sotib olish."""
     item_id = int(call.data.split(":")[1])
     user = await get_user(call.from_user.id)
     item = await get_shop_item(item_id)
@@ -778,7 +825,12 @@ async def buy_item_callback(call: CallbackQuery, bot: Bot) -> None:
         await call.answer("❌ Xatolik yuz berdi", show_alert=True)
         return
 
+    if item["category"] == "star":
+        await call.answer("⭐ Yulduzlar faqat UZS bilan sotib olinadi!", show_alert=True)
+        return
+
     settings = await get_settings()
+    label = CATEGORIES.get(item["category"], item["category"])
 
     # Minimal referallar cheklovi
     if user["referals_count"] < settings["min_referals_required"]:
@@ -790,16 +842,21 @@ async def buy_item_callback(call: CallbackQuery, bot: Bot) -> None:
         )
         return
 
-    # Balans tekshiruvi
+    # Balans tekshiruvi — yetarli bo'lmasa taklif qilish yoki ega bilan bog'lanish
     if user["balance_stars"] < item["price_stars"]:
-        await call.answer("❌ Balansingizda yetarli yulduz yo'q!", show_alert=True)
+        need_stars = item["price_stars"] - user["balance_stars"]
+        await call.answer(
+            f"❌ Balansingiz yetarli emas!\n\n"
+            f"Sizga yana <b>{need_stars} ⭐</b> kerak.\n"
+            f"Yana odam taklif qiling yoki bot egasi bilan bog'laning: @Kottabolladan",
+            show_alert=True,
+        )
         return
 
-    # Xarid
+    # Xarid — yulduz ayriladi
     await deduct_stars(call.from_user.id, item["price_stars"])
 
     # Adminga buyurtma yuboramiz
-    label = CATEGORIES.get(item["category"], item["category"])
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
@@ -808,7 +865,7 @@ async def buy_item_callback(call: CallbackQuery, bot: Bot) -> None:
                 f"👤 Foydalanuvchi: {call.from_user.first_name} (@{call.from_user.username or '—'})\n"
                 f"🆔 ID: <code>{call.from_user.id}</code>\n"
                 f"{label} <b>{item['name']}</b>\n"
-                f"💰 Narxi: <b>{item['price_stars']} ⭐</b>\n"
+                f"💰 Narxi: <b>{item['price_stars']} ⭐</b> (yulduzda)\n"
                 f"👥 Referallar: {user['referals_count']}\n"
                 f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             )
@@ -818,10 +875,53 @@ async def buy_item_callback(call: CallbackQuery, bot: Bot) -> None:
     await call.message.delete()
     await call.message.answer(
         f"✅ <b>Xarid muvaffaqiyatli!</b>\n\n"
-        f"{label} <b>{item['name']}</b> sotib olindi. "
+        f"{label} <b>{item['name']}</b> — {item['price_stars']} ⭐ ayirildi. "
         f"Buyurtma adminga yuborildi, tez orada siz bilan bog'lanamiz. 🎁",
     )
     await call.answer("✅ Sotib olindi!", show_alert=False)
+
+
+@router.callback_query(F.data.startswith("buy_uzs:"))
+async def buy_item_uzs_callback(call: CallbackQuery, bot: Bot) -> None:
+    """Har qanday mahsulotni UZS (so'm) bilan sotib olish — naqd to'lov."""
+    item_id = int(call.data.split(":")[1])
+    user = await get_user(call.from_user.id)
+    item = await get_shop_item(item_id)
+
+    if not user or not item:
+        await call.answer("❌ Xatolik yuz berdi", show_alert=True)
+        return
+
+    if item["price_uzs"] <= 0:
+        await call.answer("❌ Bu mahsulot uchun UZS narxi belgilanmagan!", show_alert=True)
+        return
+
+    label = CATEGORIES.get(item["category"], item["category"])
+
+    # Adminga buyurtma yuboramiz (UZS to'lov)
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🛒 <b>YANGI BUYURTMA (UZS)!</b>\n\n"
+                f"👤 Foydalanuvchi: {call.from_user.first_name} (@{call.from_user.username or '—'})\n"
+                f"🆔 ID: <code>{call.from_user.id}</code>\n"
+                f"{label} <b>{item['name']}</b>\n"
+                f"💰 Narxi: <b>{item['price_uzs']:,} so'm</b>\n"
+                f"👥 Referallar: {user['referals_count']}\n"
+                f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            )
+        except TelegramForbiddenError:
+            pass
+
+    await call.message.delete()
+    await call.message.answer(
+        f"✅ <b>Buyurtma qabul qilindi!</b>\n\n"
+        f"{label} <b>{item['name']}</b> — <b>{item['price_uzs']:,} so'm</b>\n\n"
+        f"To'lovni amalga oshirish uchun bot egasi siz bilan bog'lanadi:\n"
+        f"👑 <b>@Kottabolladan</b>",
+    )
+    await call.answer("✅ Buyurtma yuborildi!", show_alert=False)
 
 
 # ============================================================
@@ -901,7 +1001,8 @@ async def admin_stats(call: CallbackQuery) -> None:
         f"🎰 Ishtirokchilar: <b>{len(participants)}</b>\n"
         f"⭐ Referal mukofoti: {settings['ref_reward_stars']}\n"
         f"👥 Min. referallar: {settings['min_referals_required']}\n"
-        f"🎟️ Bilet narxi: {settings['jackpot_ticket_cost']}"
+        f"🎟️ Bilet narxi: {settings['jackpot_ticket_cost']}\n"
+        f"💸 Yechish minimumi: {settings['min_withdraw_stars']}"
     )
     await call.message.edit_text(text, reply_markup=back_to_admin_keyboard())
     await call.answer()
@@ -920,6 +1021,7 @@ def settings_keyboard() -> InlineKeyboardMarkup:
     kb.button(text="⭐ Referal mukofoti", callback_data="admin:set:ref_reward")
     kb.button(text="👥 Min. referallar", callback_data="admin:set:min_ref")
     kb.button(text="🎟️ Jekpot bilet narxi", callback_data="admin:set:jackpot_cost")
+    kb.button(text="💸 Yulduz yechish minimumi", callback_data="admin:set:min_withdraw")
     kb.button(text="🔙 Ortga", callback_data="admin")
     kb.adjust(1)
     return kb.as_markup()
@@ -935,7 +1037,8 @@ async def admin_settings(call: CallbackQuery) -> None:
         f"⚙️ <b>Sozlamalar</b>\n\n"
         f"⭐ Referal mukofoti: <b>{s['ref_reward_stars']} ⭐</b>\n"
         f"👥 Xarid uchun min. referallar: <b>{s['min_referals_required']}</b>\n"
-        f"🎟️ Jekpot bilet narxi: <b>{s['jackpot_ticket_cost']} ⭐</b>\n\n"
+        f"🎟️ Jekpot bilet narxi: <b>{s['jackpot_ticket_cost']} ⭐</b>\n"
+        f"💸 Yulduz yechish minimumi: <b>{s['min_withdraw_stars']} ⭐</b>\n\n"
         f"O'zgartirmoqchi bo'lgan qiymatni tanlang:"
     )
     await call.message.edit_text(text, reply_markup=settings_keyboard())
@@ -1008,6 +1111,28 @@ async def jackpot_cost_input(message: Message, state: FSMContext) -> None:
     await message.answer(f"✅ Jekpot bilet narxi <b>{value} ⭐</b> qilib o'rnatildi.", reply_markup=admin_keyboard())
 
 
+@router.callback_query(F.data == "admin:set:min_withdraw")
+async def set_min_withdraw(call: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(SettingsStates.min_withdraw)
+    await call.message.edit_text(
+        "✏️ <b>Yangi yulduz yechish minimumini yozing:</b>\n"
+        "(foydalanuvchi qancha yulduz yig'sa, yechib olish mumkin bo'ladi)",
+    )
+    await call.answer()
+
+
+@router.message(SettingsStates.min_withdraw)
+async def min_withdraw_input(message: Message, state: FSMContext) -> None:
+    try:
+        value = int(message.text)
+    except ValueError:
+        await message.answer("❌ Iltimos, butun son kiriting!")
+        return
+    await update_settings(min_withdraw_stars=value)
+    await state.clear()
+    await message.answer(f"✅ Yulduz yechish minimumi <b>{value} ⭐</b> qilib o'rnatildi.", reply_markup=admin_keyboard())
+
+
 # ---------- Savdo boshqaruvi ----------
 
 def shop_management_keyboard() -> InlineKeyboardMarkup:
@@ -1048,13 +1173,42 @@ async def admin_add_item_start(call: CallbackQuery, state: FSMContext) -> None:
 async def add_item_name(message: Message, state: FSMContext) -> None:
     await state.update_data(name=message.text.strip())
     await state.set_state(AddItemStates.name)
-    await message.answer("💲 <b>Narxini yozing</b> (yulduzlarda, son ko'rinishida):")
+    await message.answer("💲 <b>UZS narxini yozing</b> (so'mda, son ko'rinishida):")
 
 
 @router.message(AddItemStates.name)
 async def add_item_price(message: Message, state: FSMContext) -> None:
     try:
-        price = int(message.text)
+        price_uzs = int(message.text.replace(" ", ""))
+    except ValueError:
+        await message.answer("❌ Iltimos, butun son kiriting!")
+        return
+    await state.update_data(price_uzs=price_uzs)
+
+    data = await state.get_data()
+    if data["category"] == "star":
+        # Yulduzlar toifasi faqat UZS bilan — yulduz narxi kerak emas
+        await add_shop_item(
+            category=data["category"],
+            name=data["name"],
+            price_stars=0,
+            price_uzs=price_uzs,
+        )
+        await state.clear()
+        await message.answer(
+            f"✅ Mahsulot qo'shildi!\n\n{data['name']} — {price_uzs:,} so'm",
+            reply_markup=admin_keyboard(),
+        )
+    else:
+        # Gift / Premium: yulduz narxi ham kerak
+        await state.set_state(AddItemStates.price)
+        await message.answer("⭐ <b>Yulduz narxini yozing</b> (yulduzlarda, son ko'rinishida):")
+
+
+@router.message(AddItemStates.price)
+async def add_item_stars_price(message: Message, state: FSMContext) -> None:
+    try:
+        price_stars = int(message.text)
     except ValueError:
         await message.answer("❌ Iltimos, butun son kiriting!")
         return
@@ -1062,12 +1216,14 @@ async def add_item_price(message: Message, state: FSMContext) -> None:
     await add_shop_item(
         category=data["category"],
         name=data["name"],
-        price_stars=price,
-        description="",
-        image_file_id=None,
+        price_stars=price_stars,
+        price_uzs=data["price_uzs"],
     )
     await state.clear()
-    await message.answer(f"✅ Mahsulot qo'shildi!\n\n{data['name']} — {price} ⭐", reply_markup=admin_keyboard())
+    await message.answer(
+        f"✅ Mahsulot qo'shildi!\n\n{data['name']} — {price_stars} ⭐ / {data['price_uzs']:,} so'm",
+        reply_markup=admin_keyboard(),
+    )
 
 
 # --- Mahsulot o'chirish ---
