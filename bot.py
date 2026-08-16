@@ -89,6 +89,7 @@ class SettingsStates(StatesGroup):
     ref_reward = State()      # bitta referal uchun yulduz
     min_referals = State()    # xarid uchun minimal referallar
     jackpot_cost = State()    # jekpot bilet narxi
+    jackpot_interval = State() # avtomatik o'yin oralig'i (soat)
     min_withdraw = State()    # yulduz yechish uchun minimal
     pay_card = State()        # to'lov karta raqami
     reviews_channel = State() # otziv kanali
@@ -138,6 +139,7 @@ async def db_init() -> None:
                 balance_stars INTEGER NOT NULL DEFAULT 0,
                 referals_count INTEGER NOT NULL DEFAULT 0,
                 referrer_id INTEGER,
+                last_free_ticket TEXT DEFAULT '',
                 joined_at TEXT NOT NULL
             )
         """)
@@ -148,6 +150,8 @@ async def db_init() -> None:
                 min_referals_required INTEGER NOT NULL DEFAULT 3,
                 jackpot_ticket_cost INTEGER NOT NULL DEFAULT 10,
                 jackpot_fund INTEGER NOT NULL DEFAULT 0,
+                jackpot_interval_hours INTEGER NOT NULL DEFAULT 24,
+                jackpot_next_draw INTEGER NOT NULL DEFAULT 0,
                 min_withdraw_stars INTEGER NOT NULL DEFAULT 100,
                 pay_card TEXT NOT NULL DEFAULT '9860180104681937',
                 reviews_channel TEXT DEFAULT ''
@@ -170,6 +174,15 @@ async def db_init() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_id INTEGER UNIQUE NOT NULL,
                 tickets_count INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS jackpot_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                winner_id INTEGER NOT NULL,
+                winner_name TEXT DEFAULT '',
+                prize INTEGER NOT NULL,
+                drawn_at TEXT NOT NULL
             )
         """)
         await db.execute("""
@@ -204,6 +217,9 @@ async def db_init() -> None:
 
         # Eski DB bo'lsa, yangi ustunlarni qo'shamiz (migratsiya)
         for alter_sql in (
+            "ALTER TABLE users ADD COLUMN last_free_ticket TEXT DEFAULT ''",
+            "ALTER TABLE settings ADD COLUMN jackpot_interval_hours INTEGER NOT NULL DEFAULT 24",
+            "ALTER TABLE settings ADD COLUMN jackpot_next_draw INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE settings ADD COLUMN min_withdraw_stars INTEGER NOT NULL DEFAULT 100",
             "ALTER TABLE shop_items ADD COLUMN price_uzs INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE settings ADD COLUMN pay_card TEXT NOT NULL DEFAULT '9860180104681937'",
@@ -218,8 +234,9 @@ async def db_init() -> None:
         # Default sozlamalar (faqat birinchi marta)
         await db.execute("""
             INSERT OR IGNORE INTO settings (id, ref_reward_stars, min_referals_required,
-                                            jackpot_ticket_cost, jackpot_fund, min_withdraw_stars, pay_card)
-            VALUES (1, 5, 3, 10, 0, 100, '9860180104681937')
+                                            jackpot_ticket_cost, jackpot_fund, jackpot_interval_hours,
+                                            jackpot_next_draw, min_withdraw_stars, pay_card)
+            VALUES (1, 5, 3, 10, 0, 24, 0, 100, '9860180104681937')
         """)
 
         # Namuna mahsulotlar (faqat birinchi marta)
@@ -261,7 +278,8 @@ async def get_settings() -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT ref_reward_stars, min_referals_required, jackpot_ticket_cost, jackpot_fund, min_withdraw_stars, pay_card, reviews_channel FROM settings WHERE id = 1"
+            "SELECT ref_reward_stars, min_referals_required, jackpot_ticket_cost, jackpot_fund, "
+            "jackpot_interval_hours, jackpot_next_draw, min_withdraw_stars, pay_card, reviews_channel FROM settings WHERE id = 1"
         )
         row = await cur.fetchone()
         return dict(row) if row else None
@@ -408,6 +426,39 @@ async def clear_participants() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM jackpot_participants")
         await db.commit()
+
+
+async def set_last_free_ticket(telegram_id: int, date_str: str) -> None:
+    """Foydalanuvchining kunlik bepul bilet olgan sanasini saqlaydi."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET last_free_ticket = ? WHERE telegram_id = ?", (date_str, telegram_id))
+        await db.commit()
+
+
+async def add_jackpot_history(winner_id: int, winner_name: str, prize: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO jackpot_history (winner_id, winner_name, prize, drawn_at) VALUES (?, ?, ?, ?)",
+            (winner_id, winner_name, prize, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        await db.commit()
+
+
+async def get_jackpot_history(limit: int = 3) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM jackpot_history ORDER BY id DESC LIMIT ?", (limit,))
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+def format_countdown(seconds: int) -> str:
+    """Qolgan vaqtni HH:MM:SS ko'rinishida qaytaradi."""
+    if seconds <= 0:
+        return "00:00:00"
+    h, rem = divmod(int(seconds), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 # ---------- Majburiy kanallar ----------
@@ -964,24 +1015,38 @@ async def show_jackpot(answer_func, telegram_id: int) -> None:
     """Jekpot menyusini ko'rsatadi (har qanday answer funksiya bilan)."""
     settings = await get_settings()
     participants = await get_participants()
+    user = await get_user(telegram_id)
     user_tickets = await get_user_tickets(telegram_id)
     total_tickets = sum(p["tickets_count"] for p in participants)
+    history = await get_jackpot_history(3)
 
     kb = InlineKeyboardBuilder()
+    today = datetime.now().strftime("%Y-%m-%d")
+    if not user or user["last_free_ticket"] != today:
+        kb.button(text="🎟️ Kunlik bepul bilet (0 ⭐)", callback_data="jackpot_free")
     for qty in (1, 3, 5):
         kb.button(text=f"🎟️ {qty} bilet", callback_data=f"jackpot_buy:{qty}")
     kb.button(text="🔙 Bosh menyu", callback_data="main_menu")
-    kb.adjust(3)
+    kb.adjust(1)
+
+    next_draw = settings["jackpot_next_draw"] or 0
+    remaining = next_draw - int(datetime.now().timestamp())
 
     text = (
         f"🎰 <b>JEKPOT</b>\n\n"
         f"💰 Jekpot fondi: <b>{settings['jackpot_fund']} ⭐</b>\n"
         f"🎟️ Bilet narxi: <b>{settings['jackpot_ticket_cost']} ⭐</b>\n"
         f"👥 Ishtirokchilar: <b>{len(participants)}</b>\n"
-        f"📊 Jami biletlar: <b>{total_tickets}</b>\n\n"
+        f"📊 Jami biletlar: <b>{total_tickets}</b>\n"
+        f"⏱ Navbatdagi o'yin: <b>{format_countdown(remaining)}</b>\n\n"
         f"⭐ Sizning biletlaringiz: <b>{user_tickets}</b>\n\n"
         f"Qancha ko'p bilet olsangiz, g'olib bo'lish imkoniyati shuncha yuqori!"
     )
+    if history:
+        text += "\n\n🏆 <b>Oxirgi g'oliblar:</b>\n"
+        for h in history:
+            text += f"• {h['winner_name']} — <b>+{h['prize']} ⭐</b> ({h['drawn_at'][:16]})\n"
+
     await answer_func(text, reply_markup=kb.as_markup())
 
 
@@ -1419,6 +1484,30 @@ async def jackpot_buy_callback(call: CallbackQuery) -> None:
     await show_jackpot(call.message.answer, call.from_user.id)
 
 
+@router.callback_query(F.data == "jackpot_free")
+async def jackpot_free_callback(call: CallbackQuery) -> None:
+    """Kuniga 1 marta bepul bilet."""
+    user = await get_user(call.from_user.id)
+    if not user:
+        await call.answer("❌ Avval /start ni bosing!", show_alert=True)
+        return
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    if user["last_free_ticket"] == today:
+        await call.answer("❌ Kunlik bepul biletni allaqachon olgansiz!", show_alert=True)
+        return
+
+    await add_tickets(call.from_user.id, 1)
+    await set_last_free_ticket(call.from_user.id, today)
+    await call.answer("✅ Kunlik bepul bilet olindi!", show_alert=False)
+
+    try:
+        await call.message.delete()
+    except TelegramBadRequest:
+        pass
+    await show_jackpot(call.message.answer, call.from_user.id)
+
+
 # ============================================================
 #  ADMIN PANEL
 # ============================================================
@@ -1464,6 +1553,7 @@ async def admin_stats(call: CallbackQuery) -> None:
         f"⭐ Referal mukofoti: {settings['ref_reward_stars']}\n"
         f"👥 Min. referallar: {settings['min_referals_required']}\n"
         f"🎟️ Bilet narxi: {settings['jackpot_ticket_cost']}\n"
+        f"⏱ Avto o'yin oralig'i: {settings['jackpot_interval_hours']} soat\n"
         f"💸 Yechish minimumi: {settings['min_withdraw_stars']}"
     )
     await call.message.edit_text(text, reply_markup=back_to_admin_keyboard())
@@ -1483,6 +1573,7 @@ def settings_keyboard() -> InlineKeyboardMarkup:
     kb.button(text="⭐ Referal mukofoti", callback_data="admin:set:ref_reward")
     kb.button(text="👥 Min. referallar", callback_data="admin:set:min_ref")
     kb.button(text="🎟️ Jekpot bilet narxi", callback_data="admin:set:jackpot_cost")
+    kb.button(text="⏱ Jekpot oralig'i (soat)", callback_data="admin:set:jackpot_interval")
     kb.button(text="💸 Yulduz yechish minimumi", callback_data="admin:set:min_withdraw")
     kb.button(text="💳 To'lov kartasi", callback_data="admin:set:pay_card")
     kb.button(text="⭐ Otziv kanali", callback_data="admin:set:reviews_channel")
@@ -1503,6 +1594,7 @@ async def admin_settings(call: CallbackQuery) -> None:
         f"⭐ Referal mukofoti: <b>{s['ref_reward_stars']} ⭐</b>\n"
         f"👥 Xarid uchun min. referallar: <b>{s['min_referals_required']}</b>\n"
         f"🎟️ Jekpot bilet narxi: <b>{s['jackpot_ticket_cost']} ⭐</b>\n"
+        f"⏱ Jekpot oralig'i: <b>{s['jackpot_interval_hours']} soat</b>\n"
         f"💸 Yulduz yechish minimumi: <b>{s['min_withdraw_stars']} ⭐</b>\n"
         f"💳 To'lov kartasi: <code>{s['pay_card']}</code>\n"
         f"⭐ Otziv: {reviews_display}\n\n"
@@ -1585,6 +1677,40 @@ async def jackpot_cost_input(message: Message, state: FSMContext) -> None:
     await update_settings(jackpot_ticket_cost=value)
     await state.clear()
     await message.answer(f"✅ Jekpot bilet narxi <b>{value} ⭐</b> qilib o'rnatildi.", reply_markup=admin_keyboard())
+
+
+@router.callback_query(F.data == "admin:set:jackpot_interval")
+async def set_jackpot_interval(call: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    await state.set_state(SettingsStates.jackpot_interval)
+    await call.message.edit_text(
+        "⏱ <b>Avtomatik o'yin oralig'ini yozing (soat):</b>\n"
+        "(masalan: 24 — har kuni, 12 — har 12 soatda o'yin o'tkaziladi)\n"
+        "0 yozsangiz, avtomatik o'yin o'chadi (faqat qo'lda).",
+    )
+    await call.answer()
+
+
+@router.message(SettingsStates.jackpot_interval)
+async def jackpot_interval_input(message: Message, state: FSMContext) -> None:
+    try:
+        value = int(message.text)
+    except ValueError:
+        await message.answer("❌ Iltimos, butun son kiriting!")
+        return
+    if value < 0:
+        await message.answer("❌ Oraliq manfiy bo'lishi mumkin emas!")
+        return
+    await update_settings(jackpot_interval_hours=value)
+    # Yangi intervalga qarab keyingi o'yin vaqtini qayta hisoblaymiz
+    if value > 0:
+        now = int(datetime.now().timestamp())
+        await update_settings(jackpot_next_draw=now + value * 3600)
+    await state.clear()
+    mode = "o'chirildi (faqat qo'lda o'yin)" if value == 0 else f"{value} soatga o'rnatildi"
+    await message.answer(f"✅ Avtomatik jekpot oralig'i <b>{mode}</b>.", reply_markup=admin_keyboard())
 
 
 @router.callback_query(F.data == "admin:set:min_withdraw")
@@ -1822,21 +1948,24 @@ async def admin_jackpot(call: CallbackQuery) -> None:
     await call.answer()
 
 
-@router.callback_query(F.data == "admin:jackpot_confirm")
-async def admin_jackpot_confirm(call: CallbackQuery, bot: Bot) -> None:
-    if not is_admin(call.from_user.id):
-        await call.answer("❌ Siz admin emassiz!", show_alert=True)
-        return
+async def run_jackpot_draw(bot: Bot, admin_call: CallbackQuery | None = None) -> bool:
+    """Jekpot o'yinini o'tkazadi.
+
+    admin_call berilsa — qo'lda (admin) o'yin, xabar shu chatda yangilanadi.
+    Aks holda — avtomatik taymer o'yini.
+    """
     settings = await get_settings()
     participants = await get_participants()
     if not participants:
-        await call.answer("❌ Ishtirokchilar yo'q!", show_alert=True)
-        return
+        if admin_call:
+            await admin_call.answer("❌ Ishtirokchilar yo'q!", show_alert=True)
+        return False
 
     fund = settings["jackpot_fund"]
     if fund <= 0:
-        await call.answer("❌ Jekpot fondi bo'sh (0 ⭐)! Avval biletlar sotilishi kerak.", show_alert=True)
-        return
+        if admin_call:
+            await admin_call.answer("❌ Jekpot fondi bo'sh (0 ⭐)! Avval biletlar sotilishi kerak.", show_alert=True)
+        return False
 
     # Og'irlik bo'yicha g'olib tanlash (har bilet = 1 imkoniyat) — samarali usul
     total = sum(p["tickets_count"] for p in participants)
@@ -1850,8 +1979,9 @@ async def admin_jackpot_confirm(call: CallbackQuery, bot: Bot) -> None:
             break
 
     if winner_id is None:
-        await call.answer("❌ G'olib tanlashda xatolik!", show_alert=True)
-        return
+        if admin_call:
+            await admin_call.answer("❌ G'olib tanlashda xatolik!", show_alert=True)
+        return False
 
     # G'olibga fondni o'tkazamiz
     await add_stars(winner_id, fund)
@@ -1866,6 +1996,8 @@ async def admin_jackpot_confirm(call: CallbackQuery, bot: Bot) -> None:
     except Exception:
         pass
 
+    await add_jackpot_history(winner_id, winner_name, fund)
+
     announcement = (
         f"🏆 <b>JEKPOT G'OLIBI!</b>\n\n"
         f"👤 {winner_name}\n"
@@ -1874,8 +2006,12 @@ async def admin_jackpot_confirm(call: CallbackQuery, bot: Bot) -> None:
         f"Tabriklaymiz! 🎉"
     )
 
-    await call.message.edit_text(announcement)
-    await call.answer("✅ O'yin yakunlandi!", show_alert=True)
+    if admin_call:
+        try:
+            await admin_call.message.edit_text(announcement)
+        except TelegramBadRequest:
+            pass
+        await admin_call.answer("✅ O'yin yakunlandi!", show_alert=True)
 
     # G'olibga xabar
     try:
@@ -1895,6 +2031,41 @@ async def admin_jackpot_confirm(call: CallbackQuery, bot: Bot) -> None:
         # Telegram flood'iga tushmaslik uchun kichik pauza
         if i % 20 == 19:
             await asyncio.sleep(1)
+
+    return True
+
+
+async def jackpot_timer_loop(bot: Bot) -> None:
+    """Avtomatik jekpot: belgilangan vaqt yetganda o'yin o'tkazadi."""
+    while True:
+        try:
+            settings = await get_settings()
+            if settings:
+                now = int(datetime.now().timestamp())
+                interval = settings.get("jackpot_interval_hours") or 0
+                next_draw = settings.get("jackpot_next_draw") or 0
+                if interval <= 0:
+                    # Avtomatik o'yin o'chiq — faqat qo'lda
+                    if next_draw:
+                        await update_settings(jackpot_next_draw=0)
+                elif not next_draw:
+                    # Birinchi o'yin vaqtini belgilaymiz
+                    await update_settings(jackpot_next_draw=now + interval * 3600)
+                elif now >= next_draw:
+                    await run_jackpot_draw(bot)
+                    # Keyingi o'yinni rejalashtiramiz (o'yin o'tmasa ham)
+                    await update_settings(jackpot_next_draw=now + interval * 3600)
+        except Exception as e:
+            logger.exception("Jekpot taymerida xatolik: %s", e)
+        await asyncio.sleep(30)
+
+
+@router.callback_query(F.data == "admin:jackpot_confirm")
+async def admin_jackpot_confirm(call: CallbackQuery, bot: Bot) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    await run_jackpot_draw(bot, admin_call=call)
 
 
 # ---------- Rassilka ----------
@@ -2151,6 +2322,9 @@ async def main() -> None:
     # alohida register qilinadi:
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
+
+    # Avtomatik jekpot o'yin taymeri (polling ham, webhook ham ishlaydi)
+    asyncio.create_task(jackpot_timer_loop(bot))
 
     if WEBHOOK_URL:
         # Render/webhook rejimi
