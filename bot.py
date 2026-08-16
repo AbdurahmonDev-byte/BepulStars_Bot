@@ -45,6 +45,18 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 load_dotenv()
+from aiohttp import web
+
+async def handle_ping(request):
+    return web.Response(text="Bot is alive!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 10000)
+    await site.start()
 
 # ============================================================
 #  GLOBAL SOZLAMALAR (env fayldan o'qiladi)
