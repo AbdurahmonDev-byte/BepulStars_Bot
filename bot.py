@@ -53,9 +53,12 @@ async def handle_ping(request):
 async def start_web_server():
     app = web.Application()
     app.router.add_get('/', handle_ping)
+    app.router.add_get('/webhook', handle_ping)  # Render health-check shu yo'lni tekshiradi
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 10000)
+    # Render PORT env orqali portni beradi — qattiq yozilgan 10000 emas, o'shani ishlatamiz
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
 
 # ============================================================
@@ -540,17 +543,79 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
+def normalize_channel_id(raw: str) -> str:
+    """Admin kiritgan kanal ID/username ni Telegram Bot API tushunadigan
+    formatga keltiradi. Quyidagilarni qo'llab-quvvatlaydi:
+      -1001234567890            -> -1001234567890 (o'zgarmaydi)
+      @mychannel                -> @mychannel (o'zgarmaydi)
+      mychannel                 -> @mychannel ("@" qo'shiladi)
+      https://t.me/mychannel    -> @mychannel
+      t.me/mychannel            -> @mychannel
+    """
+    value = (raw or "").strip()
+    for prefix in ("https://t.me/", "http://t.me/", "t.me/", "@"):
+        if value.lower().startswith(prefix):
+            value = value[len(prefix):]
+            break
+    value = value.strip().strip("/")
+    if not value:
+        return raw
+    if value.lstrip("-").isdigit():
+        # Raqamli chat ID (masalan -1001234567890)
+        return value
+    # Ochiq kanal username'i — "@" bilan boshlanishi shart
+    return f"@{value}"
+
+
+# Konfiguratsiya xatosi haqida adminlarga faqat bir marta xabar berish uchun
+_notified_bad_channels: set[str] = set()
+
+
 async def check_subscriptions(bot: Bot, telegram_id: int, channels: list[dict]) -> list[dict]:
     """Foydalanuvchi majburiy kanallarga a'zo ekanligini tekshiradi.
     A'zo bo'lmagan kanallar ro'yxatini qaytaradi."""
     not_subscribed = []
     for ch in channels:
+        chat_id = normalize_channel_id(ch["channel_id"])
         try:
-            member = await bot.get_chat_member(ch["channel_id"], telegram_id)
-            if member.status not in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+            member = await bot.get_chat_member(chat_id, telegram_id)
+            if member.status not in (
+                ChatMemberStatus.MEMBER,
+                ChatMemberStatus.ADMINISTRATOR,
+                ChatMemberStatus.CREATOR,
+                ChatMemberStatus.RESTRICTED,
+            ):
                 not_subscribed.append(ch)
         except (TelegramBadRequest, TelegramForbiddenError) as e:
-            logger.warning("Kanalni tekshirib bo'lmadi %s: %s", ch["channel_id"], e)
+            # Odatda bu xato ikki sababdan bo'ladi:
+            #  1) Bot kanalda admin emas (getChatMember chaqira olmaydi)
+            #  2) channel_id noto'g'ri kiritilgan (masalan "@" yo'q yoki xato ID)
+            # Bunday holatda foydalanuvchini "obuna emas" deb belgilashning o'zi
+            # xato bo'lishi mumkin — shuning uchun bu holatni aniq logga yozamiz
+            # va adminlarga bir martalik ogohlantirish yuboramiz, lekin baribir
+            # xavfsizlik uchun kanalni "obuna bo'linmagan" deb hisoblaymiz.
+            logger.error(
+                "Kanal tekshiruvi muvaffaqiyatsiz (channel_id=%r -> %r), telegram_id=%s: %s. "
+                "Ehtimol bot kanalda admin emas yoki channel_id noto'g'ri.",
+                ch["channel_id"], chat_id, telegram_id, e,
+            )
+            if chat_id not in _notified_bad_channels:
+                _notified_bad_channels.add(chat_id)
+                warning_text = (
+                    f"⚠️ <b>Majburiy kanal tekshiruvida xatolik!</b>\n\n"
+                    f"Kanal: <code>{ch['channel_id']}</code>\n"
+                    f"Xato: <code>{e}</code>\n\n"
+                    f"Sabablari:\n"
+                    f"• Bot shu kanalda <b>admin</b> emas\n"
+                    f"• Kanal ID/username noto'g'ri kiritilgan\n\n"
+                    f"Botni kanalga admin qilib qo'shing yoki kanal ID sini "
+                    f"admin panelda qaytadan tekshiring."
+                )
+                for admin_id in ADMIN_IDS:
+                    try:
+                        await bot.send_message(admin_id, warning_text)
+                    except Exception:
+                        pass
             not_subscribed.append(ch)
     return not_subscribed
 
@@ -1153,20 +1218,29 @@ def channel_url(value: str) -> str:
 
 @router.message(F.text == "⭐ Otziv")
 async def reviews_handler(message: Message) -> None:
+    """"Otziv" tugmasi botda yozib qoldirish uchun emas — foydalanuvchini
+    to'g'ridan-to'g'ri otziv kanaliga yo'naltiradi (bitta tugma bosish)."""
     s = await get_settings()
 
-    text = (
-        "⭐ <b>Otziv</b>\n\n"
-        "Bizning kanalda fikringizni qoldiring:\n"
-        "mahsulot sifati, yetkazish tezligi va xizmat haqida.\n\n"
-        "Sizning fikringiz biz uchun juda muhim! 💛"
-    )
+    if not s["reviews_channel"]:
+        # Kanal hali sozlanmagan — botda yozib qoldirishga o'rniga aniq xabar beramiz
+        await message.answer(
+            "⭐ <b>Otziv</b>\n\n"
+            "❌ Otziv kanali hali sozlanmagan.\n"
+            "Admin: <code>Sozlamalar → Otziv kanali</code> bo'limidan kanalni belgilang.",
+        )
+        return
+
     kb = InlineKeyboardBuilder()
-    if s["reviews_channel"]:
-        kb.button(text="✍️ Otziv qoldirish", url=channel_url(s["reviews_channel"]))
+    kb.button(text="⭐ Otziv kanaliga o'tish", url=channel_url(s["reviews_channel"]))
     kb.adjust(1)
 
-    await message.answer(text, reply_markup=kb.as_markup() if s["reviews_channel"] else None)
+    await message.answer(
+        "⭐ <b>Otziv</b>\n\n"
+        "Otzivlar shu yerda emas, <b>otziv kanalimizda</b> qoldiriladi.\n"
+        "Pastdagi tugmani bosing va kanalga o'ting 👇",
+        reply_markup=kb.as_markup(),
+    )
 
 
 # ============================================================
@@ -2153,9 +2227,13 @@ async def admin_add_channel(call: CallbackQuery, state: FSMContext) -> None:
 @router.message(AddChannelStates.channel_id)
 async def channel_id_received(message: Message, state: FSMContext) -> None:
     raw = message.text.strip()
-    await state.update_data(channel_id=raw)
+    normalized = normalize_channel_id(raw)
+    await state.update_data(channel_id=normalized)
     await state.set_state(AddChannelStates.invite_link)
-    await message.answer("🔗 <b>Kanal havolasini yuboring:</b>\n(masalan: <code>https://t.me/mychannel</code>)")
+    await message.answer(
+        f"✅ Kanal ID sifatida <code>{normalized}</code> saqlanadi.\n\n"
+        f"🔗 <b>Kanal havolasini yuboring:</b>\n(masalan: <code>https://t.me/mychannel</code>)"
+    )
 
 
 @router.message(AddChannelStates.invite_link)
@@ -2324,7 +2402,10 @@ async def main() -> None:
         logger.info("Webhook server ishga tushdi: %s:%s%s", WEBAPP_HOST, WEBAPP_PORT, WEBHOOK_PATH)
         await asyncio.Event().wait()
     else:
-        await on_startup(bot)          # <-- shu qatorni qo'shing
+        # Eslatma: on_startup allaqachon dp.startup.register() orqali ro'yxatdan
+        # o'tgan — dp.start_polling() uni o'zi avtomatik chaqiradi. Bu yerda yana
+        # qo'lda chaqirilsa, db_init/webhook o'chirish 2 marta bajariladi (zararsiz,
+        # lekin ortiqcha), shuning uchun faqat bitta marta ishlaydi.
         await start_web_server()
         await dp.start_polling(bot)
 
