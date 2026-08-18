@@ -83,6 +83,7 @@ CATEGORIES = {
     "gift": "🎁 Gift",
     "star": "⭐ Yulduz",
     "premium": "💎 Premium",
+    "nft": "🖼 NFT",
 }
 
 # Telegram_id -> kutilayotgan referrer (majburiy kanalga a'zolikdan keyin berish uchun)
@@ -106,6 +107,7 @@ class SettingsStates(StatesGroup):
     min_withdraw = State()    # yulduz yechish uchun minimal
     pay_card = State()        # to'lov karta raqami
     reviews_channel = State() # otziv kanali
+    nft_group = State()       # NFT sotiladigan guruh linki
 
 
 class AddItemStates(StatesGroup):
@@ -168,7 +170,8 @@ async def db_init() -> None:
                 min_referals_required INTEGER NOT NULL DEFAULT 3,
                 min_withdraw_stars INTEGER NOT NULL DEFAULT 100,
                 pay_card TEXT NOT NULL DEFAULT '9860180104681937',
-                reviews_channel TEXT DEFAULT ''
+                reviews_channel TEXT DEFAULT '',
+                nft_group TEXT DEFAULT ''
             )
         """)
         await db.execute("""
@@ -244,6 +247,7 @@ async def db_init() -> None:
             "ALTER TABLE settings ADD COLUMN pay_card TEXT NOT NULL DEFAULT '9860180104681937'",
             "ALTER TABLE shop_items ADD COLUMN deliver_stars INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE settings ADD COLUMN reviews_channel TEXT DEFAULT ''",
+            "ALTER TABLE settings ADD COLUMN nft_group TEXT DEFAULT ''",
         ):
             try:
                 await db.execute(alter_sql)
@@ -308,7 +312,7 @@ async def get_settings() -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT ref_reward_stars, min_referals_required, min_withdraw_stars, pay_card, reviews_channel FROM settings WHERE id = 1"
+            "SELECT ref_reward_stars, min_referals_required, min_withdraw_stars, pay_card, reviews_channel, nft_group FROM settings WHERE id = 1"
         )
         row = await cur.fetchone()
         return dict(row) if row else None
@@ -1260,6 +1264,32 @@ async def shop_callback(call: CallbackQuery) -> None:
 async def shop_category_callback(call: CallbackQuery) -> None:
     category = call.data.split(":")[1]
     label = CATEGORIES.get(category, category)
+
+    # NFT bo'limi boshqacha ishlaydi — bot ichida sotilmaydi, foydalanuvchi
+    # NFT sotiladigan guruhga yo'naltiriladi.
+    if category == "nft":
+        s = await get_settings()
+        kb = InlineKeyboardBuilder()
+        if s["nft_group"]:
+            kb.button(text="🖼 NFT guruhiga o'tish", url=channel_url(s["nft_group"]))
+        kb.button(text="🔙 Ortga", callback_data="shop")
+        kb.adjust(1)
+
+        if s["nft_group"]:
+            text = (
+                f"{label} <b>bo'limi</b>\n\n"
+                f"NFT'lar bot ichida emas, <b>maxsus guruhda</b> sotiladi.\n"
+                f"Pastdagi tugmani bosing va guruhga o'ting 👇"
+            )
+        else:
+            text = (
+                f"{label} <b>bo'limi</b>\n\n"
+                f"❌ NFT guruhi hali sozlanmagan. Admin bilan bog'laning."
+            )
+        await call.message.edit_text(text, reply_markup=kb.as_markup())
+        await call.answer()
+        return
+
     items = await get_shop_items(category)
 
     if not items:
@@ -1655,6 +1685,7 @@ def settings_keyboard() -> InlineKeyboardMarkup:
     kb.button(text="💸 Yulduz yechish minimumi", callback_data="admin:set:min_withdraw")
     kb.button(text="💳 To'lov kartasi", callback_data="admin:set:pay_card")
     kb.button(text="⭐ Otziv kanali", callback_data="admin:set:reviews_channel")
+    kb.button(text="🖼 NFT guruh linki", callback_data="admin:set:nft_group")
     kb.button(text="🔙 Ortga", callback_data="admin")
     kb.adjust(1)
     return kb.as_markup()
@@ -1667,13 +1698,15 @@ async def admin_settings(call: CallbackQuery) -> None:
         return
     s = await get_settings()
     reviews_display = s["reviews_channel"] or "❌ o'rnatilmagan"
+    nft_display = s["nft_group"] or "❌ o'rnatilmagan"
     text = (
         f"⚙️ <b>Sozlamalar</b>\n\n"
         f"⭐ Referal mukofoti: <b>{s['ref_reward_stars']} ⭐</b>\n"
         f"👥 Xarid uchun min. referallar: <b>{s['min_referals_required']}</b>\n"
         f"💸 Yulduz yechish minimumi: <b>{s['min_withdraw_stars']} ⭐</b>\n"
         f"💳 To'lov kartasi: <code>{s['pay_card']}</code>\n"
-        f"⭐ Otziv: {reviews_display}\n\n"
+        f"⭐ Otziv: {reviews_display}\n"
+        f"🖼 NFT guruhi: {nft_display}\n\n"
         f"O'zgartirmoqchi bo'lgan qiymatni tanlang:"
     )
     await call.message.edit_text(text, reply_markup=settings_keyboard())
@@ -1799,6 +1832,32 @@ async def reviews_channel_input(message: Message, state: FSMContext) -> None:
     await update_settings(reviews_channel=raw)
     await state.clear()
     await message.answer(f"✅ Otziv kanali saqlandi: <b>{raw}</b>", reply_markup=admin_keyboard())
+
+
+@router.callback_query(F.data == "admin:set:nft_group")
+async def set_nft_group(call: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    await state.set_state(SettingsStates.nft_group)
+    await call.message.edit_text(
+        "🖼 <b>NFT guruh linkini yuboring:</b>\n"
+        "(masalan: <code>@nftguruh</code> yoki <code>https://t.me/nftguruh</code>)\n\n"
+        "Do'kondagi NFT bo'limi foydalanuvchini shu guruhga yo'naltiradi — "
+        "NFT'lar bot ichida emas, o'sha guruhda sotiladi.",
+    )
+    await call.answer()
+
+
+@router.message(SettingsStates.nft_group)
+async def nft_group_input(message: Message, state: FSMContext) -> None:
+    raw = message.text.strip()
+    if len(raw) < 3:
+        await message.answer("❌ Iltimos, to'g'ri havola yuboring!")
+        return
+    await update_settings(nft_group=raw)
+    await state.clear()
+    await message.answer(f"✅ NFT guruh linki saqlandi: <b>{raw}</b>", reply_markup=admin_keyboard())
 
 
 # ---------- Savdo boshqaruvi ----------
