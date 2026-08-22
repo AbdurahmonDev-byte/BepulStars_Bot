@@ -46,6 +46,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     LabeledPrice,
+    MenuButtonWebApp,
     Message,
     PreCheckoutQuery,
     ReplyKeyboardMarkup,
@@ -5179,6 +5180,24 @@ async def on_startup(bot: Bot) -> None:
     else:
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Polling rejimi (webhook o'chirildi)")
+
+    # Xabar kiritish maydonining chap tomonidagi doimiy "Menu" tugmasini
+    # to'g'ridan-to'g'ri Mini App'ni ochadigan qilib sozlaymiz (xuddi
+    # @BotFather chatidagi "Открыть/Open" tugmasi kabi) — foydalanuvchi
+    # pastdagi reply-klaviaturani qidirmasdan, bitta bosishda Mini App'ni
+    # ochadi. Faqat PUBLIC_BASE_URL HTTPS bo'lsa sozlanadi, aks holda
+    # Telegram bunday tugmani rad etadi.
+    if PUBLIC_BASE_URL.startswith("https://"):
+        try:
+            await bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(
+                    text="Stars Bot",
+                    web_app=WebAppInfo(url=f"{PUBLIC_BASE_URL}/webapp"),
+                ),
+            )
+            logger.info("Menu button (Mini App) sozlandi: %s/webapp", PUBLIC_BASE_URL)
+        except Exception as e:
+            logger.error("Menu button sozlanmadi: %s", e)
 
 
 async def on_shutdown(bot: Bot) -> None:
