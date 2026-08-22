@@ -107,10 +107,33 @@ class _TursoConnection:
         await self._client.close()
 
 
+def _http_url(url: str) -> str:
+    """Turso URL'ni WebSocket (libsql://, wss://) o'rniga HTTP (https://) sxemasiga
+    o'giradi.
+
+    Nega: `libsql://` sxemasi `wss://` bilan bir xil — uzoq muddatli WebSocket
+    ulanishini talab qiladi. Ba'zi hosting muhitlarida (masalan Render) bu
+    WebSocket handshake muvaffaqiyatsiz tugaydi va
+    `sqlite3.OperationalError: 400, message='Invalid response status'` xatosi
+    chiqadi. HTTP sxemasi esa har bir so'rov uchun oddiy HTTPS chaqiruvidan
+    foydalanadi — bu ancha barqaror va Render kabi muhitlarda ham ishonchli
+    ishlaydi. Bu botda `transaction()` API ishlatilmaydi (har bir `execute()`
+    o'zi avto-commit qiladi), shuning uchun HTTP rejimiga o'tish hech qanday
+    funksionallikni yo'qotmaydi.
+    """
+    if url.startswith("libsql://"):
+        return "https://" + url[len("libsql://"):]
+    if url.startswith("wss://"):
+        return "https://" + url[len("wss://"):]
+    if url.startswith("ws://"):
+        return "http://" + url[len("ws://"):]
+    return url
+
+
 class _TursoConnCtx:
     async def __aenter__(self):
         self._client = libsql_client.create_client(
-            url=TURSO_DATABASE_URL,
+            url=_http_url(TURSO_DATABASE_URL),
             auth_token=TURSO_AUTH_TOKEN or None,
         )
         return _TursoConnection(self._client)
