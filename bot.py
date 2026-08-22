@@ -2429,8 +2429,66 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     kb.button(text="🔗 Kanallar", callback_data="admin:channels")
     kb.button(text="📞 Aloqa boshqaruvi", callback_data="admin:contacts")
     kb.button(text="🔋 Bot balansini to'ldirish", callback_data="admin:topup")
+    kb.button(text="💰 Bot Stars balansi", callback_data="admin:starbalance")
     kb.adjust(2)
     return kb.as_markup()
+
+
+@router.callback_query(F.data == "admin:starbalance")
+async def admin_star_balance(call: CallbackQuery, bot: Bot) -> None:
+    """Botning haqiqiy Telegram Stars balansini hisoblab ko'rsatadi.
+
+    Bot API'da balansni to'g'ridan-to'g'ri qaytaradigan alohida metod yo'q
+    (masalan getMyStarBalance) — shuning uchun barcha tranzaksiyalar tarixini
+    (get_star_transactions) o'qib, kirim (source bor — foydalanuvchi to'lov
+    qilgan) va chiqim (receiver bor — gift yuborilgan/pul yechilgan)
+    summalarini o'zimiz hisoblaymiz: joriy balans = kirimlar - chiqimlar.
+    """
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    await call.answer("⏳ Hisoblanmoqda...")
+
+    income = 0
+    outcome = 0
+    count = 0
+    offset = 0
+    limit = 100
+    try:
+        while True:
+            result = await bot.get_star_transactions(offset=offset, limit=limit)
+            txns = result.transactions
+            if not txns:
+                break
+            for t in txns:
+                count += 1
+                if t.source is not None:
+                    income += t.amount
+                elif t.receiver is not None:
+                    outcome += t.amount
+            if len(txns) < limit or count >= 2000:
+                break
+            offset += limit
+    except Exception as e:
+        logger.error("Stars balansi hisoblanmadi: %s", e)
+        await call.message.answer(
+            f"⚠️ Balansni hisoblab bo'lmadi: <code>{e}</code>\n\n"
+            f"Aniq balansni @BotFather → Bot Settings orqali tekshiring.",
+            reply_markup=admin_keyboard(),
+        )
+        return
+
+    balance = income - outcome
+    await call.message.answer(
+        f"💰 <b>Botning haqiqiy Telegram Stars balansi</b>\n\n"
+        f"📥 Jami kirim: <b>{income} ⭐</b>\n"
+        f"📤 Jami chiqim (gift/refund): <b>{outcome} ⭐</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n"
+        f"💎 Joriy balans: <b>{balance} ⭐</b>\n\n"
+        f"🧾 Tekshirilgan tranzaksiyalar: {count} ta\n\n"
+        f"Aniqroq/rasmiy ma'lumot uchun: @BotFather → botingiz → Bot Settings → Payments.",
+        reply_markup=admin_keyboard(),
+    )
 
 
 @router.callback_query(F.data == "admin:topup")
