@@ -190,6 +190,13 @@ class TopupStates(StatesGroup):
     amount = State()
 
 
+class AdminUserStates(StatesGroup):
+    """Admin foydalanuvchi profilini qidirishi va uning (ichki, virtual)
+    ⭐ balansini boshqarishi — masalan xohlagan payt 0 ga tushirish."""
+    search = State()
+    set_balance = State()
+
+
 # ============================================================
 #  MA'LUMOTLAR BAZASI (aiosqlite)
 # ============================================================
@@ -431,6 +438,14 @@ async def add_stars(telegram_id: int, amount: int) -> None:
 async def deduct_stars(telegram_id: int, amount: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE users SET balance_stars = balance_stars - ? WHERE telegram_id = ?", (amount, telegram_id))
+        await db.commit()
+
+
+async def set_user_balance(telegram_id: int, amount: int) -> None:
+    """Foydalanuvchining ichki (virtual) ⭐ balansini aniq qiymatga o'rnatadi —
+    admin nazorati uchun (masalan xohlagan payt 0 ga tushirish)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET balance_stars = ? WHERE telegram_id = ?", (amount, telegram_id))
         await db.commit()
 
 
@@ -2430,8 +2445,123 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     kb.button(text="📞 Aloqa boshqaruvi", callback_data="admin:contacts")
     kb.button(text="🔋 Bot balansini to'ldirish", callback_data="admin:topup")
     kb.button(text="💰 Bot Stars balansi", callback_data="admin:starbalance")
+    kb.button(text="👤 Foydalanuvchini boshqarish", callback_data="admin:usersearch")
     kb.adjust(2)
     return kb.as_markup()
+
+
+def _user_manage_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="0️⃣ Balansni 0 ga tushirish", callback_data=f"admin:userzero:{telegram_id}")
+    kb.button(text="✏️ Aniq qiymat qo'yish", callback_data=f"admin:usersetbal:{telegram_id}")
+    kb.button(text="🔍 Boshqa foydalanuvchi", callback_data="admin:usersearch")
+    kb.button(text="🔙 Ortga", callback_data="admin")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+async def _show_user_profile(target, telegram_id: int) -> None:
+    user = await get_user(telegram_id)
+    if not user:
+        await target.answer(
+            f"❌ <code>{telegram_id}</code> ID'li foydalanuvchi topilmadi. "
+            f"Faqat botdan kamida bir marta /start bosgan foydalanuvchilar mavjud bo'ladi.",
+            reply_markup=_user_manage_keyboard(telegram_id),
+        )
+        return
+    await target.answer(
+        f"👤 <b>Foydalanuvchi profili</b>\n\n"
+        f"🆔 ID: <code>{user['telegram_id']}</code>\n"
+        f"⭐ Ichki balans: <b>{user['balance_stars']}</b>\n"
+        f"🔗 Referallar: <b>{user['referals_count']}</b>\n"
+        f"👥 Taklif qilgan: <code>{user['referrer_id'] or '—'}</code>\n"
+        f"📅 Qo'shilgan: {user['joined_at']}\n\n"
+        f"Quyidagi tugmalar orqali balansni boshqarishingiz mumkin:",
+        reply_markup=_user_manage_keyboard(telegram_id),
+    )
+
+
+@router.callback_query(F.data == "admin:usersearch")
+async def admin_user_search_start(call: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    await state.set_state(AdminUserStates.search)
+    await call.message.edit_text(
+        "👤 <b>Foydalanuvchini boshqarish</b>\n\n"
+        "Foydalanuvchining Telegram ID raqamini yuboring (masalan: <code>123456789</code>).\n\n"
+        "💡 ID'ni foydalanuvchining profilidan yoki bot adminga yuborgan xabarlardagi "
+        "<code>🆔 ID:</code> qatoridan olishingiz mumkin.",
+    )
+    await call.answer()
+
+
+@router.message(AdminUserStates.search)
+async def admin_user_search_input(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    raw = (message.text or "").strip()
+    if not raw.lstrip("-").isdigit():
+        await message.answer("❌ Iltimos, faqat Telegram ID raqamini yuboring (masalan: 123456789).")
+        return
+    telegram_id = int(raw)
+    await state.clear()
+    await _show_user_profile(message, telegram_id)
+
+
+@router.callback_query(F.data.startswith("admin:userzero:"))
+async def admin_user_zero(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    telegram_id = int(call.data.split(":")[2])
+    user = await get_user(telegram_id)
+    if not user:
+        await call.answer("❌ Foydalanuvchi topilmadi", show_alert=True)
+        return
+    await set_user_balance(telegram_id, 0)
+    await call.answer("✅ Balans 0 ga tushirildi!", show_alert=True)
+    await _show_user_profile(call.message, telegram_id)
+
+
+@router.callback_query(F.data.startswith("admin:usersetbal:"))
+async def admin_user_setbal_start(call: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    telegram_id = int(call.data.split(":")[2])
+    await state.set_state(AdminUserStates.set_balance)
+    await state.update_data(target_id=telegram_id)
+    await call.message.edit_text(
+        f"✏️ <b>Yangi balans qiymatini yuboring</b>\n\n"
+        f"Foydalanuvchi: <code>{telegram_id}</code>\n"
+        f"Butun son kiriting (masalan: <code>0</code> yoki <code>500</code>).",
+    )
+    await call.answer()
+
+
+@router.message(AdminUserStates.set_balance)
+async def admin_user_setbal_input(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    raw = (message.text or "").strip()
+    if not raw.lstrip("-").isdigit():
+        await message.answer("❌ Iltimos, faqat butun son yuboring (masalan: 0 yoki 500).")
+        return
+    data = await state.get_data()
+    telegram_id = data.get("target_id")
+    amount = int(raw)
+    await state.clear()
+    if telegram_id is None:
+        await message.answer("❌ Xatolik: foydalanuvchi aniqlanmadi, qaytadan urinib ko'ring.")
+        return
+    user = await get_user(telegram_id)
+    if not user:
+        await message.answer("❌ Foydalanuvchi topilmadi.")
+        return
+    await set_user_balance(telegram_id, amount)
+    await message.answer(f"✅ Balans <b>{amount}</b> ga o'rnatildi!")
+    await _show_user_profile(message, telegram_id)
 
 
 @router.callback_query(F.data == "admin:starbalance")
