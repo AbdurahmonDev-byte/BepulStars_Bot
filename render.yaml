@@ -13,7 +13,13 @@ services:
         sync: false
       - key: WEBHOOK_URL
         sync: false
+      - key: PUBLIC_BASE_URL
+        sync: false
       - key: DB_PATH
         value: bot.db
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
       - key: PYTHON_VERSION
         value: 3.12.6
