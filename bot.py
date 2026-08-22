@@ -18,13 +18,18 @@ Render uchun: WEBHOOK_URL o'rnatilsa — webhook rejimi, aks holda polling.
 """
 
 import asyncio
+import hashlib
+import hmac
+import json
 import logging
 import os
 import random
 from datetime import datetime
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote
 
-import aiosqlite
+import db_compat as aiosqlite  # noqa: N812 — Turso (doimiy tashqi baza) yoki lokal SQLite'ga
+                                # shaffof ulanish uchun moslashtiruvchi qatlam (pastdagi
+                                # izohga qarang: MA'LUMOTLARNI DOIMIY SAQLASH).
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -35,12 +40,16 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
+    LabeledPrice,
     Message,
+    PreCheckoutQuery,
     ReplyKeyboardMarkup,
+    WebAppInfo,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -54,6 +63,7 @@ async def start_web_server():
     app = web.Application()
     app.router.add_get('/', handle_ping)
     app.router.add_get('/webhook', handle_ping)  # Render health-check shu yo'lni tekshiradi
+    register_webapp_routes(app)  # /webapp, /api/shop, /api/create_invoice
     runner = web.AppRunner(app)
     await runner.setup()
     # Render PORT env orqali portni beradi — qattiq yozilgan 10000 emas, o'shani ishlatamiz
@@ -69,14 +79,31 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.strip()]
 
 # DB fayli qayerdan ishga tushirilishidan qat'i nazar, bot.py yonida bo'ladi
+# (faqat TURSO_DATABASE_URL sozlanmagan holatda ishlatiladi — pastga qarang).
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.getenv("DB_PATH", os.path.join(BASE_DIR, "bot.db"))
+
+# ---------- MA'LUMOTLARNI DOIMIY SAQLASH (Render free tarifi uchun muhim!) ----------
+# Render'ning free tarifida doimiy disk yo'q — bot.db kabi lokal fayllar har
+# redeploy/restart'da o'chib ketadi. Buning oldini olish uchun .env (yoki Render
+# muhit o'zgaruvchilari)da TURSO_DATABASE_URL va TURSO_AUTH_TOKEN sozlansa, bot
+# ma'lumotlarni Turso (bepul, doimiy, tashqi libSQL bazasi)da saqlaydi va ular
+# hech qachon yo'qolmaydi. Sozlanmasa, bot avvalgidek oddiy lokal bot.db bilan
+# ishlayveradi (faqat lokal/test muhiti uchun mos, Render production uchun EMAS).
+# Batafsil: TURSO_SETUP.md faylini qarang.
 
 # Render / webhook sozlamalari
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
 WEBAPP_HOST = os.getenv("WEBAPP_HOST", "0.0.0.0")
 WEBAPP_PORT = int(os.getenv("PORT", "8000"))
+
+# Mini App (Telegram Web App do'kon) uchun ochiq HTTPS manzil. Webhook rejimida
+# WEBHOOK_URL allaqachon ochiq manzil bo'lgani uchun standart shu ishlatiladi;
+# polling rejimida (Render'da WEBHOOK_URL bo'sh bo'lsa ham) xizmatning o'zi
+# baribir ochiq https://...onrender.com manzilda turadi — shuni qo'lda
+# PUBLIC_BASE_URL orqali ko'rsatish kerak. Batafsil: MINI_APP.md.
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", WEBHOOK_URL).rstrip("/")
 
 # Do'kon toifalari
 CATEGORIES = {
@@ -85,6 +112,10 @@ CATEGORIES = {
     "premium": "💎 Premium",
     "nft": "🖼 NFT",
 }
+
+# Haqiqiy Telegram gift avtomatik yuborilganda unga qo'shiladigan sarlavha matni
+# (admin panelda o'zgartirilishi mumkin). {item} — gift nomi bilan almashtiriladi.
+DEFAULT_GIFT_CAPTION = "🎁 {item} — Stars Bot'dan sovg'a!"
 
 # Telegram_id -> kutilayotgan referrer (majburiy kanalga a'zolikdan keyin berish uchun)
 pending_ref = {}
@@ -108,6 +139,7 @@ class SettingsStates(StatesGroup):
     pay_card = State()        # to'lov karta raqami
     reviews_channel = State() # otziv kanali
     nft_group = State()       # NFT sotiladigan guruh linki
+    gift_caption = State()    # avtomatik gift bilan boradigan matn
 
 
 class AddItemStates(StatesGroup):
@@ -140,9 +172,21 @@ class UzsPaymentStates(StatesGroup):
     proof = State()
 
 
+class TgGiftStates(StatesGroup):
+    """Do'kon mahsulotini haqiqiy Telegram Gift ID'siga bog'lash — shu orqali
+    foydalanuvchi giftni yechib olganda avtomatik yuboriladi."""
+    gift_id = State()
+
+
 class BoxStates(StatesGroup):
     """Admin box sozlamalarini o'zgartirishi."""
     input = State()
+
+
+class TopupStates(StatesGroup):
+    """Botning haqiqiy Telegram Stars balansini admin o'zi to'ldirishi (invoys orqali,
+    hech qanday komissiyasiz — to'liq summasi botning real balansiga tushadi)."""
+    amount = State()
 
 
 # ============================================================
@@ -223,11 +267,39 @@ async def db_init() -> None:
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS withdrawals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                user_name TEXT DEFAULT '',
+                username TEXT DEFAULT '',
+                kind TEXT NOT NULL,
+                amount_stars INTEGER NOT NULL DEFAULT 0,
+                item_name TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                resolved_at TEXT DEFAULT ''
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS gift_claims (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                item_id INTEGER NOT NULL,
+                item_name TEXT NOT NULL,
+                price_stars INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                source TEXT NOT NULL DEFAULT 'box',
+                created_at TEXT NOT NULL,
+                resolved_at TEXT DEFAULT ''
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS boxes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 box_id TEXT UNIQUE NOT NULL,
                 name TEXT NOT NULL,
                 cost INTEGER NOT NULL DEFAULT 0,
+                cost_tgstars INTEGER NOT NULL DEFAULT 0,
                 star_min INTEGER NOT NULL DEFAULT 0,
                 star_max INTEGER NOT NULL DEFAULT 0,
                 gift_drop_prob REAL NOT NULL DEFAULT 0.5,
@@ -248,6 +320,9 @@ async def db_init() -> None:
             "ALTER TABLE shop_items ADD COLUMN deliver_stars INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE settings ADD COLUMN reviews_channel TEXT DEFAULT ''",
             "ALTER TABLE settings ADD COLUMN nft_group TEXT DEFAULT ''",
+            "ALTER TABLE boxes ADD COLUMN cost_tgstars INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE shop_items ADD COLUMN tg_gift_id TEXT DEFAULT ''",
+            "ALTER TABLE settings ADD COLUMN gift_caption TEXT DEFAULT ''",
         ):
             try:
                 await db.execute(alter_sql)
@@ -312,7 +387,7 @@ async def get_settings() -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT ref_reward_stars, min_referals_required, min_withdraw_stars, pay_card, reviews_channel, nft_group FROM settings WHERE id = 1"
+            "SELECT ref_reward_stars, min_referals_required, min_withdraw_stars, pay_card, reviews_channel, nft_group, gift_caption FROM settings WHERE id = 1"
         )
         row = await cur.fetchone()
         return dict(row) if row else None
@@ -410,6 +485,15 @@ async def add_shop_item(category: str, name: str, price_stars: int, price_uzs: i
 async def delete_shop_item(item_id: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM shop_items WHERE id = ?", (item_id,))
+        await db.commit()
+
+
+async def update_shop_item(item_id: int, **kwargs) -> None:
+    """Mahsulotning istalgan ustunini yangilaydi (masalan tg_gift_id)."""
+    keys = ", ".join(f"{k} = ?" for k in kwargs)
+    vals = list(kwargs.values()) + [item_id]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(f"UPDATE shop_items SET {keys} WHERE id = ?", vals)
         await db.commit()
 
 
@@ -536,6 +620,83 @@ async def get_order(order_id: int) -> dict | None:
 async def update_order_status(order_id: int, status: str) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
+        await db.commit()
+
+
+# ---------- Yulduz/gift yechish so'rovlari (withdrawals) ----------
+# Bular real pul/gift chiqimi bo'lgani uchun holati kuzatiladi — shunda admin
+# "to'ladimmi yoki yo'qmi" deb adashib, bir so'rovni ikki marta to'lab
+# yubormaydi (status: pending -> paid / rejected).
+
+async def add_withdrawal(telegram_id: int, user_name: str, username: str, kind: str,
+                          amount_stars: int, item_name: str = "") -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO withdrawals (telegram_id, user_name, username, kind, amount_stars, item_name, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (telegram_id, user_name, username, kind, amount_stars, item_name,
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def get_withdrawal(withdrawal_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM withdrawals WHERE id = ?", (withdrawal_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def get_pending_withdrawals() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM withdrawals WHERE status = 'pending' ORDER BY id")
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def update_withdrawal_status(withdrawal_id: int, status: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE withdrawals SET status = ?, resolved_at = ? WHERE id = ?",
+            (status, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), withdrawal_id),
+        )
+        await db.commit()
+
+
+# ---------- Box'dan yutilgan giftlar — "saqlab qo'yish" (tanlov keyinroq) ----------
+# Box'dan gift chiqqanda darhol yuborilmaydi — foydalanuvchi tanlaguncha
+# "pending" holatida saqlanadi: keyinroq "🎁 Giftni olish" (haqiqiy sovg'a,
+# botning haqiqiy Stars balansidan) yoki "⭐ Starsga aylantirish" (ichki
+# bot valyutasiga aylantirish) tugmalaridan birini bosishi mumkin.
+
+async def add_gift_claim(telegram_id: int, item_id: int, item_name: str, price_stars: int, source: str = "box") -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO gift_claims (telegram_id, item_id, item_name, price_stars, source, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (telegram_id, item_id, item_name, price_stars, source, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def get_gift_claim(claim_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM gift_claims WHERE id = ?", (claim_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def update_gift_claim_status(claim_id: int, status: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE gift_claims SET status = ?, resolved_at = ? WHERE id = ?",
+            (status, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), claim_id),
+        )
         await db.commit()
 
 
@@ -688,15 +849,17 @@ async def bot_notify_pending_referral(referrer_id: int, friend_name: str) -> Non
 
 def main_menu_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     """Asosiy reply klaviaturasi."""
-    kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="👤 Profil"), KeyboardButton(text="🛍️ Do'kon")],
-            [KeyboardButton(text="🎰 Jekpot"), KeyboardButton(text="📞 Aloqa")],
-            [KeyboardButton(text="⭐ Otziv"), KeyboardButton(text="💸 Yulduz yechish")],
-            [KeyboardButton(text="🔗 Referal")],
-        ],
-        resize_keyboard=True,
-    )
+    rows = [
+        [KeyboardButton(text="👤 Profil"), KeyboardButton(text="🛍️ Do'kon")],
+        [KeyboardButton(text="🎰 Jekpot"), KeyboardButton(text="📞 Aloqa")],
+        [KeyboardButton(text="⭐ Otziv"), KeyboardButton(text="💸 Yulduz yechish")],
+        [KeyboardButton(text="🔗 Referal"), KeyboardButton(text="ℹ️ Bot haqida")],
+    ]
+    # Mini App tugmasi faqat PUBLIC_BASE_URL (ochiq HTTPS manzil) sozlangan
+    # bo'lsa ko'rsatiladi — Telegram web_app tugmasi HTTPS talab qiladi.
+    if PUBLIC_BASE_URL.startswith("https://"):
+        rows.append([KeyboardButton(text="✨ Mini-App do'kon", web_app=WebAppInfo(url=f"{PUBLIC_BASE_URL}/webapp"))])
+    kb = ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
     if is_admin(user_id):
         kb.keyboard.append([KeyboardButton(text="👑 Admin panel")])
     return kb
@@ -716,19 +879,22 @@ def inline_btn(text: str, data: str) -> InlineKeyboardButton:
 
 
 def product_keyboard(item: dict) -> InlineKeyboardMarkup:
-    """Mahsulot uchun to'lov tugmalari (toifaga qarab ⭐ va/yo UZS)."""
+    """Mahsulot uchun to'lov tugmalari (toifaga qarab ⭐ bot balansi, ✨ haqiqiy
+    Telegram Stars va/yo UZS)."""
     kb = InlineKeyboardBuilder()
     if item["category"] == "star":
         # Yulduzlar faqat UZS bilan sotib olinadi
         if item["price_uzs"] > 0:
             kb.button(text=f"💳 UZSda sotib olish ({item['price_uzs']:,} so'm)", callback_data=f"buy_uzs:{item['id']}")
     else:
-        # Gift va Premium: ham yulduz, ham UZS ishlaydi
+        # Gift va Premium: bot balansi (⭐), haqiqiy Telegram Stars (✨) va UZS ishlaydi
         if item["price_stars"] > 0:
-            kb.button(text=f"⭐ Yulduzda ({item['price_stars']} ⭐)", callback_data=f"buy:{item['id']}")
+            kb.button(text=f"⭐ Bot balansidan ({item['price_stars']} ⭐)", callback_data=f"buy:{item['id']}")
+            kb.button(text=f"✨ Telegram Stars bilan ({item['price_stars']} ⭐)", callback_data=f"buy_tgstars:{item['id']}")
         if item["price_uzs"] > 0:
             kb.button(text=f"💳 UZSda ({item['price_uzs']:,} so'm)", callback_data=f"buy_uzs:{item['id']}")
     kb.button(text="🔙 Ortga", callback_data="shop")
+    kb.adjust(1)
     return kb.as_markup()
 
 
@@ -764,7 +930,6 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext) -> None:
         referrer_id = int(payload[1])
 
     channels = await get_channels()
-    user = await get_user(message.from_user.id)
 
     # Majburiy kanallarga a'zolik tekshiruvi
     if channels:
@@ -791,9 +956,9 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext) -> None:
     pending_ref.pop(message.from_user.id, None)
 
     await message.answer(
-        f"👋 <b>Xush kelibsiz!</b>\n\n"
-        f"Bu yerda yulduzlar (⭐) yig'ib, do'kondan sovg'alar olasiz va jekpotda qatnashasiz!\n"
-        f"Taklif qilgan har bir do'stingiz uchun bonus oling. 🎁",
+        "👋 <b>Xush kelibsiz!</b>\n\n"
+        "Bu yerda yulduzlar (⭐) yig'ib, do'kondan sovg'alar olasiz va jekpotda qatnashasiz!\n"
+        "Taklif qilgan har bir do'stingiz uchun bonus oling. 🎁",
         reply_markup=main_menu_keyboard(message.from_user.id),
     )
 
@@ -916,7 +1081,8 @@ async def withdraw_handler(message: Message) -> None:
 
 
 async def process_stars_withdrawal(call: CallbackQuery, bot: Bot, amount: int) -> None:
-    """Yulduzlar yechiladi: balansdan ayriladi, egaga o'tkazish uchun avto buyurtma ketadi."""
+    """Yulduzlar yechiladi: balansdan ayriladi, admin uchun Tasdiqlash/Rad etish
+    tugmali so'rov yaratiladi (holati kuzatiladi — ikki marta to'lanib ketmasin)."""
     user = await get_user(call.from_user.id)
     if not user:
         await call.answer("❌ Xatolik", show_alert=True)
@@ -927,36 +1093,132 @@ async def process_stars_withdrawal(call: CallbackQuery, bot: Bot, amount: int) -
         return
 
     await deduct_stars(call.from_user.id, amount)
+    w_id = await add_withdrawal(
+        telegram_id=call.from_user.id,
+        user_name=call.from_user.first_name or "",
+        username=call.from_user.username or "",
+        kind="stars",
+        amount_stars=amount,
+    )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ To'lov qildim", callback_data=f"wd_approve:{w_id}")
+    kb.button(text="❌ Bekor qilish (qaytarish)", callback_data=f"wd_reject:{w_id}")
+    kb.adjust(1)
 
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
                 admin_id,
-                f"💸 <b>YULDUZ YECHISH!</b>\n\n"
+                f"💸 <b>YULDUZ YECHISH SO'ROVI #{w_id}</b>\n\n"
                 f"👤 Foydalanuvchi: {call.from_user.first_name} (@{call.from_user.username or '—'})\n"
                 f"🆔 ID: <code>{call.from_user.id}</code>\n"
                 f"💰 Miqdor: <b>{amount} ⭐</b>\n"
                 f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                f"⚠️ Bot egasi ushbu yulduzlarni foydalanuvchiga o'tkazishi kerak!",
+                f"⚠️ Foydalanuvchiga real to'lovni o'tkazgach, <b>\"✅ To'lov qildim\"</b> tugmasini bosing — "
+                f"shunda bu so'rov \"to'langan\" deb belgilanadi va qayta-qayta to'lab yubormaysiz.",
+                reply_markup=kb.as_markup(),
             )
         except TelegramForbiddenError:
             pass
 
     try:
         await call.message.edit_text(
-            f"✅ <b>Yulduzlaringiz yechildi!</b>\n\n"
-            f"💰 Miqdor: <b>{amount} ⭐</b>\n\n"
-            f"📤 Yulduzlar bot egasidan hisobingizga o'tkaziladi.\n"
+            f"✅ <b>So'rovingiz qabul qilindi!</b>\n\n"
+            f"💰 Miqdor: <b>{amount} ⭐</b>\n"
+            f"🧾 So'rov: #{w_id}\n\n"
+            f"📤 Yulduzlar bot egasi tomonidan hisobingizga o'tkaziladi.\n"
             f"👑 Ega: <b>@Kottabolladan</b>",
         )
     except TelegramBadRequest:
         await call.message.answer(
-            f"✅ <b>Yulduzlaringiz yechildi!</b>\n\n"
-            f"💰 Miqdor: <b>{amount} ⭐</b>\n\n"
-            f"📤 Yulduzlar bot egasidan hisobingizga o'tkaziladi.\n"
+            f"✅ <b>So'rovingiz qabul qilindi!</b>\n\n"
+            f"💰 Miqdor: <b>{amount} ⭐</b>\n"
+            f"🧾 So'rov: #{w_id}\n\n"
+            f"📤 Yulduzlar bot egasi tomonidan hisobingizga o'tkaziladi.\n"
             f"👑 Ega: <b>@Kottabolladan</b>",
         )
-    await call.answer("✅ Yechildi!", show_alert=False)
+    await call.answer("✅ Yuborildi!", show_alert=False)
+
+
+@router.callback_query(F.data.startswith("wd_approve:"))
+async def withdrawal_approve_callback(call: CallbackQuery, bot: Bot) -> None:
+    """Admin real to'lovni amalga oshirgach shu tugmani bosadi — so'rov 'to'langan'
+    deb belgilanadi, shu bilan qayta-qayta to'lab yuborish oldi olinadi."""
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+
+    w_id = int(call.data.split(":")[1])
+    w = await get_withdrawal(w_id)
+    if not w:
+        await call.answer("❌ So'rov topilmadi", show_alert=True)
+        return
+    if w["status"] != "pending":
+        await call.answer(f"⚠️ Bu so'rov allaqachon '{w['status']}' deb belgilangan!", show_alert=True)
+        return
+
+    await update_withdrawal_status(w_id, "paid")
+
+    try:
+        await bot.send_message(
+            w["telegram_id"],
+            f"✅ <b>To'lovingiz amalga oshirildi!</b>\n\n"
+            f"🧾 So'rov: #{w_id}\n"
+            f"💰 Miqdor: <b>{w['amount_stars']} ⭐</b>",
+        )
+    except TelegramForbiddenError:
+        pass
+
+    try:
+        await call.message.edit_text(
+            f"{call.message.text}\n\n✅ <b>TO'LANDI</b> — {call.from_user.first_name} tomonidan",
+        )
+    except TelegramBadRequest:
+        pass
+    await call.answer("✅ To'langan deb belgilandi!", show_alert=False)
+
+
+@router.callback_query(F.data.startswith("wd_reject:"))
+async def withdrawal_reject_callback(call: CallbackQuery, bot: Bot) -> None:
+    """Admin to'lovni bekor qilsa — yulduzlar foydalanuvchi balansiga qaytariladi."""
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+
+    w_id = int(call.data.split(":")[1])
+    w = await get_withdrawal(w_id)
+    if not w:
+        await call.answer("❌ So'rov topilmadi", show_alert=True)
+        return
+    if w["status"] != "pending":
+        await call.answer(f"⚠️ Bu so'rov allaqachon '{w['status']}' deb belgilangan!", show_alert=True)
+        return
+
+    await update_withdrawal_status(w_id, "rejected")
+    # "stars" va "gift" — ikkalasida ham so'rov paytida balansdan yulduz
+    # ayrilgan edi (gift'da item narxi hisobida) — shuning uchun ikkalasida
+    # ham qaytaramiz.
+    await add_stars(w["telegram_id"], w["amount_stars"])
+
+    try:
+        await bot.send_message(
+            w["telegram_id"],
+            f"❌ <b>Yechish so'rovingiz bekor qilindi!</b>\n\n"
+            f"🧾 So'rov: #{w_id}\n"
+            f"💰 <b>{w['amount_stars']} ⭐</b> balansingizga qaytarildi.\n\n"
+            f"Muammo bo'lsa, bot egasi bilan bog'laning: @Kottabolladan",
+        )
+    except TelegramForbiddenError:
+        pass
+
+    try:
+        await call.message.edit_text(
+            f"{call.message.text}\n\n❌ <b>BEKOR QILINDI (qaytarildi)</b> — {call.from_user.first_name} tomonidan",
+        )
+    except TelegramBadRequest:
+        pass
+    await call.answer("❌ Bekor qilindi, balans qaytarildi!", show_alert=False)
 
 
 @router.callback_query(F.data == "withdraw:stars")
@@ -1012,6 +1274,11 @@ async def withdraw_gift_callback(call: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("withdraw_gift:"))
 async def withdraw_gift_confirm(call: CallbackQuery, bot: Bot) -> None:
+    """Gift yechib olish. Agar mahsulotga haqiqiy Telegram gift_id bog'langan
+    bo'lsa (admin panel → 🎁 TG Gift avto-yuborish), bot uni o'zining haqiqiy
+    Stars balansidan DARHOL avtomatik yuboradi — admin qo'lda bosishi shart
+    emas. Bog'lanmagan yoki avto-yuborish muvaffaqiyatsiz bo'lsa, eski
+    qo'lda-tasdiqlash yo'liga qaytiladi (yulduz hech qachon yo'qolmaydi)."""
     item_id = int(call.data.split(":")[1])
     user = await get_user(call.from_user.id)
     item = await get_shop_item(item_id)
@@ -1026,37 +1293,96 @@ async def withdraw_gift_confirm(call: CallbackQuery, bot: Bot) -> None:
 
     # Gift yechib olinadi — yulduz ayriladi
     await deduct_stars(call.from_user.id, item["price_stars"])
+    w_id = await add_withdrawal(
+        telegram_id=call.from_user.id,
+        user_name=call.from_user.first_name or "",
+        username=call.from_user.username or "",
+        kind="gift",
+        amount_stars=item["price_stars"],
+        item_name=item["name"],
+    )
 
-    for admin_id in ADMIN_IDS:
+    # ---- Avtomatik yuborishga urinish (agar tg_gift_id bog'langan bo'lsa) ----
+    auto_sent = False
+    auto_error = None
+    if item["tg_gift_id"]:
         try:
-            await bot.send_message(
-                admin_id,
-                f"🎁 <b>GIFT YECHIB OLINDI!</b>\n\n"
-                f"👤 Foydalanuvchi: {call.from_user.first_name} (@{call.from_user.username or '—'})\n"
-                f"🆔 ID: <code>{call.from_user.id}</code>\n"
-                f"🎁 Gift: <b>{item['name']}</b>\n"
-                f"💰 Narxi: <b>{item['price_stars']} ⭐</b>\n"
-                f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                f"⚠️ Giftni foydalanuvchiga o'tkazing (Telegram'da yuborish mumkin)!",
+            await bot.send_gift(
+                user_id=call.from_user.id,
+                gift_id=item["tg_gift_id"],
+                text=f"🎁 {item['name']} — Stars Bot'dan sovg'a!",
             )
-        except TelegramForbiddenError:
-            pass
+            auto_sent = True
+        except Exception as e:
+            auto_error = str(e)
+            logger.error("send_gift avtomatik yuborilmadi (item=%s, w_id=%s): %s", item["name"], w_id, e)
+
+    if auto_sent:
+        await update_withdrawal_status(w_id, "paid")
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"🎁 <b>GIFT AVTOMATIK YUBORILDI!</b> (so'rov #{w_id})\n\n"
+                    f"👤 Foydalanuvchi: {call.from_user.first_name} (@{call.from_user.username or '—'})\n"
+                    f"🆔 ID: <code>{call.from_user.id}</code>\n"
+                    f"🎁 Gift: <b>{item['name']}</b>\n"
+                    f"💰 Narxi: <b>{item['price_stars']} ⭐</b> (bot balansidan)\n"
+                    f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                    f"✅ Hech narsa qilish shart emas — allaqachon yuborilgan.",
+                )
+            except TelegramForbiddenError:
+                pass
+
+        result_text = (
+            f"🎉 <b>Gift avtomatik yuborildi!</b>\n\n"
+            f"🎁 <b>{item['name']}</b>\n"
+            f"💰 {item['price_stars']} ⭐ ayirildi.\n"
+            f"🧾 So'rov: #{w_id}\n\n"
+            f"Telegram'dagi \"Sovg'alar\" bo'limingizni tekshiring! ✨"
+        )
+    else:
+        # Qo'lda tasdiqlash yo'li (tg_gift_id yo'q yoki avto-yuborish xato berdi)
+        kb = InlineKeyboardBuilder()
+        kb.button(text="✅ Gift yubordim", callback_data=f"wd_approve:{w_id}")
+        kb.button(text="❌ Bekor qilish (qaytarish)", callback_data=f"wd_reject:{w_id}")
+        kb.adjust(1)
+
+        warn = (
+            f"⚠️ Avtomatik yuborish muvaffaqiyatsiz bo'ldi ({auto_error}) — qo'lda yuboring!\n\n"
+            if auto_error else ""
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"🎁 <b>GIFT YECHISH SO'ROVI #{w_id}</b>\n\n"
+                    f"{warn}"
+                    f"👤 Foydalanuvchi: {call.from_user.first_name} (@{call.from_user.username or '—'})\n"
+                    f"🆔 ID: <code>{call.from_user.id}</code>\n"
+                    f"🎁 Gift: <b>{item['name']}</b>\n"
+                    f"💰 Narxi: <b>{item['price_stars']} ⭐</b>\n"
+                    f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                    f"⚠️ Giftni foydalanuvchiga Telegram'da yuborgach, <b>\"✅ Gift yubordim\"</b> tugmasini bosing — "
+                    f"shunda bu so'rov \"bajarildi\" deb belgilanadi va qayta-qayta yuborib yubormaysiz.",
+                    reply_markup=kb.as_markup(),
+                )
+            except TelegramForbiddenError:
+                pass
+
+        result_text = (
+            f"✅ <b>So'rovingiz qabul qilindi!</b>\n\n"
+            f"🎁 <b>{item['name']}</b>\n"
+            f"💰 {item['price_stars']} ⭐ ayirildi.\n"
+            f"🧾 So'rov: #{w_id}\n\n"
+            f"Gift sizga Telegram'da yuboriladi. Egasi: @Kottabolladan"
+        )
 
     try:
-        await call.message.edit_text(
-            f"✅ <b>Gift yechib olindi!</b>\n\n"
-            f"🎁 <b>{item['name']}</b>\n"
-            f"💰 {item['price_stars']} ⭐ ayirildi.\n\n"
-            f"Gift sizga Telegram'da yuboriladi. Egasi: @Kottabolladan",
-        )
+        await call.message.edit_text(result_text)
     except TelegramBadRequest:
-        await call.message.answer(
-            f"✅ <b>Gift yechib olindi!</b>\n\n"
-            f"🎁 <b>{item['name']}</b>\n"
-            f"💰 {item['price_stars']} ⭐ ayirildi.\n\n"
-            f"Gift sizga Telegram'da yuboriladi. Egasi: @Kottabolladan",
-        )
-    await call.answer("✅ Gift oldingiz!", show_alert=False)
+        await call.message.answer(result_text)
+    await call.answer("✅ Yuborildi!", show_alert=False)
 
 
 @router.message(F.text == "🛍️ Do'kon")
@@ -1101,13 +1427,18 @@ async def show_boxes(answer_func, telegram_id: int, result_text: str | None = No
 
     kb = InlineKeyboardBuilder()
     for b in boxes:
-        kb.button(text=f"{b['name']} — {b['cost']} ⭐", callback_data=f"box_open:{b['box_id']}")
+        kb.button(text=f"{b['name']} — {b['cost']} ⭐ (balans)", callback_data=f"box_open:{b['box_id']}")
+        if b["cost_tgstars"] > 0:
+            kb.button(text=f"{b['name']} — {b['cost_tgstars']} 💫 (Telegram Stars)", callback_data=f"box_open_tgstars:{b['box_id']}")
     kb.button(text="🔙 Bosh menyu", callback_data="main_menu")
     kb.adjust(1)
 
     text = "🎰 <b>BOXLAR</b>\n\nQaysi boxni ochasiz?\n\n"
     for b in boxes:
-        line = f"{b['name']} — <b>{b['cost']} ⭐</b>\n{b['desc_text']}"
+        price_line = f"{b['cost']} ⭐ (balans)"
+        if b["cost_tgstars"] > 0:
+            price_line += f" / {b['cost_tgstars']} 💫 (Telegram Stars)"
+        line = f"{b['name']} — <b>{price_line}</b>\n{b['desc_text']}"
         if b["once_per_day"]:
             if user and user["last_daily_box"] == today:
                 line = f"✅ {line}\n(Bugun ishlatilgan — ertaga qayta ochiladi)"
@@ -1124,8 +1455,207 @@ async def show_boxes(answer_func, telegram_id: int, result_text: str | None = No
     await answer_func(text, reply_markup=kb.as_markup())
 
 
+async def try_auto_deliver_gift(bot: Bot, telegram_id: int, item: dict | None) -> tuple[bool, str]:
+    """Do'kondan sotib olingan yoki box'dan yutilgan "gift" mahsulotini
+    FOYDALANUVCHIGA avtomatik yetkazishga urinadi — ega/admin qo'lda hech
+    narsa qilmaydi.
+
+    Faqat "gift" toifasidagi va admin panelda haqiqiy Telegram gift ID'siga
+    bog'langan (tg_gift_id) mahsulotlar uchun ishlaydi — bot o'zining
+    haqiqiy Telegram Stars balansidan bot.send_gift() orqali yuboradi
+    (Premium yoki bog'lanmagan/mahsus giftlar avtomatlashtirilmaydi, chunki
+    Telegram Bot API buni qo'llab-quvvatlamaydi yoki qaysi real narsa
+    ekanligi noma'lum).
+
+    Qaytaradi: (delivered, error) — delivered=True bo'lsa muvaffaqiyatli
+    yuborilgan; delivered=False va error bo'sh bo'lsa avto-yuborish umuman
+    urinilmagan (masalan Premium yoki gift_id bog'lanmagan); error to'la
+    bo'lsa urinish xato bilan tugagan (masalan bot balansida Stars yetmadi)."""
+    if not item or item.get("category") != "gift" or not item.get("tg_gift_id"):
+        return False, ""
+    try:
+        settings = await get_settings()
+        caption_template = settings.get("gift_caption") or DEFAULT_GIFT_CAPTION
+        caption = caption_template.replace("{item}", item["name"])[:255]
+        await bot.send_gift(
+            user_id=telegram_id,
+            gift_id=item["tg_gift_id"],
+            text=caption,
+        )
+        return True, ""
+    except Exception as e:
+        logger.error("Avtomatik gift yuborilmadi (item=%s, user=%s): %s", item.get("name"), telegram_id, e)
+        return False, str(e)
+
+
+async def open_box_and_award(bot: Bot, box: dict, telegram_id: int, first_name: str, username: str) -> dict:
+    """Boxni yechadi (roll_box) va mukofotni beradi — yulduz bo'lsa balansga
+    qo'shiladi, gift bo'lsa adminlarga xabar boradi. Bot balansi ORQALI ham,
+    haqiqiy Telegram Stars ORQALI ham ochilgan boxlar uchun bir xil
+    ishlatiladi.
+
+    Natija sifatida dict qaytaradi:
+      - text: Telegram HTML formatidagi natija matni
+      - kind: "stars" yoki "gifts"
+      - amount: yutilgan yulduzlar soni (gifts bo'lsa 0)
+      - ratio: 0..1 oralig'ida "qanchalik katta yutuq" ko'rsatkichi — Mini
+        App'dagi raketa animatsiyasi qay balandlikka uchishini shu belgilaydi
+        (gift har doim eng baland/portlash, yulduz esa box'ning star_min..
+        star_max oralig'idagi o'rniga qarab hisoblanadi)."""
+    prize = await roll_box(box)
+
+    if prize["kind"] == "stars":
+        await add_stars(telegram_id, prize["amount"])
+        result_text = (
+            f"🎉 <b>{box['name']}</b> ochildi!\n\n"
+            f"⭐ Mukofot: <b>+{prize['amount']} ⭐</b>\n\n"
+            f"Yulduzlar hisobingizga qo'shildi!"
+        )
+        lo, hi = box["star_min"], box["star_max"]
+        if hi > lo:
+            raw_ratio = (prize["amount"] - lo) / (hi - lo)
+        else:
+            raw_ratio = 1.0
+        raw_ratio = max(0.0, min(1.0, raw_ratio))
+        # Yulduz mukofotlari doim gift'dan pastroq "balandlik"da qoladi (0.05..0.82)
+        ratio = 0.05 + raw_ratio * 0.77
+        amount = prize["amount"]
+        claim_id = None
+    else:
+        gift = prize["gifts"][0]
+        ratio = 0.97  # gift — eng katta yutuq, raketa deyarli tepaga uchadi
+        amount = 0
+
+        # Darhol yuborilmaydi — foydalanuvchi keyinroq tanlaydi: haqiqiy gift
+        # sifatida olish yoki ⭐ (ichki valyuta) ga aylantirish. Shu tanlovga
+        # qadar hech narsa sodir bo'lmaydi ("saqlab qo'yilgan" holat).
+        claim_id = await add_gift_claim(telegram_id, gift["id"], gift["name"], gift["price_stars"], source="box")
+
+        result_text = (
+            f"🎉 <b>{box['name']}</b> ochildi!\n\n"
+            f"🎁 Yutgan giftingiz: <b>{gift['name']}</b> ({gift['price_stars']} ⭐)\n\n"
+            f"Pastdagi tugmalardan birini tanlang 👇"
+        )
+
+    return {
+        "text": result_text,
+        "kind": prize["kind"],
+        "amount": amount,
+        "ratio": round(ratio, 3),
+        "claim_id": claim_id,
+        "gift_name": prize["gifts"][0]["name"] if prize["kind"] == "gifts" else None,
+        "gift_price_stars": prize["gifts"][0]["price_stars"] if prize["kind"] == "gifts" else None,
+    }
+
+
+def gift_claim_keyboard(claim_id: int, price_stars: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🎁 Giftni olish", callback_data=f"giftclaim:real:{claim_id}")
+    kb.button(text=f"⭐ {price_stars} ⭐ ga aylantirish", callback_data=f"giftclaim:stars:{claim_id}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+@router.callback_query(F.data.startswith("giftclaim:"))
+async def gift_claim_callback(call: CallbackQuery, bot: Bot) -> None:
+    """Box'dan yutilgan gift bo'yicha foydalanuvchining tanlovi: haqiqiy
+    sovg'a sifatida olish yoki ichki ⭐ valyutaga aylantirish. Tanlov
+    qilinmaguncha gift "saqlanadi" — tugmalar istalgan vaqt bosilishi mumkin."""
+    parts = call.data.split(":")
+    action, claim_id = parts[1], int(parts[2])
+
+    claim = await get_gift_claim(claim_id)
+    if not claim:
+        await call.answer("❌ Topilmadi", show_alert=True)
+        return
+    if claim["telegram_id"] != call.from_user.id:
+        await call.answer("❌ Bu sizga tegishli emas!", show_alert=True)
+        return
+    if claim["status"] != "pending":
+        await call.answer("⚠️ Bu gift bo'yicha allaqachon tanlov qilingan!", show_alert=True)
+        return
+
+    if action == "stars":
+        await update_gift_claim_status(claim_id, "claimed_stars")
+        await add_stars(claim["telegram_id"], claim["price_stars"])
+        text = (
+            f"⭐ <b>{claim['item_name']}</b> — <b>{claim['price_stars']} ⭐</b> ga aylantirildi "
+            f"va balansingizga qo'shildi!"
+        )
+        try:
+            await call.message.edit_text(text)
+        except TelegramBadRequest:
+            await call.message.answer(text)
+        await call.answer("✅ Starsga aylantirildi!", show_alert=False)
+        return
+
+    # action == "real" — haqiqiy gift sifatida olish
+    item = await get_shop_item(claim["item_id"])
+    delivered, error = await try_auto_deliver_gift(bot, claim["telegram_id"], item)
+
+    if delivered:
+        await update_gift_claim_status(claim_id, "claimed_gift")
+        text = (
+            f"✅ <b>{claim['item_name']}</b> avtomatik yuborildi — "
+            f"Telegram'dagi \"Sovg'alar\" bo'limingizni tekshiring! ✨"
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"🎁 <b>BOX'DAN GIFT TANLANDI VA AVTOMATIK YUBORILDI!</b>\n\n"
+                    f"👤 Foydalanuvchi: {call.from_user.first_name} (@{call.from_user.username or '—'})\n"
+                    f"🆔 ID: <code>{call.from_user.id}</code>\n"
+                    f"🎁 Gift: <b>{claim['item_name']}</b> ({claim['price_stars']} ⭐)\n\n"
+                    f"✅ Hech narsa qilish shart emas — allaqachon yuborilgan.",
+                )
+            except TelegramForbiddenError:
+                pass
+    else:
+        # Qo'lda tasdiqlash yo'liga o'tamiz — mavjud withdrawals infratuzilmasi
+        # (wd_approve/wd_reject) qayta ishlatiladi, shu bilan yagona joyda
+        # kuzatiladi va ikki marta yuborib yuborilmaydi.
+        w_id = await add_withdrawal(
+            telegram_id=claim["telegram_id"],
+            user_name=call.from_user.first_name or "",
+            username=call.from_user.username or "",
+            kind="gift",
+            amount_stars=claim["price_stars"],
+            item_name=claim["item_name"],
+        )
+        await update_gift_claim_status(claim_id, "claimed_gift")
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text="✅ Gift yubordim", callback_data=f"wd_approve:{w_id}")
+        kb.adjust(1)
+        warn = f"⚠️ Avtomatik yuborish muvaffaqiyatsiz bo'ldi ({error}) — qo'lda yuboring!\n\n" if error else ""
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"🎁 <b>BOX'DAN GIFT TANLANDI — QO'LDA YUBORISH KERAK!</b>\n\n"
+                    f"{warn}"
+                    f"👤 Foydalanuvchi: {call.from_user.first_name} (@{call.from_user.username or '—'})\n"
+                    f"🆔 ID: <code>{call.from_user.id}</code>\n"
+                    f"🎁 Gift: <b>{claim['item_name']}</b> ({claim['price_stars']} ⭐)\n\n"
+                    f"⚠️ Giftni foydalanuvchiga Telegram'da yuborgach, tugmani bosing.",
+                    reply_markup=kb.as_markup(),
+                )
+            except TelegramForbiddenError:
+                pass
+
+        text = "✅ So'rovingiz qabul qilindi — gift tez orada admin tomonidan yuboriladi."
+
+    try:
+        await call.message.edit_text(text)
+    except TelegramBadRequest:
+        await call.message.answer(text)
+    await call.answer("✅ Tanlandi!", show_alert=False)
+
+
 @router.callback_query(F.data.startswith("box_open:"))
 async def box_open_callback(call: CallbackQuery, bot: Bot) -> None:
+    """Boxni bot balansidagi (ichki) ⭐ bilan ochish."""
     box_id = call.data.split(":")[1]
     box = await get_box(box_id)
     if not box:
@@ -1152,42 +1682,100 @@ async def box_open_callback(call: CallbackQuery, bot: Bot) -> None:
     if box["once_per_day"]:
         await set_daily_box_used(call.from_user.id, today)
 
-    prize = await roll_box(box)
-
-    if prize["kind"] == "stars":
-        await add_stars(call.from_user.id, prize["amount"])
-        result_text = (
-            f"🎉 <b>{box['name']}</b> ochildi!\n\n"
-            f"⭐ Mukofot: <b>+{prize['amount']} ⭐</b>\n\n"
-            f"Yulduzlar hisobingizga qo'shildi!"
-        )
-    else:
-        gift = prize["gifts"][0]
-        result_text = (
-            f"🎉 <b>{box['name']}</b> ochildi!\n\n"
-            f"🎁 Yutgan giftingiz: <b>{gift['name']}</b> ({gift['price_stars']} ⭐)\n\n"
-            f"Gift sizga admin tomonidan yuboriladi!"
-        )
-        for admin_id in ADMIN_IDS:
-            try:
-                await bot.send_message(
-                    admin_id,
-                    f"🎁 <b>BOX'DAN GIFT YUTILDI!</b>\n\n"
-                    f"👤 Foydalanuvchi: {call.from_user.first_name} (@{call.from_user.username or '—'})\n"
-                    f"🆔 ID: <code>{call.from_user.id}</code>\n"
-                    f"📦 Box: <b>{box['name']}</b>\n"
-                    f"🎁 Gift: <b>{gift['name']}</b> ({gift['price_stars']} ⭐)\n\n"
-                    f"⚠️ Giftni foydalanuvchiga o'tkazing (Telegram'da yuborish mumkin)!",
-                )
-            except TelegramForbiddenError:
-                pass
+    result = await open_box_and_award(
+        bot, box, call.from_user.id, call.from_user.first_name, call.from_user.username,
+    )
 
     await call.answer("🎉 Box ochildi!", show_alert=False)
     try:
         await call.message.delete()
     except TelegramBadRequest:
         pass
-    await show_boxes(call.message.answer, call.from_user.id, result_text)
+    if result["claim_id"]:
+        await call.message.answer(
+            result["text"],
+            reply_markup=gift_claim_keyboard(result["claim_id"], result["gift_price_stars"]),
+        )
+        await show_boxes(call.message.answer, call.from_user.id)
+    else:
+        await show_boxes(call.message.answer, call.from_user.id, result["text"])
+
+
+@router.callback_query(F.data.startswith("box_open_tgstars:"))
+async def box_open_tgstars_callback(call: CallbackQuery, bot: Bot) -> None:
+    """Boxni haqiqiy Telegram Stars bilan ochish uchun invoys yuboradi —
+    to'lov muvaffaqiyatli o'tgach, box successful_payment_handler'da ochiladi."""
+    box_id = call.data.split(":")[1]
+    box = await get_box(box_id)
+    if not box:
+        await call.answer("❌ Box topilmadi!", show_alert=True)
+        return
+    if box["cost_tgstars"] <= 0:
+        await call.answer("❌ Bu box uchun Stars narxi belgilanmagan!", show_alert=True)
+        return
+
+    user = await get_user(call.from_user.id)
+    if not user:
+        await call.answer("❌ Avval /start ni bosing!", show_alert=True)
+        return
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    if box["once_per_day"] and user["last_daily_box"] == today:
+        await call.answer("❌ Kunlik boxni bugun ishlatgansiz! Ertaga qayta oching.", show_alert=True)
+        return
+
+    try:
+        await bot.send_invoice(
+            chat_id=call.from_user.id,
+            title=f"📦 {box['name']}",
+            description=box["desc_text"] or f"{box['name']} — {box['cost_tgstars']} Telegram Stars",
+            payload=f"box:{box['box_id']}",
+            currency="XTR",
+            prices=[LabeledPrice(label=box["name"], amount=box["cost_tgstars"])],
+            provider_token="",
+        )
+    except TelegramBadRequest as e:
+        logger.error("Box uchun Stars invoys yuborilmadi (box_id=%s): %s", box_id, e)
+        await call.answer("❌ Invoys yuborib bo'lmadi, keyinroq urinib ko'ring.", show_alert=True)
+        return
+
+    await call.answer()
+
+
+@router.message(F.text == "ℹ️ Bot haqida")
+async def about_bot_handler(message: Message) -> None:
+    """Bot va Mini App qanday ishlashi haqida qisqa qo'llanma."""
+    settings = await get_settings()
+    text = (
+        "ℹ️ <b>Bot haqida — qanday ishlaydi?</b>\n\n"
+        "⭐ <b>Yulduz qanday topiladi?</b>\n"
+        f"• Do'stlaringizni <b>🔗 Referal</b> havolangiz orqali taklif qiling — "
+        f"har biri uchun <b>{settings['ref_reward_stars']} ⭐</b> olasiz "
+        f"(do'stingiz majburiy kanallarga a'zo bo'lishi shart).\n"
+        "• <b>🎰 Jekpot</b> boxlarini oching — tasodifiy miqdorda ⭐ yoki gift yutib olasiz.\n\n"
+        "🛍️ <b>Do'kon</b>\n"
+        "Gift, Premium va boshqa mahsulotlarni 3 xil usulda sotib olish mumkin: "
+        "ichki ⭐ balansingizdan, haqiqiy Telegram Stars'dan, yoki karta (UZS) orqali.\n\n"
+        "🎰 <b>Jekpot (boxlar)</b>\n"
+        "Box ochilganda raketa uchadi — qancha baland uchsa, mukofot shuncha katta. "
+        "Gift yutib olsangiz, uni <b>saqlab qo'yasiz</b>: keyin xohlaganingizda "
+        "\"🎁 Giftni olish\" (haqiqiy sovg'a) yoki \"⭐ ga aylantirish\" (ichki balansga "
+        "qo'shish) tugmalaridan birini bosasiz — shoshilish shart emas.\n\n"
+        "💸 <b>Yulduz yechish</b>\n"
+        f"Balansingiz kamida <b>{settings['min_withdraw_stars']} ⭐</b> bo'lsa, ⭐ (real to'lov) "
+        "yoki gift sifatida yechib olishingiz mumkin. Ba'zi giftlar avtomatik yuboriladi, "
+        "qolganlari bot egasi tomonidan qo'lda.\n\n"
+        "✨ <b>Mini-App do'kon</b>\n"
+        "Bir xil do'kon va Jekpot — chiroyli veb-sahifa ko'rinishida, tepadagi 🌙/☀️ "
+        "tugmasi bilan dark/light mavzuni almashtirishingiz mumkin.\n\n"
+        "❓ Savol bo'lsa — <b>📞 Aloqa</b> bo'limidan yozing."
+    )
+
+    has_miniapp = PUBLIC_BASE_URL.startswith("https://")
+    kb = InlineKeyboardBuilder()
+    if has_miniapp:
+        kb.button(text="✨ Mini-App'ni ochish", web_app=WebAppInfo(url=f"{PUBLIC_BASE_URL}/webapp"))
+    await message.answer(text, reply_markup=kb.as_markup() if has_miniapp else None)
 
 
 @router.message(F.text == "📞 Aloqa")
@@ -1386,12 +1974,17 @@ async def buy_item_callback(call: CallbackQuery, bot: Bot) -> None:
     # Xarid — yulduz ayriladi
     await deduct_stars(call.from_user.id, item["price_stars"])
 
-    # Adminga buyurtma yuboramiz
+    delivered, error = await try_auto_deliver_gift(bot, call.from_user.id, item)
+
+    # Adminga buyurtma haqida xabar (auto-yuborilgan bo'lsa — faqat ma'lumot uchun)
+    warn = f"⚠️ Avtomatik yuborish muvaffaqiyatsiz bo'ldi ({error}) — qo'lda yuboring!\n\n" if error else ""
+    status_line = "✅ Gift avtomatik yuborildi — hech narsa qilish shart emas.\n\n" if delivered else warn
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
                 admin_id,
                 f"🛒 <b>YANGI BUYURTMA!</b>\n\n"
+                f"{status_line}"
                 f"👤 Foydalanuvchi: {call.from_user.first_name} (@{call.from_user.username or '—'})\n"
                 f"🆔 ID: <code>{call.from_user.id}</code>\n"
                 f"{label} <b>{item['name']}</b>\n"
@@ -1403,10 +1996,14 @@ async def buy_item_callback(call: CallbackQuery, bot: Bot) -> None:
             pass
 
     await call.message.delete()
+    if delivered:
+        user_note = "✅ Gift avtomatik yuborildi — Telegram'dagi \"Sovg'alar\" bo'limingizni tekshiring! ✨"
+    else:
+        user_note = "Buyurtma adminga yuborildi, tez orada siz bilan bog'lanamiz. 🎁"
     await call.message.answer(
         f"✅ <b>Xarid muvaffaqiyatli!</b>\n\n"
         f"{label} <b>{item['name']}</b> — {item['price_stars']} ⭐ ayirildi. "
-        f"Buyurtma adminga yuborildi, tez orada siz bilan bog'lanamiz. 🎁",
+        f"{user_note}",
     )
     await call.answer("✅ Sotib olindi!", show_alert=False)
 
@@ -1454,6 +2051,187 @@ async def buy_item_uzs_callback(call: CallbackQuery) -> None:
         reply_markup=kb.as_markup(),
     )
     await call.answer()
+
+
+# ---------- Telegram Stars (haqiqiy ⭐, Bot API to'lovi) ----------
+# Bularni bot ichidagi virtual ⭐ balansi bilan aralashtirmang: bu yerda
+# foydalanuvchi o'zining Telegramdagi haqiqiy Stars balansidan to'laydi
+# (Telegram Payments API, currency="XTR", provider_token shart emas).
+
+@router.callback_query(F.data.startswith("buy_tgstars:"))
+async def buy_item_tgstars_callback(call: CallbackQuery, bot: Bot) -> None:
+    """Mahsulotni foydalanuvchining haqiqiy Telegram Stars balansidan to'lash uchun invoys yuboradi."""
+    item_id = int(call.data.split(":")[1])
+    item = await get_shop_item(item_id)
+
+    if not item:
+        await call.answer("❌ Mahsulot topilmadi", show_alert=True)
+        return
+    if item["price_stars"] <= 0:
+        await call.answer("❌ Bu mahsulot uchun Stars narxi belgilanmagan!", show_alert=True)
+        return
+
+    label = CATEGORIES.get(item["category"], item["category"])
+    try:
+        await bot.send_invoice(
+            chat_id=call.from_user.id,
+            title=f"{label} — {item['name']}",
+            description=item["description"] or f"{item['name']} ({item['price_stars']} ⭐ Telegram Stars)",
+            payload=f"shop_item:{item['id']}",
+            currency="XTR",  # Telegram Stars uchun maxsus valyuta kodi
+            prices=[LabeledPrice(label=item["name"], amount=item["price_stars"])],
+            provider_token="",  # Telegram Stars uchun bo'sh qoldiriladi
+        )
+    except TelegramBadRequest as e:
+        logger.error("Stars invoys yuborilmadi (item_id=%s): %s", item_id, e)
+        await call.answer("❌ Invoys yuborib bo'lmadi, keyinroq urinib ko'ring.", show_alert=True)
+        return
+
+    await call.answer()
+
+
+@router.pre_checkout_query()
+async def pre_checkout_handler(pre_checkout_query: PreCheckoutQuery, bot: Bot) -> None:
+    """Telegram to'lovni tasdiqlashdan oldin so'raydi — mahsulot hali mavjudligini tekshiramiz."""
+    payload = pre_checkout_query.invoice_payload
+    ok = True
+    error_message = None
+    if payload.startswith("shop_item:"):
+        item_id = int(payload.split(":")[1])
+        item = await get_shop_item(item_id)
+        if not item:
+            ok = False
+            error_message = "Bu mahsulot endi mavjud emas."
+    elif payload.startswith("box:"):
+        box_id = payload.split(":", 1)[1]
+        box = await get_box(box_id)
+        if not box:
+            ok = False
+            error_message = "Bu box endi mavjud emas."
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=ok, error_message=error_message)
+
+
+async def _handle_box_stars_payment(message: Message, bot: Bot, payload: str, payment) -> None:
+    """Box haqiqiy Telegram Stars bilan to'langach shu yerda ochiladi (rol
+    o'ynatiladi) va mukofot beriladi — bot balansi yoki kunlik cheklovga
+    umuman tegilmaydi, chunki bu boshqa (real pul) to'lov yo'li."""
+    box_id = payload.split(":", 1)[1]
+    box = await get_box(box_id)
+    if not box:
+        await message.answer("⚠️ To'lov qabul qilindi, lekin box topilmadi. Admin bilan bog'laning: @Kottabolladan")
+        return
+
+    if box["once_per_day"]:
+        today = datetime.now().strftime("%Y-%m-%d")
+        await set_daily_box_used(message.from_user.id, today)
+
+    result = await open_box_and_award(
+        bot, box, message.from_user.id, message.from_user.first_name or "", message.from_user.username or "",
+    )
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"💫 <b>BOX TELEGRAM STARS BILAN OCHILDI!</b>\n\n"
+                f"👤 Foydalanuvchi: {message.from_user.first_name} (@{message.from_user.username or '—'})\n"
+                f"🆔 ID: <code>{message.from_user.id}</code>\n"
+                f"📦 Box: <b>{box['name']}</b>\n"
+                f"💰 To'lov: <b>{payment.total_amount} ⭐ Telegram Stars</b>\n"
+                f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            )
+        except TelegramForbiddenError:
+            pass
+
+    if result["claim_id"]:
+        await message.answer(
+            result["text"],
+            reply_markup=gift_claim_keyboard(result["claim_id"], result["gift_price_stars"]),
+        )
+        await show_boxes(message.answer, message.from_user.id)
+    else:
+        await show_boxes(message.answer, message.from_user.id, result["text"])
+
+
+@router.message(F.successful_payment)
+async def successful_payment_handler(message: Message, bot: Bot) -> None:
+    """To'lov muvaffaqiyatli o'tgach — mahsulotni yetkazib beramiz va adminga xabar beramiz."""
+    payment = message.successful_payment
+    payload = payment.invoice_payload
+
+    if payload.startswith("box:"):
+        await _handle_box_stars_payment(message, bot, payload, payment)
+        return
+
+    if payload.startswith("topup:"):
+        # Admin botning haqiqiy Stars balansini o'zi to'ldirdi — bu to'lov hech qanday
+        # buyurtma/mahsulotga bog'liq emas, faqat Telegram'ning o'zi balansni oshiradi.
+        # Komissiya olinmaydi: bot kodi to'lovning bir tiyinini ham ushlab qolmaydi —
+        # to'liq summasi Telegram tomonidan botning real balansiga qo'shiladi.
+        await message.answer(
+            f"✅ <b>Balans to'ldirildi!</b>\n\n"
+            f"Botning haqiqiy Stars balansiga <b>{payment.total_amount} ⭐</b> qo'shildi "
+            f"(komissiyasiz, 100%). Bu balansdan endi foydalanuvchilarga haqiqiy "
+            f"gift'lar avtomatik yuborilishi mumkin.",
+        )
+        return
+
+    if not payload.startswith("shop_item:"):
+        return
+
+    item_id = int(payload.split(":")[1])
+    item = await get_shop_item(item_id)
+    if not item:
+        await message.answer("⚠️ To'lov qabul qilindi, lekin mahsulot topilmadi. Admin bilan bog'laning.")
+        return
+
+    label = CATEGORIES.get(item["category"], item["category"])
+
+    order_id = await add_order(
+        telegram_id=message.from_user.id,
+        user_name=message.from_user.first_name or "",
+        username=message.from_user.username or "",
+        item_id=item["id"],
+        item_name=item["name"],
+        category=item["category"],
+        amount_uzs=0,
+        proof_file_id="",
+    )
+    # Telegram o'zi to'lovni tasdiqlagan — buyurtma darhol tasdiqlangan deb belgilanadi
+    await update_order_status(order_id, "approved")
+
+    delivered, error = await try_auto_deliver_gift(bot, message.from_user.id, item)
+    warn = f"⚠️ Avtomatik yuborish muvaffaqiyatsiz bo'ldi ({error}) — qo'lda yuboring!\n\n" if error else ""
+    status_line = "✅ Gift avtomatik yuborildi — hech narsa qilish shart emas.\n\n" if delivered else (
+        warn or "⚠️ Mahsulotni foydalanuvchiga o'tkazing (Telegram'da yuborish mumkin)!\n\n"
+    )
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"✨ <b>TELEGRAM STARS BILAN TO'LANDI!</b>\n\n"
+                f"{status_line}"
+                f"👤 Foydalanuvchi: {message.from_user.first_name} (@{message.from_user.username or '—'})\n"
+                f"🆔 ID: <code>{message.from_user.id}</code>\n"
+                f"{label} <b>{item['name']}</b>\n"
+                f"💰 Narxi: <b>{payment.total_amount} ⭐ Telegram Stars</b>\n"
+                f"🧾 Buyurtma: #{order_id}\n"
+                f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            )
+        except TelegramForbiddenError:
+            pass
+
+    user_note = (
+        "✅ Gift avtomatik yuborildi — Telegram'dagi \"Sovg'alar\" bo'limingizni tekshiring! ✨"
+        if delivered else "Tez orada mahsulot sizga yetkaziladi. 🎁"
+    )
+    await message.answer(
+        f"✅ <b>To'lov qabul qilindi!</b>\n\n"
+        f"{label} <b>{item['name']}</b> — {payment.total_amount} ⭐ Telegram Stars orqali sotib olindi.\n"
+        f"🧾 Buyurtma: #{order_id}\n\n"
+        f"{user_note}",
+    )
 
 
 @router.callback_query(F.data.startswith("uzs_paid:"))
@@ -1565,6 +2343,9 @@ async def order_approve_callback(call: CallbackQuery, bot: Bot) -> None:
     if order["category"] == "star" and item and item["deliver_stars"] > 0:
         await add_stars(order["telegram_id"], item["deliver_stars"])
 
+    # Gift toifasida va Telegram gift ID bog'langan bo'lsa — avtomatik yuboramiz
+    delivered, error = await try_auto_deliver_gift(bot, order["telegram_id"], item)
+
     try:
         await bot.send_message(
             order["telegram_id"],
@@ -1572,17 +2353,23 @@ async def order_approve_callback(call: CallbackQuery, bot: Bot) -> None:
             f"🛒 #{order_id} buyurtma: <b>{order['item_name']}</b> — {order['amount_uzs']:,} so'm\n\n"
             + (f"⭐ <b>{item['deliver_stars']} yulduz</b> hisobingizga qo'shildi!\n"
                if order["category"] == "star" and item and item["deliver_stars"] > 0 else "")
+            + ("✅ Gift avtomatik yuborildi — Telegram'dagi \"Sovg'alar\" bo'limingizni tekshiring! ✨\n"
+               if delivered else "")
             + (f"🎁 {order['item_name']} sizga yuboriladi (egasi: @Kottabolladan).\n"
-               if order["category"] != "star" else "")
+               if order["category"] != "star" and not delivered else "")
             + "\nDo'kondan foydalanishda davom eting! 🛍️",
         )
     except TelegramForbiddenError:
         pass
 
+    caption_extra = "\n\n✅ <b>TASDIQLANDI</b>"
+    if delivered:
+        caption_extra += " (gift avtomatik yuborildi)"
+    elif error:
+        caption_extra += f" — ⚠️ avto-yuborish xato berdi ({error}), qo'lda yuboring!"
+    caption_extra += f" — {call.from_user.first_name}"
     try:
-        await call.message.edit_caption(
-            caption=f"{call.message.caption}\n\n✅ <b>TASDIQLANDI</b> — {call.from_user.first_name}",
-        )
+        await call.message.edit_caption(caption=f"{call.message.caption}{caption_extra}")
     except TelegramBadRequest:
         pass
     await call.answer("✅ Tasdiqlandi!", show_alert=False)
@@ -1634,12 +2421,199 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     kb.button(text="📊 Statistika", callback_data="admin:stats")
     kb.button(text="⚙️ Sozlamalar", callback_data="admin:settings")
     kb.button(text="🛒 Savdo boshqaruvi", callback_data="admin:shop")
+    kb.button(text="💸 Kutilayotgan to'lovlar", callback_data="admin:withdrawals")
+    kb.button(text="🎁 TG Gift avto-yuborish", callback_data="admin:tggifts")
     kb.button(text="📦 Boxlar boshqaruvi", callback_data="admin:boxes")
     kb.button(text="📢 Rassilka", callback_data="admin:broadcast")
     kb.button(text="🔗 Kanallar", callback_data="admin:channels")
     kb.button(text="📞 Aloqa boshqaruvi", callback_data="admin:contacts")
+    kb.button(text="🔋 Bot balansini to'ldirish", callback_data="admin:topup")
     kb.adjust(2)
     return kb.as_markup()
+
+
+@router.callback_query(F.data == "admin:topup")
+async def admin_topup_start(call: CallbackQuery, state: FSMContext) -> None:
+    """Admin botning haqiqiy Stars balansini o'zi to'ldirishi uchun miqdor so'raydi."""
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    await state.set_state(TopupStates.amount)
+    await call.message.edit_text(
+        "🔋 <b>Bot balansini to'ldirish</b>\n\n"
+        "Nechta ⭐ Stars bilan botning haqiqiy balansini to'ldirmoqchisiz? "
+        "Raqamni yuboring (masalan: <code>500</code>).\n\n"
+        "💡 To'lov to'g'ridan-to'g'ri Telegram orqali o'tadi, hech qanday komissiya "
+        "olinmaydi — yuborgan summangizning 100% botning real Stars balansiga tushadi. "
+        "Shu balansdan keyin foydalanuvchilarga haqiqiy gift'lar avtomatik yuboriladi.",
+    )
+    await call.answer()
+
+
+@router.message(TopupStates.amount)
+async def admin_topup_amount_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    raw = (message.text or "").strip()
+    if not raw.isdigit() or int(raw) <= 0:
+        await message.answer("❌ Iltimos, musbat butun son yuboring (masalan: 500).")
+        return
+    amount = int(raw)
+    if amount > 100000:
+        await message.answer("❌ Bir martada eng ko'pi bilan 100000 ⭐ yuborish mumkin.")
+        return
+
+    await state.clear()
+    try:
+        await bot.send_invoice(
+            chat_id=message.from_user.id,
+            title="Bot balansini to'ldirish",
+            description=(
+                f"Botning haqiqiy Stars balansiga {amount} ⭐ qo'shiladi. "
+                "Komissiyasiz — 100% balansga tushadi."
+            ),
+            payload=f"topup:{amount}",
+            currency="XTR",  # Telegram Stars uchun maxsus valyuta kodi
+            prices=[LabeledPrice(label="Balansni to'ldirish", amount=amount)],
+            provider_token="",  # Telegram Stars uchun bo'sh qoldiriladi
+        )
+    except TelegramBadRequest as e:
+        logger.error("Balans to'ldirish invoysi yuborilmadi: %s", e)
+        await message.answer("❌ Invoys yuborib bo'lmadi, keyinroq urinib ko'ring.")
+
+
+@router.callback_query(F.data == "admin:withdrawals")
+async def admin_pending_withdrawals(call: CallbackQuery) -> None:
+    """Hali to'lanmagan/berilmagan barcha yechish so'rovlari ro'yxati — admin
+    chatidagi eski xabarni yo'qotib qo'ysa ham, shu yerdan holatni tekshiradi."""
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+
+    pending = await get_pending_withdrawals()
+    if not pending:
+        text = "💸 <b>Kutilayotgan to'lovlar</b>\n\n✅ Hozircha kutilayotgan so'rov yo'q."
+    else:
+        lines = ["💸 <b>Kutilayotgan to'lovlar</b>\n"]
+        total_stars = 0
+        for w in pending:
+            if w["kind"] == "gift":
+                lines.append(f"#{w['id']} — 🎁 {w['item_name']} ({w['amount_stars']} ⭐) — {w['user_name']} (@{w['username'] or '—'}, ID: {w['telegram_id']})")
+            else:
+                lines.append(f"#{w['id']} — ⭐ {w['amount_stars']} ⭐ — {w['user_name']} (@{w['username'] or '—'}, ID: {w['telegram_id']})")
+            total_stars += w["amount_stars"]
+        lines.append(f"\nJami: <b>{len(pending)}</b> ta so'rov, <b>{total_stars} ⭐</b> qiymatida.")
+        lines.append("\nHar birini tasdiqlash/bekor qilish uchun o'sha so'rov yuborilgan admin xabaridagi tugmalardan foydalaning.")
+        text = "\n".join(lines)
+
+    await call.message.edit_text(text, reply_markup=back_to_admin_keyboard())
+    await call.answer()
+
+
+# ---------- Telegram Gift avtomatik yuborish ----------
+# "Gift sifatida yechish" so'ralganda, agar shop_items'dagi gift'ga haqiqiy
+# Telegram gift_id bog'langan bo'lsa, admin qo'lda bosishi shart bo'lmaydi —
+# bot o'zining haqiqiy Stars balansidan (Bot API sendGift) avtomatik yuboradi.
+# Bog'lanmagan giftlar uchun eski qo'lda tasdiqlash yo'li ishlayveradi.
+
+@router.callback_query(F.data == "admin:tggifts")
+async def admin_tggifts_menu(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+
+    gifts = await get_shop_items("gift")
+    kb = InlineKeyboardBuilder()
+    for g in gifts:
+        mark = "✅" if g["tg_gift_id"] else "❌"
+        kb.button(text=f"{mark} {g['name']}", callback_data=f"admin:tggift_set:{g['id']}")
+    kb.button(text="📋 Mavjud Telegram gift'lar", callback_data="admin:tggift_catalog")
+    kb.button(text="🔙 Ortga", callback_data="admin")
+    kb.adjust(1)
+
+    text = (
+        "🎁 <b>TG Gift avto-yuborish</b>\n\n"
+        "Do'kondagi \"Gift\" mahsulotlaridan qay birini foydalanuvchi "
+        "\"Yulduz yechish → Gift sifatida\" orqali tanlasa — agar shu "
+        "mahsulotga haqiqiy Telegram gift ID bog'langan bo'lsa, bot uni "
+        "<b>o'zining haqiqiy Stars balansidan avtomatik</b> yuboradi (admin "
+        "qo'lda bosishi shart emas). Bog'lanmagan mahsulotlar eskichasiga "
+        "qo'lda tasdiqlanadi.\n\n"
+        "✅ — gift ID bog'langan, ❌ — bog'lanmagan.\n"
+        "Mahsulotni tanlang:"
+    )
+    await call.message.edit_text(text, reply_markup=kb.as_markup())
+    await call.answer()
+
+
+@router.callback_query(F.data == "admin:tggift_catalog")
+async def admin_tggift_catalog(call: CallbackQuery, bot: Bot) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+
+    try:
+        gifts = await bot.get_available_gifts()
+    except Exception as e:
+        logger.error("get_available_gifts xato: %s", e)
+        await call.answer("❌ Telegram'dan gift ro'yxatini olib bo'lmadi.", show_alert=True)
+        return
+
+    if not gifts.gifts:
+        text = "📋 <b>Mavjud Telegram gift'lar</b>\n\nHozircha ro'yxat bo'sh."
+    else:
+        lines = ["📋 <b>Mavjud Telegram gift'lar</b>\n(ID'ni nusxalab, mahsulotga bog'lang)\n"]
+        for g in gifts.gifts[:40]:
+            emoji = g.sticker.emoji if g.sticker and g.sticker.emoji else "🎁"
+            limit = f" (qolgan {g.remaining_count}/{g.total_count})" if g.total_count else " (cheksiz)"
+            lines.append(f"{emoji} <code>{g.id}</code> — {g.star_count} ⭐{limit}")
+        text = "\n".join(lines)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔙 Ortga", callback_data="admin:tggifts")
+    await call.message.edit_text(text, reply_markup=kb.as_markup())
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin:tggift_set:"))
+async def admin_tggift_set_start(call: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+
+    item_id = int(call.data.split(":")[2])
+    item = await get_shop_item(item_id)
+    if not item:
+        await call.answer("❌ Mahsulot topilmadi", show_alert=True)
+        return
+
+    await state.set_state(TgGiftStates.gift_id)
+    await state.update_data(item_id=item_id)
+
+    current = item["tg_gift_id"] or "❌ bog'lanmagan"
+    await call.message.edit_text(
+        f"🎁 <b>{item['name']}</b>\n\n"
+        f"Hozirgi holat: <code>{current}</code>\n\n"
+        f"📋 \"Mavjud Telegram gift'lar\" bo'limidan ID'ni nusxalab shu yerga yuboring.\n"
+        f"O'chirish uchun <code>-</code> yozing.",
+    )
+    await call.answer()
+
+
+@router.message(TgGiftStates.gift_id)
+async def admin_tggift_id_input(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    item_id = data.get("item_id")
+    raw = message.text.strip()
+
+    new_value = "" if raw == "-" else raw
+    await update_shop_item(item_id, tg_gift_id=new_value)
+    await state.clear()
+
+    if new_value:
+        await message.answer(f"✅ Bog'landi! Endi bu gift avtomatik yuboriladi.\nID: <code>{new_value}</code>")
+    else:
+        await message.answer("✅ Bog'lanish o'chirildi — bu gift endi qo'lda tasdiqlanadi.")
 
 
 @router.message(F.text == "👑 Admin panel")
@@ -1686,6 +2660,7 @@ def settings_keyboard() -> InlineKeyboardMarkup:
     kb.button(text="💳 To'lov kartasi", callback_data="admin:set:pay_card")
     kb.button(text="⭐ Otziv kanali", callback_data="admin:set:reviews_channel")
     kb.button(text="🖼 NFT guruh linki", callback_data="admin:set:nft_group")
+    kb.button(text="🎁 Gift yuborish matni", callback_data="admin:set:gift_caption")
     kb.button(text="🔙 Ortga", callback_data="admin")
     kb.adjust(1)
     return kb.as_markup()
@@ -1699,6 +2674,7 @@ async def admin_settings(call: CallbackQuery) -> None:
     s = await get_settings()
     reviews_display = s["reviews_channel"] or "❌ o'rnatilmagan"
     nft_display = s["nft_group"] or "❌ o'rnatilmagan"
+    gift_caption_display = s["gift_caption"] or DEFAULT_GIFT_CAPTION
     text = (
         f"⚙️ <b>Sozlamalar</b>\n\n"
         f"⭐ Referal mukofoti: <b>{s['ref_reward_stars']} ⭐</b>\n"
@@ -1706,7 +2682,8 @@ async def admin_settings(call: CallbackQuery) -> None:
         f"💸 Yulduz yechish minimumi: <b>{s['min_withdraw_stars']} ⭐</b>\n"
         f"💳 To'lov kartasi: <code>{s['pay_card']}</code>\n"
         f"⭐ Otziv: {reviews_display}\n"
-        f"🖼 NFT guruhi: {nft_display}\n\n"
+        f"🖼 NFT guruhi: {nft_display}\n"
+        f"🎁 Gift matni: <code>{gift_caption_display}</code>\n\n"
         f"O'zgartirmoqchi bo'lgan qiymatni tanlang:"
     )
     await call.message.edit_text(text, reply_markup=settings_keyboard())
@@ -1860,6 +2837,34 @@ async def nft_group_input(message: Message, state: FSMContext) -> None:
     await message.answer(f"✅ NFT guruh linki saqlandi: <b>{raw}</b>", reply_markup=admin_keyboard())
 
 
+@router.callback_query(F.data == "admin:set:gift_caption")
+async def set_gift_caption(call: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    settings = await get_settings()
+    current = settings.get("gift_caption") or DEFAULT_GIFT_CAPTION
+    await state.set_state(SettingsStates.gift_caption)
+    await call.message.edit_text(
+        "🎁 <b>Gift yuborish matnini yozing:</b>\n\n"
+        "Bu matn haqiqiy Telegram gift avtomatik yuborilganda unga qo'shiladi.\n"
+        "<code>{item}</code> — gift nomi bilan avtomatik almashtiriladi.\n\n"
+        f"Joriy: <code>{current}</code>\n\n"
+        "Standart holatga qaytarish uchun <code>-</code> yozing.",
+    )
+    await call.answer()
+
+
+@router.message(SettingsStates.gift_caption)
+async def gift_caption_input(message: Message, state: FSMContext) -> None:
+    raw = message.text.strip()
+    new_value = "" if raw == "-" else raw[:255]
+    await update_settings(gift_caption=new_value)
+    await state.clear()
+    shown = new_value or DEFAULT_GIFT_CAPTION
+    await message.answer(f"✅ Gift yuborish matni saqlandi:\n<code>{shown}</code>", reply_markup=admin_keyboard())
+
+
 # ---------- Savdo boshqaruvi ----------
 
 def shop_management_keyboard() -> InlineKeyboardMarkup:
@@ -1998,9 +3003,11 @@ async def admin_delete_item(call: CallbackQuery) -> None:
 def box_detail_text(b: dict) -> str:
     prob = f"{b['gift_drop_prob'] * 100:.0f}%"
     daily = "✅ Ha" if b["once_per_day"] else "❌ Yo'q"
+    tgstars_line = f"💫 Telegram Stars narxi: <b>{b['cost_tgstars']} ⭐</b>\n" if b["cost_tgstars"] > 0 else "💫 Telegram Stars narxi: <b>o'rnatilmagan</b>\n"
     return (
         f"📦 <b>{b['name']}</b>\n\n"
-        f"💰 Narxi: <b>{b['cost']} ⭐</b>\n"
+        f"💰 Narxi (bot balansi): <b>{b['cost']} ⭐</b>\n"
+        f"{tgstars_line}"
         f"⭐ Star diapazoni: <b>{b['star_min']}–{b['star_max']}</b>\n"
         f"🎁 Gift tushish foizi: <b>{prob}</b>\n"
         f"🎟️ Gift tanlovi: eng arzon <b>{b['gift_pool_size']}</b> tasidan biri\n"
@@ -2013,7 +3020,8 @@ def box_detail_text(b: dict) -> str:
 def box_edit_keyboard(box_id: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="✏️ Nom", callback_data=f"admin:box:field:name:{box_id}")
-    kb.button(text="💰 Narx", callback_data=f"admin:box:field:cost:{box_id}")
+    kb.button(text="💰 Narx (balans)", callback_data=f"admin:box:field:cost:{box_id}")
+    kb.button(text="💫 Narx (TG Stars)", callback_data=f"admin:box:field:tgstars:{box_id}")
     kb.button(text="⭐ Star min", callback_data=f"admin:box:field:starmin:{box_id}")
     kb.button(text="⭐ Star max", callback_data=f"admin:box:field:starmax:{box_id}")
     kb.button(text="🎁 Gift foizi %", callback_data=f"admin:box:field:prob:{box_id}")
@@ -2057,7 +3065,8 @@ async def admin_box_edit(call: CallbackQuery) -> None:
 
 BOX_FIELD_PROMPTS = {
     "name": "✏️ <b>Yangi nomni yozing:</b>",
-    "cost": "💰 <b>Yangi narxni yozing (yulduz):</b>",
+    "cost": "💰 <b>Yangi narxni yozing (bot balansi, yulduzda):</b>",
+    "tgstars": "💫 <b>Yangi Telegram Stars narxini yozing:</b>\n(Bu — foydalanuvchi o'zining haqiqiy Telegram Stars balansidan to'laydigan narx. 0 yozsangiz, bu box uchun Stars orqali ochish o'chiriladi.)",
     "starmin": "⭐ <b>Yangi star minimumini yozing:</b>",
     "starmax": "⭐ <b>Yangi star maksimumini yozing:</b>",
     "prob": "🎁 <b>Gift tushish foizini yozing (0–100):</b>\nMasalan: 50 — 50% gift, 50% stars. 0 yozsangiz, faqat stars tushadi.",
@@ -2091,7 +3100,7 @@ async def box_field_input(message: Message, state: FSMContext) -> None:
     raw = message.text.strip()
 
     value = raw
-    if field in ("cost", "starmin", "starmax", "pool"):
+    if field in ("cost", "tgstars", "starmin", "starmax", "pool"):
         try:
             value = int(raw)
         except ValueError:
@@ -2127,6 +3136,7 @@ async def box_field_input(message: Message, state: FSMContext) -> None:
     column = {
         "name": "name",
         "cost": "cost",
+        "tgstars": "cost_tgstars",
         "starmin": "star_min",
         "starmax": "star_max",
         "prob": "gift_drop_prob",
@@ -2409,6 +3419,1752 @@ async def admin_back(call: CallbackQuery) -> None:
 
 
 # ============================================================
+#  MINI APP (Telegram Web App do'kon) — Stars orqali to'lov
+# ============================================================
+# Do'kon endi bot xabarlari o'rniga chiroyli veb-sahifa (Telegram Mini App)
+# ko'rinishida ham ochilishi mumkin. Sahifa shu botning o'z aiohttp serveri
+# orqali /webapp manzilida beriladi (alohida hosting kerak emas). To'lov
+# Telegram'ning o'z Stars invoys mexanizmi orqali (Telegram.WebApp.openInvoice)
+# amalga oshadi — muvaffaqiyatli to'lov xuddi oddiy bot chatidagi kabi
+# successful_payment_handler orqali qayta ishlanadi, shuning uchun mahsulot
+# yetkazib berish logikasi ikkalasida ham bir xil.
+
+BOT_LOGO_DATA_URI = "data:image/png;base64,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"
+
+
+MINI_APP_HTML = """<!doctype html>
+<html lang="uz">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Stars Bot</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-bg-color, #f5f6fa);
+    --text: var(--tg-theme-text-color, #111111);
+    --hint: var(--tg-theme-hint-color, #888888);
+    --btn: var(--tg-theme-button-color, #2ea6ff);
+    --btn-text: var(--tg-theme-button-text-color, #ffffff);
+    --secbg: var(--tg-theme-secondary-bg-color, #ffffff);
+    --header-bg: var(--tg-theme-bg-color, #ffffff);
+    --card-border: rgba(255,255,255,0.35);
+    --card-border-top: rgba(255,255,255,0.55);
+  }
+  /* Foydalanuvchi qo'lda tanlagan mavzu — Telegram'ning o'z ranglaridan
+     ustun turadi, chunki bu ranglar Telegram tashqarisida ham (masalan
+     brauzerda ochilsa) ishlashi kerak. */
+  :root[data-theme="light"] {
+    --bg: #f5f6fa; --text: #111111; --hint: #888888; --btn: #2ea6ff;
+    --btn-text: #ffffff; --secbg: #ffffff; --header-bg: #ffffff;
+    --card-border: rgba(255,255,255,0.35); --card-border-top: rgba(255,255,255,0.55);
+  }
+  :root[data-theme="dark"] {
+    --bg: #101017; --text: #f0f0f5; --hint: #9797a3; --btn: #3aa9ff;
+    --btn-text: #ffffff; --secbg: #1b1b24; --header-bg: #14141b;
+    --card-border: rgba(255,255,255,0.08); --card-border-top: rgba(255,255,255,0.14);
+  }
+  :root[data-theme="dark"] .bg-decor { opacity: 0.6; }
+  :root[data-theme="dark"] .bg-grid { opacity: 0.3; }
+  :root[data-theme="dark"] .balance-chip,
+  :root[data-theme="dark"] .theme-toggle { box-shadow: 0 2px 8px rgba(0,0,0,0.35); }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html { scroll-behavior: smooth; }
+  html, body { min-height: 100%; }
+  body {
+    margin: 0; padding: 0 0 40px;
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    position: relative;
+    background-color: var(--bg);
+  }
+  /* ---- Fon: harakatlanuvchi rangli "aurora" dog'lari + nozik nuqta to'r ---- */
+  .bg-decor {
+    position: fixed; inset: -10%; z-index: -2; pointer-events: none;
+    background:
+      radial-gradient(40% 32% at 10% 6%, rgba(46,166,255,0.48), transparent 70%),
+      radial-gradient(38% 30% at 92% 8%, rgba(123,92,255,0.44), transparent 70%),
+      radial-gradient(42% 34% at 50% 50%, rgba(123,92,255,0.10), transparent 72%),
+      radial-gradient(40% 34% at 48% 104%, rgba(255,149,0,0.30), transparent 70%),
+      radial-gradient(32% 26% at 96% 84%, rgba(255,45,85,0.24), transparent 70%),
+      radial-gradient(30% 24% at 2% 80%, rgba(255,213,74,0.24), transparent 70%);
+    filter: blur(4px);
+    animation: bgDrift 22s ease-in-out infinite alternate;
+  }
+  @keyframes bgDrift {
+    0% { transform: translate(0, 0) scale(1); }
+    100% { transform: translate(-2.5%, 3%) scale(1.07); }
+  }
+  .bg-grid {
+    position: fixed; inset: 0; z-index: -1; pointer-events: none;
+    background-image: radial-gradient(rgba(127,127,127,0.20) 1px, transparent 1px);
+    background-size: 22px 22px;
+    -webkit-mask-image: radial-gradient(85% 75% at 50% 0%, #000 35%, transparent 100%);
+    mask-image: radial-gradient(85% 75% at 50% 0%, #000 35%, transparent 100%);
+    opacity: 0.6;
+  }
+  .wrap { max-width: 560px; margin: 0 auto; padding: 0 14px; position: relative; z-index: 1; }
+
+  /* ---- Top bar (sticky, web-style navbar) ---- */
+  .topbar {
+    position: sticky; top: 0; z-index: 30;
+    background: color-mix(in srgb, var(--header-bg) 74%, transparent);
+    backdrop-filter: blur(18px) saturate(1.4); -webkit-backdrop-filter: blur(18px) saturate(1.4);
+    border-bottom: 1px solid rgba(127,127,127,0.14);
+  }
+  .topbar-inner {
+    max-width: 560px; margin: 0 auto; padding: 12px 14px;
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  }
+  .brand { display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 16px; }
+  .brand .logo {
+    width: 30px; height: 30px; border-radius: 9px; display: flex; align-items: center;
+    justify-content: center; font-size: 16px; color: #fff; overflow: hidden;
+    background: linear-gradient(135deg, var(--btn), #7b5cff 120%);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+  }
+  .brand .logo img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .balance-chip {
+    display: flex; align-items: center; gap: 6px; background: var(--secbg);
+    border-radius: 999px; padding: 6px 12px 6px 6px; font-size: 13px; font-weight: 700;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08); cursor: default;
+  }
+  .balance-chip .dot {
+    width: 20px; height: 20px; border-radius: 999px; background: linear-gradient(135deg,#ffd54a,#ff9500);
+    display: flex; align-items: center; justify-content: center; font-size: 11px;
+  }
+  .topbar-right { display: flex; align-items: center; gap: 8px; }
+  .theme-toggle {
+    width: 34px; height: 34px; border-radius: 999px; background: var(--secbg);
+    display: flex; align-items: center; justify-content: center; font-size: 15px;
+    cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,0.08); flex-shrink: 0;
+    border: none; transition: transform 0.15s ease;
+  }
+  .theme-toggle:active { transform: scale(0.88); }
+
+  /* ---- Hero ---- */
+  .hero {
+    margin: 14px 0 16px; padding: 24px 18px 28px;
+    background: linear-gradient(135deg, var(--btn), #7b5cff 120%);
+    color: #fff; border-radius: 20px;
+    box-shadow: 0 10px 26px rgba(0,0,0,0.16);
+    position: relative; overflow: hidden;
+  }
+  .hero::after {
+    content: ""; position: absolute; right: -30px; top: -30px; width: 140px; height: 140px;
+    background: radial-gradient(circle, rgba(255,255,255,0.22), transparent 70%);
+  }
+  .hero h1 { font-size: 22px; margin: 0 0 6px; position: relative; }
+  .hero p { font-size: 13px; margin: 0; opacity: 0.9; line-height: 1.5; position: relative; max-width: 90%; }
+  .hero .stats { display: flex; gap: 10px; margin-top: 14px; position: relative; }
+  .hero .stat {
+    background: rgba(255,255,255,0.16); border-radius: 12px; padding: 8px 12px; font-size: 12px;
+  }
+  .hero .stat b { display: block; font-size: 15px; }
+
+  /* ---- Tabs (sticky under topbar) ---- */
+  .tabs-sticky { position: sticky; top: 58px; z-index: 20; background: var(--bg); padding: 2px 0 12px; margin-top: -2px; }
+  .tabs { display: flex; gap: 8px; overflow-x: auto; padding: 2px 1px 4px; scrollbar-width: none; }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tab {
+    padding: 9px 16px; border-radius: 999px; background: var(--secbg);
+    color: var(--text); font-size: 13.5px; white-space: nowrap; cursor: pointer;
+    border: 1px solid rgba(127,127,127,0.14); font-weight: 600; transition: all 0.15s ease;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.04);
+  }
+  .tab.active { background: var(--btn); color: var(--btn-text); border-color: transparent; box-shadow: 0 4px 12px rgba(0,0,0,0.18); }
+  .tab.jackpot.active { background: linear-gradient(135deg, #ff9500, #ff2d55); }
+
+  /* ---- Section ---- */
+  .section-title { font-size: 13px; font-weight: 700; color: var(--hint); margin: 4px 2px 10px; text-transform: uppercase; letter-spacing: 0.03em; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .card {
+    background: color-mix(in srgb, var(--secbg) 88%, transparent);
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    border-radius: 18px; padding: 14px;
+    display: flex; flex-direction: column; gap: 6px;
+    box-shadow: 0 3px 14px rgba(0,0,0,0.07);
+    border: 1px solid var(--card-border);
+    border-top-color: var(--card-border-top);
+    transition: transform 0.12s ease, box-shadow 0.12s ease;
+    animation: fadeIn 0.25s ease both;
+  }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  .card:active { transform: scale(0.97); }
+  .card.jackpot {
+    background: linear-gradient(160deg, #2b1055, #4a1a7a);
+    color: #fff; border: 1px solid rgba(255,193,7,0.4);
+    box-shadow: 0 6px 18px rgba(122,26,122,0.35);
+  }
+  .card.jackpot .desc { color: #d8c8ff; }
+  .card.jackpot .price { color: #ffd54a; }
+  .card.jackpot.locked { opacity: 0.55; }
+  .card .icon-tile {
+    width: 42px; height: 42px; border-radius: 12px; font-size: 21px;
+    display: flex; align-items: center; justify-content: center; margin-bottom: 2px;
+    background: linear-gradient(135deg, rgba(46,166,255,0.15), rgba(123,92,255,0.15));
+  }
+  .card.jackpot .icon-tile { background: rgba(255,255,255,0.1); }
+  .card .name { font-size: 14px; font-weight: 700; }
+  .card .desc { font-size: 12px; color: var(--hint); min-height: 14px; line-height: 1.4; }
+  .card .price { font-size: 13px; font-weight: 800; margin-top: 2px; }
+  .card .price small { font-weight: 500; opacity: 0.7; }
+  .card .btnrow { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+  .card button {
+    border: none; border-radius: 11px; padding: 10px 10px;
+    background: var(--btn); color: var(--btn-text); font-size: 12.5px; font-weight: 700;
+    cursor: pointer; transition: opacity 0.15s ease;
+  }
+  .card button.alt { background: rgba(127,127,127,0.14); color: var(--text); }
+  .card.jackpot button.alt { background: rgba(255,255,255,0.14); color: #fff; }
+  .card button.stars { background: linear-gradient(135deg,#ffd54a,#ff9500); color: #1a1a1a; }
+  .card.jackpot button { background: linear-gradient(135deg, #ff9500, #ff2d55); color: #fff; }
+  .card button:disabled { opacity: 0.5; cursor: default; }
+  .card button:active { opacity: 0.8; }
+  .lock-badge { font-size: 11px; font-weight: 700; color: #ffd54a; margin-top: 2px; }
+
+  .banner-card {
+    grid-column: 1 / -1; border-radius: 20px; padding: 22px 18px; text-align: center;
+    background: linear-gradient(160deg, #1c1c26, #33263f);
+    color: #fff; box-shadow: 0 8px 20px rgba(0,0,0,0.18);
+  }
+  .banner-card .icon-tile { margin: 0 auto 10px; background: rgba(255,255,255,0.12); width: 52px; height: 52px; font-size: 26px; border-radius: 14px; }
+  .banner-card h3 { margin: 0 0 6px; font-size: 16px; }
+  .banner-card p { margin: 0 0 14px; font-size: 12.5px; color: #c9c3d6; line-height: 1.5; }
+  .banner-card button { width: 100%; max-width: 260px; padding: 12px; border-radius: 12px; border: none; font-weight: 700; font-size: 13.5px; background: linear-gradient(135deg, var(--btn), #7b5cff); color: #fff; cursor: pointer; }
+
+  .empty { grid-column: 1 / -1; color: var(--hint); text-align: center; padding: 44px 10px; font-size: 13.5px; }
+
+  /* ---- Toast ---- */
+  .toast {
+    position: fixed; left: 14px; right: 14px; bottom: 18px;
+    background: var(--secbg); color: var(--text); border-radius: 14px;
+    padding: 13px 15px; font-size: 13px; text-align: center;
+    box-shadow: 0 8px 26px rgba(0,0,0,0.22);
+    transform: translateY(140%); transition: transform 0.28s ease; z-index: 50;
+    max-width: 560px; margin: 0 auto;
+  }
+  .toast.show { transform: translateY(0); }
+
+  /* ---- Modal ---- */
+  .overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 60;
+    display: flex; align-items: flex-end; justify-content: center;
+    opacity: 0; pointer-events: none; transition: opacity 0.2s ease;
+  }
+  .overlay.show { opacity: 1; pointer-events: auto; }
+  .modal {
+    background: var(--bg); width: 100%; max-width: 560px; border-radius: 20px 20px 0 0;
+    padding: 20px 18px 26px; transform: translateY(100%); transition: transform 0.25s ease;
+    max-height: 82vh; overflow-y: auto;
+  }
+  .overlay.show .modal { transform: translateY(0); }
+  .modal h2 { font-size: 16px; margin: 0 0 4px; }
+  .modal .sub { font-size: 12.5px; color: var(--hint); margin-bottom: 14px; }
+  .modal .card-num {
+    background: var(--secbg); border-radius: 12px; padding: 12px 14px; font-size: 16px;
+    font-weight: 800; letter-spacing: 0.04em; text-align: center; margin-bottom: 14px;
+  }
+  .modal label { font-size: 12.5px; font-weight: 700; color: var(--hint); display: block; margin: 12px 0 6px; }
+  .modal input[type=file] {
+    width: 100%; padding: 10px; border-radius: 10px; border: 1px dashed rgba(127,127,127,0.4);
+    background: var(--secbg); color: var(--text); font-size: 12.5px;
+  }
+  .modal .actions { display: flex; gap: 10px; margin-top: 18px; }
+  .modal .actions button {
+    flex: 1; padding: 12px; border-radius: 12px; border: none; font-weight: 700; font-size: 13.5px; cursor: pointer;
+  }
+  .modal .actions .primary { background: var(--btn); color: var(--btn-text); }
+  .modal .actions .secondary { background: rgba(127,127,127,0.14); color: var(--text); }
+  .modal .result-body { font-size: 14px; line-height: 1.6; }
+  .modal .about-body { max-height: 56vh; overflow-y: auto; padding-right: 2px; }
+  .modal .about-body p { margin: 0 0 12px; }
+  .modal .about-body p:last-child { margin-bottom: 0; }
+  .modal .close-x { position: absolute; right: 16px; top: 14px; font-size: 18px; color: var(--hint); cursor: pointer; }
+
+  /* ---- Jekpot raketa animatsiyasi ---- */
+  .rocket-overlay {
+    position: fixed; inset: 0; z-index: 80; display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(circle at 50% 30%, #241a45, #0a0714 75%);
+    opacity: 0; pointer-events: none; transition: opacity 0.2s ease;
+  }
+  .rocket-overlay.show { opacity: 1; pointer-events: auto; }
+  .rocket-overlay.shake { animation: rocketShake 0.5s ease; }
+  @keyframes rocketShake {
+    0%, 100% { transform: translate(0, 0); }
+    20% { transform: translate(-8px, 4px); }
+    40% { transform: translate(7px, -5px); }
+    60% { transform: translate(-6px, -3px); }
+    80% { transform: translate(5px, 4px); }
+  }
+  .rocket-stars {
+    position: absolute; inset: 0;
+    background-image:
+      radial-gradient(1.5px 1.5px at 20% 30%, rgba(255,255,255,0.5), transparent),
+      radial-gradient(1.5px 1.5px at 70% 15%, rgba(255,255,255,0.4), transparent),
+      radial-gradient(1px 1px at 40% 70%, rgba(255,255,255,0.35), transparent),
+      radial-gradient(1.5px 1.5px at 85% 55%, rgba(255,255,255,0.4), transparent),
+      radial-gradient(1px 1px at 55% 85%, rgba(255,255,255,0.3), transparent),
+      radial-gradient(1.5px 1.5px at 12% 60%, rgba(255,255,255,0.4), transparent);
+    background-size: 100% 100%;
+  }
+  .rocket-track {
+    position: relative; width: 100%; max-width: 340px; height: 78vh; max-height: 620px;
+    margin: 0 auto;
+  }
+  .rocket-zone {
+    position: absolute; left: 0; right: 0; display: flex; align-items: center; gap: 8px;
+    font-size: 11px; font-weight: 700; color: rgba(255,255,255,0.45);
+  }
+  .rocket-zone::before {
+    content: ""; flex: 1; height: 1px; background: rgba(255,255,255,0.14); border-style: dashed;
+  }
+  .rocket-zone.z1 { bottom: 8%; } .rocket-zone.z2 { bottom: 38%; }
+  .rocket-zone.z3 { bottom: 68%; } .rocket-zone.z4 { bottom: 92%; }
+  .rocket-el {
+    position: absolute; left: 50%; bottom: 40px; font-size: 40px; line-height: 1;
+    transform: translateX(-50%); filter: drop-shadow(0 0 10px rgba(123,92,255,0.6));
+    z-index: 2;
+  }
+  .rocket-flame {
+    position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); font-size: 20px;
+    opacity: 0.9; animation: flameFlicker 0.12s infinite alternate; z-index: 1;
+  }
+  @keyframes flameFlicker { from { transform: translateX(-50%) scale(1); } to { transform: translateX(-50%) scale(0.8) translateY(2px); } }
+  .rocket-particle {
+    position: absolute; font-size: 20px; pointer-events: none; z-index: 3;
+    animation: particleBurst 0.85s ease-out forwards;
+  }
+  @keyframes particleBurst {
+    0% { transform: translate(0,0) scale(1); opacity: 1; }
+    100% { transform: translate(var(--px), var(--py)) scale(0.4); opacity: 0; }
+  }
+  .rocket-caption {
+    position: absolute; top: 16px; left: 0; right: 0; text-align: center;
+    color: #fff; font-size: 14px; font-weight: 700; letter-spacing: 0.02em;
+  }
+  .rocket-caption small { display: block; font-weight: 500; opacity: 0.6; font-size: 11.5px; margin-top: 3px; }
+
+  /* ---- Pages / bottom nav ---- */
+  body { padding-bottom: 84px; }
+  .page { display: none; }
+  .page.active { display: block; animation: fadeIn 0.2s ease both; }
+
+  .bottom-nav {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
+    background: color-mix(in srgb, var(--header-bg) 78%, transparent);
+    backdrop-filter: blur(18px) saturate(1.4); -webkit-backdrop-filter: blur(18px) saturate(1.4);
+    box-shadow: 0 -4px 20px rgba(0,0,0,0.06);
+    border-top: 1px solid rgba(127,127,127,0.14);
+    display: flex; padding: 6px 4px calc(6px + env(safe-area-inset-bottom, 0px));
+    max-width: 560px; margin: 0 auto; left: 50%; transform: translateX(-50%); width: 100%;
+  }
+  .nav-item {
+    flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px;
+    padding: 6px 2px; border-radius: 12px; font-size: 10.5px; font-weight: 700;
+    color: var(--hint); cursor: pointer; transition: color 0.15s ease;
+  }
+  .nav-item .ic { font-size: 20px; line-height: 1; }
+  .nav-item.active { color: var(--btn); }
+
+  .profile-hero { text-align: center; padding: 14px 0 20px; }
+  .avatar {
+    width: 68px; height: 68px; border-radius: 50%; margin: 0 auto 10px; font-size: 26px; font-weight: 800;
+    display: flex; align-items: center; justify-content: center; color: #fff;
+    background: linear-gradient(135deg, var(--btn), #7b5cff 120%); box-shadow: 0 6px 18px rgba(0,0,0,0.18);
+  }
+  .p-name { font-size: 16px; font-weight: 800; margin-bottom: 6px; }
+  .p-balance { font-size: 26px; font-weight: 800; color: var(--btn); }
+  .p-refs { font-size: 12.5px; color: var(--hint); margin-top: 4px; }
+  .reflink-box {
+    display: flex; align-items: center; gap: 8px; background: var(--secbg); border-radius: 12px;
+    padding: 12px 12px; margin-bottom: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+  }
+  .reflink-box code { flex: 1; font-size: 11.5px; overflow-x: auto; white-space: nowrap; color: var(--text); }
+  .reflink-box button {
+    border: none; border-radius: 9px; padding: 8px 12px; background: var(--btn); color: var(--btn-text);
+    font-size: 12px; font-weight: 700; cursor: pointer; flex-shrink: 0;
+  }
+  .wide-btn {
+    width: 100%; border: none; border-radius: 13px; padding: 13px; margin-bottom: 8px;
+    background: linear-gradient(135deg, var(--btn), #7b5cff 120%); color: #fff;
+    font-size: 14px; font-weight: 700; cursor: pointer;
+  }
+  .wide-btn:disabled { opacity: 0.5; }
+  .hint-p { font-size: 12px; color: var(--hint); line-height: 1.5; text-align: center; padding: 0 8px; }
+
+  .withdraw-card { background: var(--secbg); border-radius: 16px; padding: 16px; margin-bottom: 16px; box-shadow: 0 2px 10px rgba(0,0,0,0.06); }
+  .wc-row { display: flex; justify-content: space-between; align-items: center; font-size: 13.5px; padding: 6px 0; }
+  .wc-note { font-size: 12px; color: var(--hint); margin: 6px 0 12px; }
+  .gift-list { display: flex; flex-direction: column; gap: 8px; }
+  .gift-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    background: var(--secbg); border-radius: 12px; padding: 12px 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+  }
+  .gift-row .gname { font-size: 13px; font-weight: 700; }
+  .gift-row .gprice { font-size: 12px; color: var(--hint); }
+  .gift-row button {
+    border: none; border-radius: 9px; padding: 8px 12px; background: var(--btn); color: var(--btn-text);
+    font-size: 12px; font-weight: 700; cursor: pointer; flex-shrink: 0;
+  }
+
+  .contacts-list { display: flex; flex-direction: column; gap: 8px; }
+  .contact-row {
+    display: flex; align-items: center; gap: 12px; background: var(--secbg); border-radius: 14px;
+    padding: 13px 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); cursor: pointer; text-decoration: none; color: var(--text);
+  }
+  .contact-row .c-ic {
+    width: 36px; height: 36px; border-radius: 10px; display: flex; align-items: center; justify-content: center;
+    background: linear-gradient(135deg, rgba(46,166,255,0.15), rgba(123,92,255,0.15)); font-size: 17px;
+  }
+  .contact-row .c-label { font-size: 13.5px; font-weight: 700; }
+  .contact-row .c-user { font-size: 11.5px; color: var(--hint); }
+</style>
+</head>
+<body>
+  <div class="bg-decor"></div>
+  <div class="bg-grid"></div>
+  <div class="topbar">
+    <div class="topbar-inner">
+      <div class="brand"><div class="logo"><img src="__LOGO_DATA_URI__" alt="logo"></div>Stars Bot</div>
+      <div class="topbar-right">
+        <div class="balance-chip" id="balanceChip"><div class="dot">⭐</div><span id="balanceVal">—</span></div>
+        <button class="theme-toggle" id="aboutToggle" type="button" aria-label="Bot haqida">ℹ️</button>
+        <button class="theme-toggle" id="themeToggle" type="button" aria-label="Mavzuni almashtirish">🌙</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <div class="page active" id="page-shop">
+      <div class="hero">
+        <h1>Xush kelibsiz! ✨</h1>
+        <p>Telegram Stars yoki bot balansingiz bilan sovg'alar, premium va Jekpot boxlarni sotib oling — barchasi shu yerda.</p>
+        <div class="stats">
+          <div class="stat"><b id="statBalance">0</b>⭐ balans</div>
+          <div class="stat"><b id="statRefs">0</b>referal</div>
+        </div>
+      </div>
+
+      <div class="tabs-sticky">
+        <div class="tabs" id="tabs"></div>
+      </div>
+      <div class="grid" id="grid"></div>
+    </div>
+
+    <div class="page" id="page-profile">
+      <div class="profile-hero">
+        <div class="avatar" id="profAvatar">?</div>
+        <div class="p-name" id="profName">—</div>
+        <div class="p-balance"><span id="profBalance">0</span> ⭐</div>
+        <div class="p-refs"><b id="profRefs">0</b> ta do'st taklif qilingan</div>
+      </div>
+      <div class="section-title">Referal havolangiz</div>
+      <div class="reflink-box">
+        <code id="refLinkText">—</code>
+        <button id="refCopyBtn">Nusxalash</button>
+      </div>
+      <button class="wide-btn" id="refShareBtn">📤 Do'stlarga ulashish</button>
+      <p class="hint-p">Har bir yangi a'zo botga qo'shilib, majburiy kanallarga a'zo bo'lganda balansingizga bonus qo'shiladi.</p>
+    </div>
+
+    <div class="page" id="page-withdraw">
+      <div class="section-title">Yulduz yechish</div>
+      <div class="withdraw-card">
+        <div class="wc-row"><span>Balansingiz</span><b id="wdBalance">0 ⭐</b></div>
+        <div class="wc-row"><span>Minimal chegara</span><b id="wdMin">— ⭐</b></div>
+        <div class="wc-note" id="wdNote"></div>
+        <button class="wide-btn" id="wdStarsBtn">⭐ Yulduz sifatida yechish</button>
+      </div>
+      <div class="section-title">Yoki gift sifatida yeching</div>
+      <div id="wdGiftList" class="gift-list"></div>
+    </div>
+
+    <div class="page" id="page-contacts">
+      <div class="section-title">Aloqa</div>
+      <div id="contactsList" class="contacts-list"></div>
+    </div>
+
+    <div class="page" id="page-reviews">
+      <div class="section-title">Otziv</div>
+      <div class="banner-card" id="reviewsBanner">
+        <div class="icon-tile">⭐</div>
+        <h3>Otziv kanali</h3>
+        <p id="reviewsText">Yuklanmoqda...</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="bottom-nav" id="bottomNav">
+    <div class="nav-item active" data-page="shop"><div class="ic">🛍️</div>Do'kon</div>
+    <div class="nav-item" data-page="profile"><div class="ic">👤</div>Profil</div>
+    <div class="nav-item" data-page="withdraw"><div class="ic">💸</div>Yechish</div>
+    <div class="nav-item" data-page="contacts"><div class="ic">📞</div>Aloqa</div>
+    <div class="nav-item" data-page="reviews"><div class="ic">⭐</div>Otziv</div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <div class="overlay" id="uzsOverlay">
+    <div class="modal">
+      <span class="close-x" id="uzsClose">✕</span>
+      <h2 id="uzsTitle">💳 Karta orqali to'lov</h2>
+      <div class="sub" id="uzsSub"></div>
+      <div class="card-num" id="uzsCard"></div>
+      <label>To'lov chekini (screenshot) yuklang</label>
+      <input type="file" id="uzsFile" accept="image/*">
+      <div class="actions">
+        <button class="secondary" id="uzsCancel">Bekor qilish</button>
+        <button class="primary" id="uzsSubmit">Yuborish</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="overlay" id="resultOverlay">
+    <div class="modal">
+      <span class="close-x" id="resultClose">✕</span>
+      <div class="result-body" id="resultBody"></div>
+      <div class="actions" id="resultClaimActions" style="display:none;"></div>
+      <div class="actions" id="resultOkRow">
+        <button class="primary" id="resultOk">Tushunarli</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="overlay" id="aboutOverlay">
+    <div class="modal">
+      <span class="close-x" id="aboutClose">✕</span>
+      <h2>ℹ️ Bot haqida — qanday ishlaydi?</h2>
+      <div class="result-body about-body" id="aboutBody">Yuklanmoqda...</div>
+      <div class="actions">
+        <button class="primary" id="aboutOk">Tushunarli</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="rocket-overlay" id="rocketOverlay">
+    <div class="rocket-stars"></div>
+    <div class="rocket-caption" id="rocketCaption">🚀 Uchmoqda...<small>Qancha baland — mukofot shuncha katta!</small></div>
+    <div class="rocket-track" id="rocketTrack">
+      <div class="rocket-zone z1">Kichik</div>
+      <div class="rocket-zone z2">O'rta</div>
+      <div class="rocket-zone z3">Katta</div>
+      <div class="rocket-zone z4">MEGA 🎆</div>
+      <div class="rocket-flame" id="rocketFlame">🔥</div>
+      <div class="rocket-el" id="rocketEl">🚀</div>
+    </div>
+  </div>
+
+<script>
+const tg = window.Telegram && window.Telegram.WebApp;
+if (tg) { tg.ready(); tg.expand(); if (tg.setHeaderColor) { try { tg.setHeaderColor('secondary_bg_color'); } catch(e){} } }
+const INIT_DATA = tg ? (tg.initData || '') : '';
+
+// ---- Dark / Light mavzu ----
+const THEME_KEY = 'starsbot_theme';
+function detectDefaultTheme() {
+  if (tg && tg.colorScheme) return tg.colorScheme; // Telegram'ning o'z mavzusi ('light' | 'dark')
+  return (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+}
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  const btn = document.getElementById('themeToggle');
+  if (btn) btn.textContent = theme === 'dark' ? '☀️' : '🌙';
+}
+function loadTheme() {
+  let stored = null;
+  try { stored = localStorage.getItem(THEME_KEY); } catch (e) {}
+  applyTheme(stored || detectDefaultTheme());
+}
+loadTheme();
+document.getElementById('themeToggle').onclick = () => {
+  const cur = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
+  const next = cur === 'dark' ? 'light' : 'dark';
+  applyTheme(next);
+  try { localStorage.setItem(THEME_KEY, next); } catch (e) {}
+};
+if (tg && tg.onEvent) {
+  try {
+    tg.onEvent('themeChanged', () => {
+      let stored = null;
+      try { stored = localStorage.getItem(THEME_KEY); } catch (e) {}
+      if (!stored) applyTheme(detectDefaultTheme()); // faqat foydalanuvchi qo'lda tanlamagan bo'lsa
+    });
+  } catch (e) {}
+}
+
+// ---- "Bot haqida" ma'lumot oynasi ----
+function renderAbout() {
+  const body = document.getElementById('aboutBody');
+  body.innerHTML = `
+    <p><b>⭐ Yulduz qanday topiladi?</b><br>
+    Do'stlaringizni referal havolangiz orqali taklif qiling — har biri uchun
+    <b>${INFO.ref_reward_stars || 0} ⭐</b> olasiz. Shuningdek 🎰 Jekpot boxlarini oching —
+    tasodifiy miqdorda ⭐ yoki gift yutib olasiz.</p>
+    <p><b>🛍️ Do'kon</b><br>
+    Gift, Premium va boshqa mahsulotlarni 3 xil usulda sotib olish mumkin: ichki ⭐
+    balansingizdan, haqiqiy Telegram Stars'dan, yoki karta (UZS) orqali.</p>
+    <p><b>🎰 Jekpot (boxlar)</b><br>
+    Box ochilganda raketa uchadi — qancha baland uchsa, mukofot shuncha katta. Gift
+    yutib olsangiz, uni <b>saqlab qo'yasiz</b>: keyin xohlaganingizda "🎁 Giftni olish"
+    (haqiqiy sovg'a) yoki "⭐ ga aylantirish" (ichki balansga qo'shish) tugmalaridan
+    birini bosasiz — shoshilish shart emas.</p>
+    <p><b>💸 Yulduz yechish</b><br>
+    Balansingiz kamida <b>${INFO.min_withdraw_stars || 0} ⭐</b> bo'lsa, ⭐ (real to'lov)
+    yoki gift sifatida yechib olishingiz mumkin. Ba'zi giftlar avtomatik yuboriladi,
+    qolganlari bot egasi tomonidan qo'lda.</p>
+    <p><b>🌙 Dark/Light</b><br>
+    Tepadagi 🌙/☀️ tugmasi bilan mavzuni istalgan vaqt almashtirishingiz mumkin —
+    tanlovingiz eslab qolinadi.</p>
+    <p>❓ Savol bo'lsa — 📞 Aloqa bo'limidan yozing (bot chatida ham mavjud).</p>
+  `;
+}
+document.getElementById('aboutToggle').onclick = () => { renderAbout(); openOverlay('aboutOverlay'); };
+document.getElementById('aboutClose').onclick = () => closeOverlay('aboutOverlay');
+document.getElementById('aboutOk').onclick = () => closeOverlay('aboutOverlay');
+
+const TABS = [
+  { key: 'gift', label: '🎁 Gift' },
+  { key: 'premium', label: '💎 Premium' },
+  { key: 'star', label: '⭐ Yulduz' },
+  { key: 'box', label: '🎰 Jekpot', jackpot: true },
+  { key: 'nft', label: '🖼 NFT' },
+];
+
+let SHOP = { items: [], boxes: [], nft: {}, settings: {} };
+let USER = null;
+let ACTIVE_CAT = 'gift';
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2800);
+}
+
+function openOverlay(id) { document.getElementById(id).classList.add('show'); }
+function closeOverlay(id) { document.getElementById(id).classList.remove('show'); }
+
+function showResult(html, claim) {
+  document.getElementById('resultBody').innerHTML = html;
+  const actionsEl = document.getElementById('resultClaimActions');
+  const okRow = document.getElementById('resultOkRow');
+  actionsEl.innerHTML = '';
+  if (claim && claim.claim_id) {
+    okRow.style.display = 'none';
+    actionsEl.style.display = 'flex';
+    const realBtn = document.createElement('button');
+    realBtn.className = 'primary';
+    realBtn.textContent = '🎁 Giftni olish';
+    const starsBtn = document.createElement('button');
+    starsBtn.className = 'secondary';
+    starsBtn.textContent = `⭐ ${claim.gift_price_stars} ⭐ ga aylantirish`;
+    const choose = async (action, btn) => {
+      [realBtn, starsBtn].forEach(b => b.disabled = true);
+      const old = btn.textContent;
+      btn.textContent = 'Yuborilmoqda...';
+      try {
+        const res = await fetch('/api/gift_claim', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ init_data: INIT_DATA, action, claim_id: claim.claim_id }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          toast(data.error || 'Xatolik yuz berdi');
+          [realBtn, starsBtn].forEach(b => b.disabled = false);
+          btn.textContent = old;
+          return;
+        }
+        actionsEl.style.display = 'none';
+        okRow.style.display = 'flex';
+        document.getElementById('resultBody').innerHTML = data.message;
+        await refreshMe();
+      } catch (e) {
+        toast('Tarmoq xatosi, qayta urinib ko\\'ring');
+        [realBtn, starsBtn].forEach(b => b.disabled = false);
+        btn.textContent = old;
+      }
+    };
+    realBtn.onclick = () => choose('real', realBtn);
+    starsBtn.onclick = () => choose('stars', starsBtn);
+    actionsEl.appendChild(realBtn);
+    actionsEl.appendChild(starsBtn);
+  } else {
+    actionsEl.style.display = 'none';
+    okRow.style.display = 'flex';
+  }
+  openOverlay('resultOverlay');
+}
+document.getElementById('resultClose').onclick = () => closeOverlay('resultOverlay');
+document.getElementById('resultOk').onclick = () => closeOverlay('resultOverlay');
+
+function renderTabs() {
+  const tabsEl = document.getElementById('tabs');
+  tabsEl.innerHTML = '';
+  TABS.forEach(cat => {
+    const el = document.createElement('div');
+    el.className = 'tab' + (cat.jackpot ? ' jackpot' : '') + (cat.key === ACTIVE_CAT ? ' active' : '');
+    el.textContent = cat.label;
+    el.onclick = () => { ACTIVE_CAT = cat.key; renderTabs(); renderGrid(); };
+    tabsEl.appendChild(el);
+  });
+}
+
+function priceLine(item) {
+  const parts = [];
+  if (item.price_stars > 0) parts.push(`${item.price_stars} ⭐`);
+  if (item.price_uzs > 0) parts.push(`${item.price_uzs.toLocaleString('ru-RU')} so'm`);
+  return parts.join(' <small>yoki</small> ');
+}
+
+function itemCard(item) {
+  const card = document.createElement('div');
+  card.className = 'card';
+  const icon = item.cat === 'premium' ? '💎' : (item.cat === 'star' ? '⭐' : '🎁');
+  let buttons = '';
+  if (item.price_stars > 0) {
+    buttons += `<button data-act="balance">⭐ Balansdan (${item.price_stars})</button>`;
+    buttons += `<button data-act="tgstars" class="stars">✨ Stars bilan</button>`;
+  }
+  if (item.price_uzs > 0) {
+    buttons += `<button data-act="uzs" class="alt">💳 Kartadan (${item.price_uzs.toLocaleString('ru-RU')} so'm)</button>`;
+  }
+  card.innerHTML = `
+    <div class="icon-tile">${icon}</div>
+    <div class="name">${item.name}</div>
+    <div class="desc">${item.desc || ''}</div>
+    <div class="price">${priceLine(item)}</div>
+    <div class="btnrow">${buttons}</div>
+  `;
+  card.querySelectorAll('button').forEach(btn => {
+    btn.onclick = () => {
+      const act = btn.dataset.act;
+      if (act === 'balance') buyBalance('item', item.id, btn);
+      else if (act === 'tgstars') buyStars('item', item.id, btn);
+      else if (act === 'uzs') openUzsModal(item);
+    };
+  });
+  return card;
+}
+
+function boxCard(box) {
+  const card = document.createElement('div');
+  card.className = 'card jackpot' + (box.locked ? ' locked' : '');
+  let buttons = '';
+  if (!box.locked) {
+    buttons += `<button data-act="balance">⭐ Ochish (${box.cost})</button>`;
+    if (box.cost_tgstars > 0) buttons += `<button data-act="tgstars" class="stars">✨ Stars (${box.cost_tgstars})</button>`;
+  }
+  card.innerHTML = `
+    <div class="icon-tile">🎰</div>
+    <div class="name">${box.name}</div>
+    <div class="desc">${box.desc || ''}</div>
+    <div class="price">${box.cost} ⭐${box.cost_tgstars > 0 ? ` <small>yoki</small> ${box.cost_tgstars} 💫` : ''}</div>
+    ${box.locked ? '<div class="lock-badge">✅ Bugun ishlatilgan — ertaga qayta oching</div>' : `<div class="btnrow">${buttons}</div>`}
+  `;
+  card.querySelectorAll('button').forEach(btn => {
+    btn.onclick = () => {
+      const act = btn.dataset.act;
+      if (act === 'balance') buyBalance('box', box.id, btn);
+      else if (act === 'tgstars') buyStars('box', box.id, btn);
+    };
+  });
+  return card;
+}
+
+function nftCard() {
+  const card = document.createElement('div');
+  card.className = 'banner-card';
+  const hasGroup = !!SHOP.nft.group_url;
+  card.innerHTML = `
+    <div class="icon-tile">🖼</div>
+    <h3>NFT bozori</h3>
+    <p>${hasGroup ? "NFT'lar bot ichida emas, maxsus guruhda sotiladi. Tugmani bosib guruhga o'ting." : "NFT guruhi hali sozlanmagan."}</p>
+    ${hasGroup ? '<button id="nftGoBtn">Guruhga o\\'tish</button>' : ''}
+  `;
+  if (hasGroup) {
+    card.querySelector('#nftGoBtn').onclick = () => {
+      if (tg && tg.openTelegramLink && SHOP.nft.group_url.includes('t.me')) {
+        tg.openTelegramLink(SHOP.nft.group_url);
+      } else {
+        window.open(SHOP.nft.group_url, '_blank');
+      }
+    };
+  }
+  return card;
+}
+
+function renderGrid() {
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+
+  if (ACTIVE_CAT === 'nft') {
+    grid.appendChild(nftCard());
+    return;
+  }
+  if (ACTIVE_CAT === 'box') {
+    if (!SHOP.boxes.length) {
+      grid.innerHTML = '<div class="empty">Hozircha boxlar sozlanmagan.</div>';
+      return;
+    }
+    SHOP.boxes.forEach(b => grid.appendChild(boxCard(b)));
+    return;
+  }
+  const items = SHOP.items.filter(i => i.cat === ACTIVE_CAT);
+  if (!items.length) {
+    grid.innerHTML = '<div class="empty">Bu bo\\'limda hozircha mahsulot yo\\'q.</div>';
+    return;
+  }
+  items.forEach(i => grid.appendChild(itemCard(i)));
+}
+
+function updateHeader() {
+  const balEl = document.getElementById('balanceVal');
+  const statBal = document.getElementById('statBalance');
+  const statRefs = document.getElementById('statRefs');
+  if (USER) {
+    balEl.textContent = USER.balance_stars;
+    statBal.textContent = USER.balance_stars;
+    statRefs.textContent = USER.referals_count;
+  } else {
+    balEl.textContent = '—';
+  }
+  renderProfile();
+  renderWithdraw();
+}
+
+async function refreshMe() {
+  if (!INIT_DATA) { USER = null; updateHeader(); return; }
+  try {
+    const res = await fetch('/api/me', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ init_data: INIT_DATA }),
+    });
+    const data = await res.json();
+    USER = res.ok ? data : null;
+  } catch (e) { USER = null; }
+  updateHeader();
+}
+
+async function refreshShop() {
+  const res = await fetch('/api/shop');
+  const data = await res.json();
+  SHOP = data;
+  if (USER) {
+    SHOP.boxes = SHOP.boxes.map(b => ({
+      ...b,
+      locked: !!(b.once_per_day && USER.last_daily_box === data.server_date),
+    }));
+  }
+  renderGrid();
+}
+
+function spawnParticles(container, bottomPx, big) {
+  const count = big ? 22 : 14;
+  const emojis = big ? ['✨', '🎆', '⭐', '🟡', '💥'] : ['✨', '💥', '⭐'];
+  for (let i = 0; i < count; i++) {
+    const p = document.createElement('div');
+    p.className = 'rocket-particle';
+    p.textContent = emojis[Math.floor(Math.random() * emojis.length)];
+    const angle = (Math.PI * 2 * i) / count + Math.random() * 0.5;
+    const dist = 60 + Math.random() * (big ? 120 : 70);
+    p.style.setProperty('--px', `${Math.cos(angle) * dist}px`);
+    p.style.setProperty('--py', `${Math.sin(angle) * dist}px`);
+    p.style.left = '50%';
+    p.style.bottom = bottomPx + 'px';
+    p.style.fontSize = (big ? 16 + Math.random() * 14 : 14 + Math.random() * 8) + 'px';
+    container.appendChild(p);
+    setTimeout(() => p.remove(), 900);
+  }
+}
+
+function launchRocket(ratio, kind) {
+  return new Promise(resolve => {
+    const overlay = document.getElementById('rocketOverlay');
+    const track = document.getElementById('rocketTrack');
+    const rocket = document.getElementById('rocketEl');
+    const flame = document.getElementById('rocketFlame');
+    const caption = document.getElementById('rocketCaption');
+    const isGift = kind === 'gifts';
+
+    rocket.style.transition = 'none';
+    rocket.style.bottom = '40px';
+    rocket.textContent = '🚀';
+    rocket.style.fontSize = '40px';
+    flame.style.display = '';
+    caption.innerHTML = "🚀 Uchmoqda...<small>Qancha baland — mukofot shuncha katta!</small>";
+    overlay.classList.add('show');
+
+    const trackH = track.clientHeight;
+    const targetBottom = 40 + ratio * (trackH - 110);
+
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        rocket.style.transition = 'bottom 2.1s cubic-bezier(.13,.75,.28,1)';
+        rocket.style.bottom = targetBottom + 'px';
+      });
+    });
+
+    setTimeout(() => {
+      flame.style.display = 'none';
+      rocket.textContent = isGift ? '🎆' : '💥';
+      rocket.style.fontSize = isGift ? '58px' : '46px';
+      overlay.classList.add('shake');
+      spawnParticles(track, targetBottom, isGift || ratio > 0.7);
+      caption.innerHTML = isGift
+        ? "🎇 MEGA YUTUQ!<small>Portladi — natija hozir ko'rinadi</small>"
+        : "💥 Raketa to'xtadi!<small>Natija hozir ko'rinadi</small>";
+      setTimeout(() => {
+        overlay.classList.remove('shake');
+      }, 500);
+      setTimeout(() => {
+        overlay.classList.remove('show');
+        resolve();
+      }, 950);
+    }, 2150);
+  });
+}
+
+async function buyBalance(kind, id, btnEl) {
+  if (!INIT_DATA) { toast('Bu amal uchun botni Telegram ilovasi ichidan oching'); return; }
+  const row = btnEl.parentElement;
+  row.querySelectorAll('button').forEach(b => b.disabled = true);
+  const oldText = btnEl.textContent;
+  btnEl.textContent = 'Kutilmoqda...';
+  try {
+    const res = await fetch('/api/buy_balance', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ init_data: INIT_DATA, kind, id }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      toast(data.error || 'Xatolik yuz berdi');
+      row.querySelectorAll('button').forEach(b => b.disabled = false);
+      btnEl.textContent = oldText;
+      return;
+    }
+    if (kind === 'box' && typeof data.ratio === 'number') {
+      await launchRocket(data.ratio, data.kind);
+    }
+    showResult(data.message, data.claim_id ? { claim_id: data.claim_id, gift_price_stars: data.gift_price_stars } : null);
+    await refreshMe();
+    await refreshShop();
+  } catch (e) {
+    toast('Tarmoq xatosi, qayta urinib ko\\'ring');
+    row.querySelectorAll('button').forEach(b => b.disabled = false);
+    btnEl.textContent = oldText;
+  }
+}
+
+async function buyStars(kind, id, btnEl) {
+  const row = btnEl.parentElement;
+  row.querySelectorAll('button').forEach(b => b.disabled = true);
+  const oldText = btnEl.textContent;
+  btnEl.textContent = 'Kutilmoqda...';
+  try {
+    const res = await fetch('/api/create_invoice', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind, id, init_data: INIT_DATA }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.invoice_url) {
+      toast(data.error || 'Xatolik yuz berdi');
+      row.querySelectorAll('button').forEach(b => b.disabled = false);
+      btnEl.textContent = oldText;
+      return;
+    }
+    const finish = async (status) => {
+      row.querySelectorAll('button').forEach(b => b.disabled = false);
+      btnEl.textContent = oldText;
+      if (status === 'paid') {
+        toast('✅ To\\'lov qabul qilindi!');
+        await refreshMe(); await refreshShop();
+      } else if (status === 'failed') {
+        toast('❌ To\\'lov amalga oshmadi');
+      }
+    };
+    if (tg && tg.openInvoice) {
+      tg.openInvoice(data.invoice_url, finish);
+    } else {
+      window.open(data.invoice_url, '_blank');
+      finish('unknown');
+    }
+  } catch (e) {
+    toast('Tarmoq xatosi, qayta urinib ko\\'ring');
+    row.querySelectorAll('button').forEach(b => b.disabled = false);
+    btnEl.textContent = oldText;
+  }
+}
+
+let UZS_ITEM = null;
+function openUzsModal(item) {
+  UZS_ITEM = item;
+  document.getElementById('uzsTitle').textContent = `💳 ${item.name}`;
+  document.getElementById('uzsSub').textContent = `${item.price_uzs.toLocaleString('ru-RU')} so'm miqdorida to'lov qiling`;
+  document.getElementById('uzsCard').textContent = SHOP.settings.pay_card || '—';
+  document.getElementById('uzsFile').value = '';
+  openOverlay('uzsOverlay');
+}
+document.getElementById('uzsClose').onclick = () => closeOverlay('uzsOverlay');
+document.getElementById('uzsCancel').onclick = () => closeOverlay('uzsOverlay');
+document.getElementById('uzsSubmit').onclick = async () => {
+  if (!INIT_DATA) { toast('Bu amal uchun botni Telegram ilovasi ichidan oching'); return; }
+  const fileEl = document.getElementById('uzsFile');
+  if (!fileEl.files.length) { toast('Chek (screenshot) tanlang'); return; }
+  const submitBtn = document.getElementById('uzsSubmit');
+  submitBtn.disabled = true; submitBtn.textContent = 'Yuborilmoqda...';
+  try {
+    const fd = new FormData();
+    fd.append('init_data', INIT_DATA);
+    fd.append('item_id', UZS_ITEM.id);
+    fd.append('photo', fileEl.files[0]);
+    const res = await fetch('/api/upload_proof', { method: 'POST', body: fd });
+    const data = await res.json();
+    submitBtn.disabled = false; submitBtn.textContent = 'Yuborish';
+    if (!res.ok || !data.ok) { toast(data.error || 'Xatolik yuz berdi'); return; }
+    closeOverlay('uzsOverlay');
+    showResult('✅ <b>Chekingiz qabul qilindi!</b><br><br>Admin tekshirib, tasdiqlagach mahsulot yetkaziladi.');
+  } catch (e) {
+    submitBtn.disabled = false; submitBtn.textContent = 'Yuborish';
+    toast('Tarmoq xatosi, qayta urinib ko\\'ring');
+  }
+};
+
+let INFO = { contacts: [], reviews_url: null, min_withdraw_stars: 0 };
+
+function switchPage(key) {
+  document.querySelectorAll('.page').forEach(p => p.classList.toggle('active', p.id === 'page-' + key));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.page === key));
+  window.scrollTo({ top: 0 });
+}
+document.getElementById('bottomNav').querySelectorAll('.nav-item').forEach(el => {
+  el.onclick = () => switchPage(el.dataset.page);
+});
+
+function renderProfile() {
+  const nameEl = document.getElementById('profName');
+  const avatarEl = document.getElementById('profAvatar');
+  const balEl = document.getElementById('profBalance');
+  const refsEl = document.getElementById('profRefs');
+  const linkEl = document.getElementById('refLinkText');
+  if (!USER) {
+    nameEl.textContent = 'Aniqlanmadi';
+    avatarEl.textContent = '?';
+    balEl.textContent = '0';
+    refsEl.textContent = '0';
+    linkEl.textContent = "Botni Telegram ilovasi ichidan oching";
+    return;
+  }
+  const name = USER.first_name || 'Foydalanuvchi';
+  nameEl.textContent = name;
+  avatarEl.textContent = name.trim().charAt(0).toUpperCase() || '👤';
+  balEl.textContent = USER.balance_stars;
+  refsEl.textContent = USER.referals_count;
+  linkEl.textContent = USER.ref_link || '—';
+}
+
+document.getElementById('refCopyBtn').onclick = async () => {
+  const link = USER && USER.ref_link;
+  if (!link) { toast('Havola hali tayyor emas'); return; }
+  try {
+    await navigator.clipboard.writeText(link);
+    toast('✅ Havola nusxalandi!');
+  } catch (e) {
+    toast('Nusxalab bo\\'lmadi — havolani qo\\'lda belgilab oling');
+  }
+};
+document.getElementById('refShareBtn').onclick = () => {
+  const link = USER && USER.ref_link;
+  if (!link) { toast('Havola hali tayyor emas'); return; }
+  const shareText = "Men bu bot orqali yulduzlar yig'ib, sovg'alar olaman! Qo'shil! 🎁";
+  const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(shareText)}`;
+  if (tg && tg.openTelegramLink) tg.openTelegramLink(shareUrl);
+  else window.open(shareUrl, '_blank');
+};
+
+function renderWithdraw() {
+  document.getElementById('wdBalance').textContent = (USER ? USER.balance_stars : 0) + ' ⭐';
+  document.getElementById('wdMin').textContent = (INFO.min_withdraw_stars || 0) + ' ⭐';
+  const note = document.getElementById('wdNote');
+  const starsBtn = document.getElementById('wdStarsBtn');
+  const canWithdraw = USER && USER.balance_stars >= (INFO.min_withdraw_stars || 0);
+  note.textContent = canWithdraw
+    ? "Butun balansingiz yechiladi (yulduz yoki gift sifatida)."
+    : `Yechish uchun kamida ${INFO.min_withdraw_stars} ⭐ kerak.`;
+  starsBtn.disabled = !canWithdraw;
+  starsBtn.textContent = `⭐ Yulduz sifatida yechish (${USER ? USER.balance_stars : 0})`;
+
+  const list = document.getElementById('wdGiftList');
+  list.innerHTML = '';
+  if (!USER) return;
+  const gifts = SHOP.items.filter(i => i.cat === 'gift' && i.price_stars > 0 && i.price_stars <= USER.balance_stars);
+  if (!gifts.length) {
+    list.innerHTML = '<div class="hint-p">Balansingizga hozircha yetadigan gift yo\\'q.</div>';
+    return;
+  }
+  gifts.forEach(g => {
+    const row = document.createElement('div');
+    row.className = 'gift-row';
+    row.innerHTML = `<div><div class="gname">${g.name}</div><div class="gprice">${g.price_stars} ⭐</div></div><button>Yechish</button>`;
+    row.querySelector('button').onclick = (e) => withdraw('gift', g.id, e.target);
+    list.appendChild(row);
+  });
+}
+
+document.getElementById('wdStarsBtn').onclick = (e) => withdraw('stars', null, e.target);
+
+async function withdraw(kind, itemId, btnEl) {
+  if (!INIT_DATA) { toast('Bu amal uchun botni Telegram ilovasi ichidan oching'); return; }
+  const oldText = btnEl.textContent;
+  btnEl.disabled = true; btnEl.textContent = 'Yuborilmoqda...';
+  try {
+    const res = await fetch('/api/withdraw', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ init_data: INIT_DATA, kind, item_id: itemId }),
+    });
+    const data = await res.json();
+    btnEl.disabled = false; btnEl.textContent = oldText;
+    if (!res.ok || !data.ok) { toast(data.error || 'Xatolik yuz berdi'); return; }
+    showResult(data.message);
+    await refreshMe();
+  } catch (e) {
+    btnEl.disabled = false; btnEl.textContent = oldText;
+    toast('Tarmoq xatosi, qayta urinib ko\\'ring');
+  }
+}
+
+function renderContacts() {
+  const list = document.getElementById('contactsList');
+  list.innerHTML = '';
+  if (!INFO.contacts.length) {
+    list.innerHTML = '<div class="hint-p">Kontaktlar hozircha yo\\'q.</div>';
+    return;
+  }
+  INFO.contacts.forEach(c => {
+    const a = document.createElement('a');
+    a.className = 'contact-row';
+    a.href = `https://t.me/${c.username}`;
+    a.target = '_blank';
+    a.innerHTML = `<div class="c-ic">📩</div><div><div class="c-label">${c.label}</div><div class="c-user">@${c.username}</div></div>`;
+    a.onclick = (e) => {
+      e.preventDefault();
+      if (tg && tg.openTelegramLink) tg.openTelegramLink(`https://t.me/${c.username}`);
+      else window.open(`https://t.me/${c.username}`, '_blank');
+    };
+    list.appendChild(a);
+  });
+}
+
+function renderReviews() {
+  const textEl = document.getElementById('reviewsText');
+  const banner = document.getElementById('reviewsBanner');
+  if (INFO.reviews_url) {
+    textEl.textContent = "Otzivlar bot ichida emas, otziv kanalimizda qoldiriladi. Tugmani bosib kanalga o'ting.";
+    if (!document.getElementById('reviewsGoBtn')) {
+      const btn = document.createElement('button');
+      btn.id = 'reviewsGoBtn';
+      btn.textContent = "Kanalga o'tish";
+      btn.onclick = () => {
+        if (tg && tg.openTelegramLink && INFO.reviews_url.includes('t.me')) tg.openTelegramLink(INFO.reviews_url);
+        else window.open(INFO.reviews_url, '_blank');
+      };
+      banner.appendChild(btn);
+    }
+  } else {
+    textEl.textContent = "Otziv kanali hali sozlanmagan.";
+  }
+}
+
+async function refreshInfo() {
+  try {
+    const res = await fetch('/api/info');
+    INFO = await res.json();
+  } catch (e) { /* keep defaults */ }
+  renderWithdraw();
+  renderContacts();
+  renderReviews();
+}
+
+async function load() {
+  renderTabs();
+  await Promise.all([refreshMe(), refreshShop(), refreshInfo()]);
+}
+
+load();
+</script>
+</body>
+</html>
+""".replace("__LOGO_DATA_URI__", BOT_LOGO_DATA_URI)
+
+
+async def webapp_page_handler(request):
+    return web.Response(text=MINI_APP_HTML, content_type="text/html")
+
+
+def verify_webapp_init_data(init_data: str) -> dict | None:
+    """Telegram Mini App'dan kelgan initData'ni HMAC orqali tekshiradi
+    (https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app).
+    Muvaffaqiyatli bo'lsa foydalanuvchi ma'lumotlari lug'atini (id, first_name,
+    username, ...) qaytaradi, aks holda None (soxta/o'zgartirilgan so'rov)."""
+    if not init_data or not BOT_TOKEN:
+        return None
+    try:
+        pairs = dict(parse_qsl(init_data, strict_parsing=True))
+    except ValueError:
+        return None
+
+    received_hash = pairs.pop("hash", None)
+    if not received_hash:
+        return None
+
+    data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+    secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+    computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(computed_hash, received_hash):
+        return None
+
+    user_raw = pairs.get("user")
+    if not user_raw:
+        return None
+    try:
+        user = json.loads(user_raw)
+    except ValueError:
+        return None
+    if "id" not in user:
+        return None
+    return user
+
+
+async def _webapp_identify(request) -> tuple[dict | None, dict | None]:
+    """So'rov tanasidan (JSON yoki form) init_data'ni oladi, tekshiradi va
+    mos foydalanuvchi bazadagi yozuvini qaytaradi. (tg_user, db_user)."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    init_data = body.get("init_data", "") if isinstance(body, dict) else ""
+    tg_user = verify_webapp_init_data(init_data)
+    if not tg_user:
+        return None, None
+
+    telegram_id = int(tg_user["id"])
+    db_user = await get_user(telegram_id)
+    if not db_user:
+        await add_user(telegram_id)
+        db_user = await get_user(telegram_id)
+    return tg_user, db_user
+
+
+async def webapp_me_handler(request):
+    """Mini App header'ida va Profil bo'limida ko'rsatiladigan foydalanuvchi
+    ma'lumotlari (balans, referallar soni, referal havola) — initData
+    orqali xavfsiz aniqlanadi."""
+    tg_user, db_user = await _webapp_identify(request)
+    if not db_user:
+        return web.json_response({"error": "Foydalanuvchi aniqlanmadi"}, status=401)
+
+    ref_link = None
+    if _bot is not None:
+        try:
+            me = await _bot.me()
+            ref_link = f"https://t.me/{me.username}?start={db_user['telegram_id']}"
+        except Exception:
+            ref_link = None
+
+    return web.json_response({
+        "telegram_id": db_user["telegram_id"],
+        "first_name": tg_user.get("first_name", ""),
+        "balance_stars": db_user["balance_stars"],
+        "referals_count": db_user["referals_count"],
+        "last_daily_box": db_user["last_daily_box"],
+        "ref_link": ref_link,
+    })
+
+
+async def webapp_info_handler(request):
+    """Mini App'ning Aloqa/Otziv/Yechish bo'limlari uchun umumiy (foydalanuvchiga
+    bog'liq bo'lmagan) sozlamalar — kontaktlar, otziv kanali, minimal yechish
+    chegarasi. Admin panelda o'zgartirilgan sozlama shu yerda avtomatik ko'rinadi."""
+    s = await get_settings()
+    contacts = await get_contacts()
+    return web.json_response({
+        "contacts": [{"label": c["label"], "username": c["username"].lstrip("@")} for c in contacts],
+        "reviews_url": channel_url(s["reviews_channel"]) if s["reviews_channel"] else None,
+        "min_withdraw_stars": s["min_withdraw_stars"],
+        "ref_reward_stars": s["ref_reward_stars"],
+        "min_referals_required": s["min_referals_required"],
+    })
+
+
+async def webapp_shop_api_handler(request):
+    """Mini App uchun do'kondagi BARCHA toifalar: Gift/Premium/Yulduz
+    (bot balansi + Telegram Stars + UZS), Jekpot (boxlar) va NFT (guruh
+    havolasi) — admin panelda qo'shilgan har qanday yangi narsa shu yerda
+    avtomatik chiqadi, chunki ro'yxat har safar bazadan jonli o'qiladi."""
+    items = []
+    for it in await get_all_shop_items():
+        if it["category"] == "nft":
+            continue
+        if it["price_stars"] <= 0 and it["price_uzs"] <= 0:
+            continue
+        items.append({
+            "kind": "item",
+            "id": it["id"],
+            "cat": it["category"],
+            "name": it["name"],
+            "desc": it["description"] or "",
+            "price_stars": it["price_stars"],
+            "price_uzs": it["price_uzs"],
+        })
+
+    boxes = []
+    for b in await get_all_boxes():
+        boxes.append({
+            "kind": "box",
+            "id": b["box_id"],
+            "name": b["name"],
+            "desc": b["desc_text"] or "",
+            "cost": b["cost"],
+            "cost_tgstars": b["cost_tgstars"],
+            "once_per_day": bool(b["once_per_day"]),
+        })
+
+    s = await get_settings()
+
+    return web.json_response({
+        "items": items,
+        "boxes": boxes,
+        "nft": {"group_url": channel_url(s["nft_group"]) if s["nft_group"] else None},
+        "settings": {"pay_card": format_card(s["pay_card"])},
+        "server_date": datetime.now().strftime("%Y-%m-%d"),
+    })
+
+
+async def webapp_create_invoice_handler(request):
+    """Mini App'dan kelgan 'sotib olish' so'rovi uchun Telegram Stars
+    invoys havolasini yaratadi (bot.create_invoice_link) — foydalanuvchi
+    uni Telegram.WebApp.openInvoice() orqali ochadi."""
+    if _bot is None:
+        return web.json_response({"error": "Bot hali tayyor emas"}, status=503)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Noto'g'ri so'rov"}, status=400)
+
+    kind = body.get("kind")
+    raw_id = body.get("id")
+
+    try:
+        if kind == "item":
+            item = await get_shop_item(int(raw_id))
+            if not item or item["price_stars"] <= 0:
+                return web.json_response({"error": "Mahsulot topilmadi"}, status=404)
+            label = CATEGORIES.get(item["category"], item["category"])
+            invoice_url = await _bot.create_invoice_link(
+                title=f"{label} — {item['name']}",
+                description=item["description"] or f"{item['name']} ({item['price_stars']} ⭐ Telegram Stars)",
+                payload=f"shop_item:{item['id']}",
+                currency="XTR",
+                prices=[LabeledPrice(label=item["name"], amount=item["price_stars"])],
+                provider_token="",
+            )
+        elif kind == "box":
+            box = await get_box(str(raw_id))
+            if not box or box["cost_tgstars"] <= 0:
+                return web.json_response({"error": "Box topilmadi"}, status=404)
+            invoice_url = await _bot.create_invoice_link(
+                title=f"📦 {box['name']}",
+                description=box["desc_text"] or f"{box['name']} — {box['cost_tgstars']} Telegram Stars",
+                payload=f"box:{box['box_id']}",
+                currency="XTR",
+                prices=[LabeledPrice(label=box["name"], amount=box["cost_tgstars"])],
+                provider_token="",
+            )
+        else:
+            return web.json_response({"error": "Noma'lum turi"}, status=400)
+    except Exception as e:
+        logger.error("Mini App invoys yaratilmadi (kind=%s, id=%s): %s", kind, raw_id, e)
+        return web.json_response({"error": "Invoys yaratib bo'lmadi"}, status=500)
+
+    return web.json_response({"invoice_url": invoice_url})
+
+
+async def webapp_buy_balance_handler(request):
+    """Mini App'dan bot balansi (ichki ⭐) bilan xarid — Gift/Premium
+    mahsulot yoki Jekpot box. Xuddi bot-chat'dagi buy_item_callback /
+    box_open_callback bilan bir xil qoidalar (referal talabi, balans
+    tekshiruvi) qo'llaniladi."""
+    if _bot is None:
+        return web.json_response({"error": "Bot hali tayyor emas"}, status=503)
+
+    tg_user, user = await _webapp_identify(request)
+    if not user:
+        return web.json_response({"error": "Foydalanuvchi aniqlanmadi — botni Telegram ichidan oching"}, status=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Noto'g'ri so'rov"}, status=400)
+
+    kind = body.get("kind")
+    raw_id = body.get("id")
+    telegram_id = int(tg_user["id"])
+    first_name = tg_user.get("first_name", "")
+    username = tg_user.get("username", "")
+
+    if kind == "item":
+        item = await get_shop_item(int(raw_id))
+        if not item:
+            return web.json_response({"error": "Mahsulot topilmadi"}, status=404)
+        if item["category"] == "star":
+            return web.json_response({"error": "⭐ Yulduzlar faqat karta (UZS) bilan sotib olinadi"}, status=400)
+        if item["price_stars"] <= 0:
+            return web.json_response({"error": "Bu mahsulot uchun bot balansi narxi belgilanmagan"}, status=400)
+
+        settings = await get_settings()
+        label = CATEGORIES.get(item["category"], item["category"])
+
+        if user["referals_count"] < settings["min_referals_required"]:
+            need = settings["min_referals_required"] - user["referals_count"]
+            return web.json_response({
+                "error": f"Minimal {settings['min_referals_required']} ta odam taklif qilishingiz kerak! "
+                         f"Yana {need} ta kerak.",
+            }, status=403)
+
+        if user["balance_stars"] < item["price_stars"]:
+            need_stars = item["price_stars"] - user["balance_stars"]
+            return web.json_response({
+                "error": f"Balansingiz yetarli emas! Yana {need_stars} ⭐ kerak.",
+            }, status=402)
+
+        await deduct_stars(telegram_id, item["price_stars"])
+
+        delivered, error = await try_auto_deliver_gift(_bot, telegram_id, item)
+        warn = f"⚠️ Avtomatik yuborish muvaffaqiyatsiz bo'ldi ({error}) — qo'lda yuboring!\n\n" if error else ""
+        status_line = "✅ Gift avtomatik yuborildi — hech narsa qilish shart emas.\n\n" if delivered else warn
+
+        for admin_id in ADMIN_IDS:
+            try:
+                await _bot.send_message(
+                    admin_id,
+                    f"🛒 <b>YANGI BUYURTMA (Mini App)!</b>\n\n"
+                    f"{status_line}"
+                    f"👤 Foydalanuvchi: {first_name} (@{username or '—'})\n"
+                    f"🆔 ID: <code>{telegram_id}</code>\n"
+                    f"{label} <b>{item['name']}</b>\n"
+                    f"💰 Narxi: <b>{item['price_stars']} ⭐</b> (bot balansi)\n"
+                    f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                )
+            except TelegramForbiddenError:
+                pass
+
+        user_note = (
+            "✅ Gift avtomatik yuborildi — Telegram'dagi \"Sovg'alar\" bo'limingizni tekshiring! ✨"
+            if delivered else "Buyurtma adminga yuborildi, tez orada siz bilan bog'lanamiz. 🎁"
+        )
+        message = (
+            f"✅ <b>Xarid muvaffaqiyatli!</b><br><br>"
+            f"{label} <b>{item['name']}</b> — {item['price_stars']} ⭐ ayirildi. "
+            f"{user_note}"
+        )
+        return web.json_response({"ok": True, "message": message})
+
+    if kind == "box":
+        box = await get_box(str(raw_id))
+        if not box:
+            return web.json_response({"error": "Box topilmadi"}, status=404)
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        if box["once_per_day"] and user["last_daily_box"] == today:
+            return web.json_response({"error": "Kunlik boxni bugun ishlatgansiz! Ertaga qayta oching."}, status=403)
+
+        if user["balance_stars"] < box["cost"]:
+            return web.json_response({"error": f"Balans yetarli emas! Kerak: {box['cost']} ⭐"}, status=402)
+
+        await deduct_stars(telegram_id, box["cost"])
+        if box["once_per_day"]:
+            await set_daily_box_used(telegram_id, today)
+
+        result = await open_box_and_award(_bot, box, telegram_id, first_name, username)
+        return web.json_response({
+            "ok": True,
+            "message": result["text"],
+            "ratio": result["ratio"],
+            "kind": result["kind"],
+            "claim_id": result["claim_id"],
+            "gift_price_stars": result["gift_price_stars"],
+        })
+
+    return web.json_response({"error": "Noma'lum turi"}, status=400)
+
+
+async def webapp_gift_claim_handler(request):
+    """Mini App'da box'dan gift yutilganda foydalanuvchi tanlagan variantni
+    bajaradi — bot-chat'dagi giftclaim:real / giftclaim:stars bilan bir xil
+    mantiq (try_auto_deliver_gift / add_stars), faqat HTTP orqali."""
+    if _bot is None:
+        return web.json_response({"error": "Bot hali tayyor emas"}, status=503)
+
+    tg_user, user = await _webapp_identify(request)
+    if not user:
+        return web.json_response({"error": "Foydalanuvchi aniqlanmadi — botni Telegram ichidan oching"}, status=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Noto'g'ri so'rov"}, status=400)
+
+    action = body.get("action")
+    claim_id = body.get("claim_id")
+    telegram_id = int(tg_user["id"])
+
+    claim = await get_gift_claim(int(claim_id)) if claim_id is not None else None
+    if not claim:
+        return web.json_response({"error": "Topilmadi"}, status=404)
+    if claim["telegram_id"] != telegram_id:
+        return web.json_response({"error": "Bu sizga tegishli emas"}, status=403)
+    if claim["status"] != "pending":
+        return web.json_response({"error": "Bu gift bo'yicha allaqachon tanlov qilingan"}, status=409)
+
+    if action == "stars":
+        await update_gift_claim_status(claim["id"], "claimed_stars")
+        await add_stars(telegram_id, claim["price_stars"])
+        message = f"⭐ <b>{claim['item_name']}</b> — {claim['price_stars']} ⭐ ga aylantirildi va balansingizga qo'shildi!"
+        return web.json_response({"ok": True, "message": message})
+
+    if action == "real":
+        item = await get_shop_item(claim["item_id"])
+        delivered, error = await try_auto_deliver_gift(_bot, telegram_id, item)
+        if delivered:
+            await update_gift_claim_status(claim["id"], "claimed_gift")
+            message = f"✅ <b>{claim['item_name']}</b> avtomatik yuborildi — Telegram'dagi \"Sovg'alar\" bo'limingizni tekshiring! ✨"
+            for admin_id in ADMIN_IDS:
+                try:
+                    await _bot.send_message(
+                        admin_id,
+                        f"🎁 <b>BOX'DAN GIFT TANLANDI VA AVTOMATIK YUBORILDI (Mini App)!</b>\n\n"
+                        f"👤 Foydalanuvchi: {tg_user.get('first_name', '')} (@{tg_user.get('username') or '—'})\n"
+                        f"🆔 ID: <code>{telegram_id}</code>\n"
+                        f"🎁 Gift: <b>{claim['item_name']}</b> ({claim['price_stars']} ⭐)\n\n"
+                        f"✅ Hech narsa qilish shart emas — allaqachon yuborilgan.",
+                    )
+                except TelegramForbiddenError:
+                    pass
+        else:
+            w_id = await add_withdrawal(
+                telegram_id=telegram_id,
+                user_name=tg_user.get("first_name", ""),
+                username=tg_user.get("username", ""),
+                kind="gift",
+                amount_stars=claim["price_stars"],
+                item_name=claim["item_name"],
+            )
+            await update_gift_claim_status(claim["id"], "claimed_gift")
+            kb = InlineKeyboardBuilder()
+            kb.button(text="✅ Gift yubordim", callback_data=f"wd_approve:{w_id}")
+            kb.adjust(1)
+            warn = f"⚠️ Avtomatik yuborish muvaffaqiyatsiz bo'ldi ({error}) — qo'lda yuboring!\n\n" if error else ""
+            for admin_id in ADMIN_IDS:
+                try:
+                    await _bot.send_message(
+                        admin_id,
+                        f"🎁 <b>BOX'DAN GIFT TANLANDI — QO'LDA YUBORISH KERAK (Mini App)!</b>\n\n"
+                        f"{warn}"
+                        f"👤 Foydalanuvchi: {tg_user.get('first_name', '')} (@{tg_user.get('username') or '—'})\n"
+                        f"🆔 ID: <code>{telegram_id}</code>\n"
+                        f"🎁 Gift: <b>{claim['item_name']}</b> ({claim['price_stars']} ⭐)\n\n"
+                        f"⚠️ Giftni foydalanuvchiga Telegram'da yuborgach, tugmani bosing.",
+                        reply_markup=kb.as_markup(),
+                    )
+                except TelegramForbiddenError:
+                    pass
+            message = "✅ So'rovingiz qabul qilindi — gift tez orada admin tomonidan yuboriladi."
+        return web.json_response({"ok": True, "message": message})
+
+    return web.json_response({"error": "Noma'lum amal"}, status=400)
+
+
+async def webapp_upload_proof_handler(request):
+    """Mini App'dan UZS (karta) to'lovi uchun chek (screenshot) qabul
+    qiladi — bot-chat'dagi uzs_proof_received bilan bir xil natija: order
+    yaratiladi va adminga tasdiqlash tugmalari bilan yuboriladi."""
+    if _bot is None:
+        return web.json_response({"error": "Bot hali tayyor emas"}, status=503)
+
+    init_data = ""
+    item_id_raw = None
+    photo_bytes = None
+
+    try:
+        reader = await request.multipart()
+        async for field in reader:
+            if field.name == "init_data":
+                init_data = (await field.read()).decode("utf-8", "ignore")
+            elif field.name == "item_id":
+                item_id_raw = (await field.read()).decode("utf-8", "ignore")
+            elif field.name == "photo":
+                photo_bytes = await field.read()
+    except Exception:
+        return web.json_response({"error": "Noto'g'ri so'rov"}, status=400)
+
+    tg_user = verify_webapp_init_data(init_data)
+    if not tg_user:
+        return web.json_response({"error": "Foydalanuvchi aniqlanmadi — botni Telegram ichidan oching"}, status=401)
+    if not photo_bytes:
+        return web.json_response({"error": "Chek (screenshot) topilmadi"}, status=400)
+
+    telegram_id = int(tg_user["id"])
+    first_name = tg_user.get("first_name", "")
+    username = tg_user.get("username", "")
+
+    try:
+        item = await get_shop_item(int(item_id_raw))
+    except (TypeError, ValueError):
+        item = None
+    if not item or item["price_uzs"] <= 0:
+        return web.json_response({"error": "Mahsulot topilmadi"}, status=404)
+
+    if not await get_user(telegram_id):
+        await add_user(telegram_id)
+
+    label = CATEGORIES.get(item["category"], item["category"])
+    order_id = await add_order(
+        telegram_id=telegram_id,
+        user_name=first_name,
+        username=username,
+        item_id=item["id"],
+        item_name=item["name"],
+        category=item["category"],
+        amount_uzs=item["price_uzs"],
+        proof_file_id="",
+    )
+
+    caption = (
+        f"🛒 <b>YANGI BUYURTMA #{order_id} (UZS, Mini App)!</b>\n\n"
+        f"👤 Foydalanuvchi: {first_name} (@{username or '—'})\n"
+        f"🆔 ID: <code>{telegram_id}</code>\n"
+        f"{label} <b>{item['name']}</b>\n"
+        f"💰 Summa: <b>{item['price_uzs']:,} so'm</b>\n"
+        f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"👇 Chekni tekshiring va qaror qabul qiling:"
+    )
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Tasdiqlash", callback_data=f"order_approve:{order_id}")
+    kb.button(text="❌ Rad etish", callback_data=f"order_reject:{order_id}")
+    kb.adjust(1)
+
+    photo_file = BufferedInputFile(photo_bytes, filename=f"proof_{order_id}.jpg")
+    for admin_id in ADMIN_IDS:
+        try:
+            await _bot.send_photo(admin_id, photo_file, caption=caption, reply_markup=kb.as_markup())
+        except TelegramForbiddenError:
+            pass
+
+    return web.json_response({"ok": True, "order_id": order_id})
+
+
+async def webapp_withdraw_handler(request):
+    """Mini App'dagi 'Yulduz yechish' bo'limi — ⭐ yulduz yoki 🎁 gift
+    sifatida yechish so'rovini yaratadi. Bot-chat'dagi process_stars_withdrawal
+    / withdraw_gift_confirm bilan bir xil qoidalar (minimal chegara, balans
+    tekshiruvi) va bir xil kuzatuv (withdrawals jadvali + admin
+    Tasdiqlash/Bekor tugmalari — qayta-qayta to'lab yubormaslik uchun)."""
+    if _bot is None:
+        return web.json_response({"error": "Bot hali tayyor emas"}, status=503)
+
+    tg_user, user = await _webapp_identify(request)
+    if not user:
+        return web.json_response({"error": "Foydalanuvchi aniqlanmadi — botni Telegram ichidan oching"}, status=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Noto'g'ri so'rov"}, status=400)
+
+    kind = body.get("kind")
+    telegram_id = int(tg_user["id"])
+    first_name = tg_user.get("first_name", "")
+    username = tg_user.get("username", "")
+    settings = await get_settings()
+
+    if user["balance_stars"] < settings["min_withdraw_stars"]:
+        need = settings["min_withdraw_stars"] - user["balance_stars"]
+        return web.json_response({
+            "error": f"Yechish uchun minimal {settings['min_withdraw_stars']} ⭐ kerak. Yana {need} ⭐ kerak.",
+        }, status=402)
+
+    if kind == "stars":
+        amount = user["balance_stars"]
+        item_name = ""
+    elif kind == "gift":
+        try:
+            item = await get_shop_item(int(body.get("item_id")))
+        except (TypeError, ValueError):
+            item = None
+        if not item or item["category"] != "gift" or item["price_stars"] <= 0:
+            return web.json_response({"error": "Gift topilmadi"}, status=404)
+        if user["balance_stars"] < item["price_stars"]:
+            return web.json_response({"error": "Balans yetarli emas"}, status=402)
+        amount = item["price_stars"]
+        item_name = item["name"]
+    else:
+        return web.json_response({"error": "Noma'lum turi"}, status=400)
+
+    await deduct_stars(telegram_id, amount)
+    w_id = await add_withdrawal(
+        telegram_id=telegram_id, user_name=first_name, username=username,
+        kind=kind, amount_stars=amount, item_name=item_name,
+    )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ To'lov qildim", callback_data=f"wd_approve:{w_id}")
+    kb.button(text="❌ Bekor qilish (qaytarish)", callback_data=f"wd_reject:{w_id}")
+    kb.adjust(1)
+
+    label = f"🎁 Gift: <b>{item_name}</b>" if kind == "gift" else "⭐ Yulduz sifatida"
+    for admin_id in ADMIN_IDS:
+        try:
+            await _bot.send_message(
+                admin_id,
+                f"💸 <b>YECHISH SO'ROVI #{w_id} (Mini App)</b>\n\n"
+                f"👤 Foydalanuvchi: {first_name} (@{username or '—'})\n"
+                f"🆔 ID: <code>{telegram_id}</code>\n"
+                f"{label}\n"
+                f"💰 Miqdor: <b>{amount} ⭐</b>\n"
+                f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"⚠️ Real to'lovni o'tkazgach \"✅ To'lov qildim\" tugmasini bosing — "
+                f"shunda ikki marta to'lab yubormaysiz.",
+                reply_markup=kb.as_markup(),
+            )
+        except TelegramForbiddenError:
+            pass
+
+    message = (
+        f"✅ <b>So'rovingiz qabul qilindi!</b><br><br>"
+        f"💰 Miqdor: <b>{amount} ⭐</b><br>"
+        f"🧾 So'rov: #{w_id}<br><br>"
+        f"Yulduzlar/gift bot egasi tomonidan tez orada yuboriladi."
+    )
+    return web.json_response({"ok": True, "message": message})
+
+
+def register_webapp_routes(app: "web.Application") -> None:
+    """Mini App uchun kerakli barcha yo'llarni (routes) mavjud aiohttp
+    ilovasiga qo'shadi — polling va webhook rejimlarining ikkalasida ham
+    ishlatiladi."""
+    app.router.add_get("/webapp", webapp_page_handler)
+    app.router.add_get("/api/shop", webapp_shop_api_handler)
+    app.router.add_get("/api/info", webapp_info_handler)
+    app.router.add_post("/api/me", webapp_me_handler)
+    app.router.add_post("/api/withdraw", webapp_withdraw_handler)
+    app.router.add_post("/api/create_invoice", webapp_create_invoice_handler)
+    app.router.add_post("/api/buy_balance", webapp_buy_balance_handler)
+    app.router.add_post("/api/upload_proof", webapp_upload_proof_handler)
+    app.router.add_post("/api/gift_claim", webapp_gift_claim_handler)
+
+
+# ============================================================
 #  MAIN (ISHLAB CHIQARISH)
 # ============================================================
 
@@ -2450,8 +5206,10 @@ async def main() -> None:
         from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
         app = web.Application()
+        app.router.add_get('/', handle_ping)
         SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
         setup_application(app, dp, bot=bot)
+        register_webapp_routes(app)  # /webapp, /api/shop, /api/create_invoice
 
         runner = web.AppRunner(app)
         await runner.setup()
