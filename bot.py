@@ -302,6 +302,15 @@ async def db_init() -> None:
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS gift_variants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_id INTEGER NOT NULL,
+                tg_gift_id TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS boxes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 box_id TEXT UNIQUE NOT NULL,
@@ -713,6 +722,42 @@ async def update_gift_claim_status(claim_id: int, status: str) -> None:
             "UPDATE gift_claims SET status = ?, resolved_at = ? WHERE id = ?",
             (status, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), claim_id),
         )
+        await db.commit()
+
+
+# ---------- Bitta mahsulotga bog'langan bir nechta haqiqiy gift turi ----------
+# (masalan "🐻 Ayiqcha / 🧸 Panda" — foydalanuvchi sotib olganda yoki yutib
+# olganda aynan qaysi birini xohlashini o'zi tanlaydi.)
+
+async def add_gift_variant(item_id: int, tg_gift_id: str, label: str = "") -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO gift_variants (item_id, tg_gift_id, label, created_at) VALUES (?, ?, ?, ?)",
+            (item_id, tg_gift_id, label, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def get_gift_variants(item_id: int) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM gift_variants WHERE item_id = ? ORDER BY id", (item_id,))
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_gift_variant(variant_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM gift_variants WHERE id = ?", (variant_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def clear_gift_variants(item_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM gift_variants WHERE item_id = ?", (item_id,))
         await db.commit()
 
 
@@ -1471,7 +1516,12 @@ async def show_boxes(answer_func, telegram_id: int, result_text: str | None = No
     await answer_func(text, reply_markup=kb.as_markup())
 
 
-async def try_auto_deliver_gift(bot: Bot, telegram_id: int, item: dict | None) -> tuple[bool, str]:
+async def try_auto_deliver_gift(
+    bot: Bot,
+    telegram_id: int,
+    item: dict | None,
+    gift_id_override: str | None = None,
+) -> tuple[bool, str]:
     """Do'kondan sotib olingan yoki box'dan yutilgan "gift" mahsulotini
     FOYDALANUVCHIGA avtomatik yetkazishga urinadi — ega/admin qo'lda hech
     narsa qilmaydi.
@@ -1483,11 +1533,19 @@ async def try_auto_deliver_gift(bot: Bot, telegram_id: int, item: dict | None) -
     Telegram Bot API buni qo'llab-quvvatlamaydi yoki qaysi real narsa
     ekanligi noma'lum).
 
+    gift_id_override — mahsulotga BIR NECHTA gift turi bog'langanda
+    (gift_variants), foydalanuvchi allaqachon aynan qaysi birini
+    tanlaganidan keyin, o'sha aniq gift_id bilan yuborish uchun (deliver_gift
+    va giftvariant: callback'lari shu orqali chaqiradi).
+
     Qaytaradi: (delivered, error) — delivered=True bo'lsa muvaffaqiyatli
     yuborilgan; delivered=False va error bo'sh bo'lsa avto-yuborish umuman
     urinilmagan (masalan Premium yoki gift_id bog'lanmagan); error to'la
     bo'lsa urinish xato bilan tugagan (masalan bot balansida Stars yetmadi)."""
-    if not item or item.get("category") != "gift" or not item.get("tg_gift_id"):
+    if not item or item.get("category") != "gift":
+        return False, ""
+    target_gift_id = gift_id_override or item.get("tg_gift_id")
+    if not target_gift_id:
         return False, ""
     try:
         settings = await get_settings()
@@ -1495,13 +1553,94 @@ async def try_auto_deliver_gift(bot: Bot, telegram_id: int, item: dict | None) -
         caption = caption_template.replace("{item}", item["name"])[:255]
         await bot.send_gift(
             user_id=telegram_id,
-            gift_id=item["tg_gift_id"],
+            gift_id=target_gift_id,
             text=caption,
         )
         return True, ""
     except Exception as e:
         logger.error("Avtomatik gift yuborilmadi (item=%s, user=%s): %s", item.get("name"), telegram_id, e)
         return False, str(e)
+
+
+def gift_variant_choice_keyboard(claim_id: int, variants: list[dict]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for v in variants:
+        kb.button(text=v["label"] or "🎁", callback_data=f"giftvariant:{claim_id}:{v['id']}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+async def deliver_gift(
+    bot: Bot,
+    telegram_id: int,
+    item: dict | None,
+    *,
+    price_stars: int | None = None,
+    source: str = "purchase",
+) -> dict:
+    """Gift mahsulotni yetkazishning YAGONA kirish nuqtasi — do'kondan sotib
+    olinganda HAM, box'dan yutilganda HAM shu orqali chaqiriladi.
+
+    - Mahsulotga hech qanday haqiqiy gift bog'lanmagan bo'lsa: {"mode": "none"}
+      (avto-yetkazish umuman qo'llanilmaydi, eski qo'lda tasdiqlash yo'li davom etadi)
+    - Bitta gift turi bog'langan bo'lsa: darhol yuboriladi —
+      {"mode": "delivered"} yoki {"mode": "failed", "error": ...}
+    - IKKI YOKI KO'PROQ gift turi (gift_variants) bog'langan bo'lsa: darhol
+      yubormaydi — foydalanuvchiga "qaysi birini xohlaysiz?" tanlov tugmalarini
+      yuboradi, tanlov qilingach giftvariant: callback orqali yakunlanadi —
+      {"mode": "choice", "claim_id": ...}
+    """
+    if not item or item.get("category") != "gift":
+        return {"mode": "none"}
+
+    variants = await get_gift_variants(item["id"])
+    if len(variants) >= 2:
+        claim_id = await add_gift_claim(
+            telegram_id, item["id"], item["name"], price_stars or item.get("price_stars", 0), source=source,
+        )
+        try:
+            await bot.send_message(
+                telegram_id,
+                f"🎁 <b>{item['name']}</b>\n\n"
+                f"Bu mahsulotning bir nechta turi bor — aynan qaysi birini xohlaysiz?",
+                reply_markup=gift_variant_choice_keyboard(claim_id, variants),
+            )
+        except TelegramForbiddenError:
+            pass
+        return {"mode": "choice", "claim_id": claim_id}
+
+    if len(variants) == 1:
+        ok, err = await try_auto_deliver_gift(bot, telegram_id, item, gift_id_override=variants[0]["tg_gift_id"])
+    elif item.get("tg_gift_id"):
+        ok, err = await try_auto_deliver_gift(bot, telegram_id, item)
+    else:
+        return {"mode": "none"}
+
+    return {"mode": "delivered"} if ok else {"mode": "failed", "error": err}
+
+
+def gift_delivery_texts(result: dict) -> tuple[str, str]:
+    """deliver_gift() natijasidan admin xabariga qo'shiladigan qism va
+    foydalanuvchiga ko'rsatiladigan qatorni tayyorlaydi — barcha xarid
+    yo'llarida (balans/Stars/UZS) bir xil matn mantig'i ishlatiladi."""
+    mode = result.get("mode")
+    if mode == "delivered":
+        return (
+            "✅ Gift avtomatik yuborildi — hech narsa qilish shart emas.\n\n",
+            "✅ Gift avtomatik yuborildi — Telegram'dagi \"Sovg'alar\" bo'limingizni tekshiring! ✨",
+        )
+    if mode == "choice":
+        return (
+            "🎯 Foydalanuvchi hozir qaysi gift turini xohlashini tanlamoqda — tanlagach avtomatik yuboriladi.\n\n",
+            "🎁 Sizga gift turini tanlash uchun alohida xabar yubordik — shu yerdan tanlang!",
+        )
+    if mode == "failed":
+        err = result.get("error", "")
+        return (
+            f"⚠️ Avtomatik yuborish muvaffaqiyatsiz bo'ldi ({err}) — qo'lda yuboring!\n\n",
+            "Buyurtma adminga yuborildi, tez orada siz bilan bog'lanamiz. 🎁",
+        )
+    return "", "Buyurtma adminga yuborildi, tez orada siz bilan bog'lanamiz. 🎁"
 
 
 async def open_box_and_award(bot: Bot, box: dict, telegram_id: int, first_name: str, username: str) -> dict:
@@ -1607,6 +1746,20 @@ async def gift_claim_callback(call: CallbackQuery, bot: Bot) -> None:
 
     # action == "real" — haqiqiy gift sifatida olish
     item = await get_shop_item(claim["item_id"])
+
+    variants = await get_gift_variants(claim["item_id"]) if item else []
+    if len(variants) >= 2:
+        # Mahsulotga bir nechta gift turi bog'langan — avval foydalanuvchi
+        # aynan qaysi birini xohlashini tanlashi kerak (claim hali "pending"
+        # holatida qoladi, giftvariant: callback uni yakunlaydi).
+        text = f"🎁 <b>{claim['item_name']}</b>\n\nQaysi turini xohlaysiz?"
+        try:
+            await call.message.edit_text(text, reply_markup=gift_variant_choice_keyboard(claim_id, variants))
+        except TelegramBadRequest:
+            await call.message.answer(text, reply_markup=gift_variant_choice_keyboard(claim_id, variants))
+        await call.answer()
+        return
+
     delivered, error = await try_auto_deliver_gift(bot, claim["telegram_id"], item)
 
     if delivered:
@@ -1661,6 +1814,98 @@ async def gift_claim_callback(call: CallbackQuery, bot: Bot) -> None:
                 pass
 
         text = "✅ So'rovingiz qabul qilindi — gift tez orada admin tomonidan yuboriladi."
+
+    try:
+        await call.message.edit_text(text)
+    except TelegramBadRequest:
+        await call.message.answer(text)
+    await call.answer("✅ Tanlandi!", show_alert=False)
+
+
+@router.callback_query(F.data.startswith("giftvariant:"))
+async def gift_variant_choice_callback(call: CallbackQuery, bot: Bot) -> None:
+    """Mahsulotga bir nechta haqiqiy gift turi (gift_variants) bog'langanda,
+    foydalanuvchi aynan qaysi birini xohlashini shu yerda yakuniy tanlaydi —
+    sotib olganda HAM, box'dan yutib "Giftni olish"ni tanlagandan keyin HAM
+    shu bitta callback orqali ishlaydi (deliver_gift/gift_claim_callback
+    ikkalasi ham shu claim_id'ga havola qiladi)."""
+    parts = call.data.split(":")
+    claim_id, variant_id = int(parts[1]), int(parts[2])
+
+    claim = await get_gift_claim(claim_id)
+    if not claim:
+        await call.answer("❌ Topilmadi", show_alert=True)
+        return
+    if claim["telegram_id"] != call.from_user.id:
+        await call.answer("❌ Bu sizga tegishli emas!", show_alert=True)
+        return
+    if claim["status"] != "pending":
+        await call.answer("⚠️ Bu gift bo'yicha allaqachon tanlov qilingan!", show_alert=True)
+        return
+
+    variant = await get_gift_variant(variant_id)
+    if not variant or variant["item_id"] != claim["item_id"]:
+        await call.answer("❌ Noto'g'ri tanlov", show_alert=True)
+        return
+
+    item = await get_shop_item(claim["item_id"])
+    delivered, error = await try_auto_deliver_gift(
+        bot, claim["telegram_id"], item, gift_id_override=variant["tg_gift_id"],
+    )
+    variant_label = variant["label"] or claim["item_name"]
+
+    if delivered:
+        await update_gift_claim_status(claim_id, "claimed_gift")
+        text = (
+            f"✅ <b>{variant_label}</b> avtomatik yuborildi — "
+            f"Telegram'dagi \"Sovg'alar\" bo'limingizni tekshiring! ✨"
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"🎁 <b>GIFT TURI TANLANDI VA AVTOMATIK YUBORILDI!</b>\n\n"
+                    f"👤 Foydalanuvchi: {call.from_user.first_name} (@{call.from_user.username or '—'})\n"
+                    f"🆔 ID: <code>{call.from_user.id}</code>\n"
+                    f"🎁 Gift: <b>{variant_label}</b>\n\n"
+                    f"✅ Hech narsa qilish shart emas — allaqachon yuborilgan.",
+                )
+            except TelegramForbiddenError:
+                pass
+    else:
+        # Qo'lda tasdiqlash yo'liga o'tamiz — mavjud withdrawals infratuzilmasi
+        # qayta ishlatiladi, shu bilan yagona joyda kuzatiladi va ikki marta
+        # yuborib yuborilmaydi.
+        w_id = await add_withdrawal(
+            telegram_id=claim["telegram_id"],
+            user_name=call.from_user.first_name or "",
+            username=call.from_user.username or "",
+            kind="gift",
+            amount_stars=claim["price_stars"],
+            item_name=variant_label,
+        )
+        await update_gift_claim_status(claim_id, "claimed_gift")
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text="✅ Gift yubordim", callback_data=f"wd_approve:{w_id}")
+        kb.adjust(1)
+        warn = f"⚠️ Avtomatik yuborish muvaffaqiyatsiz bo'ldi ({error}) — qo'lda yuboring!\n\n" if error else ""
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"🎁 <b>GIFT TURI TANLANDI — QO'LDA YUBORISH KERAK!</b>\n\n"
+                    f"{warn}"
+                    f"👤 Foydalanuvchi: {call.from_user.first_name} (@{call.from_user.username or '—'})\n"
+                    f"🆔 ID: <code>{call.from_user.id}</code>\n"
+                    f"🎁 Gift: <b>{variant_label}</b>\n\n"
+                    f"⚠️ Giftni foydalanuvchiga Telegram'da yuborgach, tugmani bosing.",
+                    reply_markup=kb.as_markup(),
+                )
+            except TelegramForbiddenError:
+                pass
+
+        text = "✅ Tanlovingiz qabul qilindi — gift tez orada admin tomonidan yuboriladi."
 
     try:
         await call.message.edit_text(text)
@@ -1990,11 +2235,9 @@ async def buy_item_callback(call: CallbackQuery, bot: Bot) -> None:
     # Xarid — yulduz ayriladi
     await deduct_stars(call.from_user.id, item["price_stars"])
 
-    delivered, error = await try_auto_deliver_gift(bot, call.from_user.id, item)
+    result = await deliver_gift(bot, call.from_user.id, item, price_stars=item["price_stars"], source="purchase")
+    status_line, user_note = gift_delivery_texts(result)
 
-    # Adminga buyurtma haqida xabar (auto-yuborilgan bo'lsa — faqat ma'lumot uchun)
-    warn = f"⚠️ Avtomatik yuborish muvaffaqiyatsiz bo'ldi ({error}) — qo'lda yuboring!\n\n" if error else ""
-    status_line = "✅ Gift avtomatik yuborildi — hech narsa qilish shart emas.\n\n" if delivered else warn
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
@@ -2012,10 +2255,6 @@ async def buy_item_callback(call: CallbackQuery, bot: Bot) -> None:
             pass
 
     await call.message.delete()
-    if delivered:
-        user_note = "✅ Gift avtomatik yuborildi — Telegram'dagi \"Sovg'alar\" bo'limingizni tekshiring! ✨"
-    else:
-        user_note = "Buyurtma adminga yuborildi, tez orada siz bilan bog'lanamiz. 🎁"
     await call.message.answer(
         f"✅ <b>Xarid muvaffaqiyatli!</b>\n\n"
         f"{label} <b>{item['name']}</b> — {item['price_stars']} ⭐ ayirildi. "
@@ -2216,11 +2455,11 @@ async def successful_payment_handler(message: Message, bot: Bot) -> None:
     # Telegram o'zi to'lovni tasdiqlagan — buyurtma darhol tasdiqlangan deb belgilanadi
     await update_order_status(order_id, "approved")
 
-    delivered, error = await try_auto_deliver_gift(bot, message.from_user.id, item)
-    warn = f"⚠️ Avtomatik yuborish muvaffaqiyatsiz bo'ldi ({error}) — qo'lda yuboring!\n\n" if error else ""
-    status_line = "✅ Gift avtomatik yuborildi — hech narsa qilish shart emas.\n\n" if delivered else (
-        warn or "⚠️ Mahsulotni foydalanuvchiga o'tkazing (Telegram'da yuborish mumkin)!\n\n"
-    )
+    result = await deliver_gift(bot, message.from_user.id, item, price_stars=payment.total_amount, source="purchase")
+    status_line, user_note = gift_delivery_texts(result)
+    if result.get("mode") == "none":
+        status_line = "⚠️ Mahsulotni foydalanuvchiga o'tkazing (Telegram'da yuborish mumkin)!\n\n"
+        user_note = "Tez orada mahsulot sizga yetkaziladi. 🎁"
 
     for admin_id in ADMIN_IDS:
         try:
@@ -2238,10 +2477,6 @@ async def successful_payment_handler(message: Message, bot: Bot) -> None:
         except TelegramForbiddenError:
             pass
 
-    user_note = (
-        "✅ Gift avtomatik yuborildi — Telegram'dagi \"Sovg'alar\" bo'limingizni tekshiring! ✨"
-        if delivered else "Tez orada mahsulot sizga yetkaziladi. 🎁"
-    )
     await message.answer(
         f"✅ <b>To'lov qabul qilindi!</b>\n\n"
         f"{label} <b>{item['name']}</b> — {payment.total_amount} ⭐ Telegram Stars orqali sotib olindi.\n"
@@ -2360,7 +2595,11 @@ async def order_approve_callback(call: CallbackQuery, bot: Bot) -> None:
         await add_stars(order["telegram_id"], item["deliver_stars"])
 
     # Gift toifasida va Telegram gift ID bog'langan bo'lsa — avtomatik yuboramiz
-    delivered, error = await try_auto_deliver_gift(bot, order["telegram_id"], item)
+    # (2+ gift turi bog'langan bo'lsa — foydalanuvchi tanlaydi, "choice" rejimi)
+    result = await deliver_gift(bot, order["telegram_id"], item, price_stars=order["amount_uzs"], source="purchase")
+    delivered = result.get("mode") == "delivered"
+    is_choice = result.get("mode") == "choice"
+    error = result.get("error", "")
 
     try:
         await bot.send_message(
@@ -2371,8 +2610,10 @@ async def order_approve_callback(call: CallbackQuery, bot: Bot) -> None:
                if order["category"] == "star" and item and item["deliver_stars"] > 0 else "")
             + ("✅ Gift avtomatik yuborildi — Telegram'dagi \"Sovg'alar\" bo'limingizni tekshiring! ✨\n"
                if delivered else "")
+            + ("🎯 Gift turini tanlash uchun alohida xabar yubordik — shu yerdan tanlang!\n"
+               if is_choice else "")
             + (f"🎁 {order['item_name']} sizga yuboriladi (egasi: @Kottabolladan).\n"
-               if order["category"] != "star" and not delivered else "")
+               if order["category"] != "star" and not delivered and not is_choice else "")
             + "\nDo'kondan foydalanishda davom eting! 🛍️",
         )
     except TelegramForbiddenError:
@@ -2381,6 +2622,8 @@ async def order_approve_callback(call: CallbackQuery, bot: Bot) -> None:
     caption_extra = "\n\n✅ <b>TASDIQLANDI</b>"
     if delivered:
         caption_extra += " (gift avtomatik yuborildi)"
+    elif is_choice:
+        caption_extra += " (foydalanuvchi gift turini tanlamoqda)"
     elif error:
         caption_extra += f" — ⚠️ avto-yuborish xato berdi ({error}), qo'lda yuboring!"
     caption_extra += f" — {call.from_user.first_name}"
@@ -2714,7 +2957,13 @@ async def admin_tggifts_menu(call: CallbackQuery) -> None:
     gifts = await get_shop_items("gift")
     kb = InlineKeyboardBuilder()
     for g in gifts:
-        mark = "✅" if g["tg_gift_id"] else "❌"
+        variants = await get_gift_variants(g["id"])
+        if len(variants) >= 2:
+            mark = f"✅ ({len(variants)} tur)"
+        elif g["tg_gift_id"]:
+            mark = "✅"
+        else:
+            mark = "❌"
         kb.button(text=f"{mark} {g['name']}", callback_data=f"admin:tggift_set:{g['id']}")
     kb.button(text="📋 Mavjud Telegram gift'lar", callback_data="admin:tggift_catalog")
     kb.button(text="🔙 Ortga", callback_data="admin")
@@ -2728,7 +2977,11 @@ async def admin_tggifts_menu(call: CallbackQuery) -> None:
         "<b>o'zining haqiqiy Stars balansidan avtomatik</b> yuboradi (admin "
         "qo'lda bosishi shart emas). Bog'lanmagan mahsulotlar eskichasiga "
         "qo'lda tasdiqlanadi.\n\n"
-        "✅ — gift ID bog'langan, ❌ — bog'lanmagan.\n"
+        "💡 Bitta mahsulotga BIR NECHTA gift turini bog'lasangiz (masalan "
+        "\"🐻/🧸\" — ikkalasi ham), foydalanuvchi sotib olganda yoki yutib "
+        "olganda aynan qaysi birini xohlashini o'zi tanlaydi.\n\n"
+        "✅ — gift ID bog'langan (bitta), ✅ (N tur) — bir nechta tur "
+        "bog'langan (foydalanuvchi tanlaydi), ❌ — bog'lanmagan.\n"
         "Mahsulotni tanlang:"
     )
     await call.message.edit_text(text, reply_markup=kb.as_markup())
@@ -2779,11 +3032,20 @@ async def admin_tggift_set_start(call: CallbackQuery, state: FSMContext) -> None
     await state.set_state(TgGiftStates.gift_id)
     await state.update_data(item_id=item_id)
 
-    current = item["tg_gift_id"] or "❌ bog'lanmagan"
+    variants = await get_gift_variants(item_id)
+    if len(variants) >= 2:
+        current = "\n".join(f"• {v['label'] or '—'}: <code>{v['tg_gift_id']}</code>" for v in variants)
+    else:
+        current = item["tg_gift_id"] or "❌ bog'lanmagan"
     await call.message.edit_text(
         f"🎁 <b>{item['name']}</b>\n\n"
-        f"Hozirgi holat: <code>{current}</code>\n\n"
-        f"📋 \"Mavjud Telegram gift'lar\" bo'limidan ID'ni nusxalab shu yerga yuboring.\n"
+        f"Hozirgi holat:\n{current}\n\n"
+        f"📋 \"Mavjud Telegram gift'lar\" bo'limidan ID'ni nusxalab shu yerga yuboring.\n\n"
+        f"💡 Bitta gift ID — bitta qatorda yuboring (masalan: <code>abc123</code>).\n"
+        f"💡 BIR NECHTA turni bog'lash uchun — har birini ALOHIDA qatorga, "
+        f"xohlasangiz nomi bilan yozing:\n"
+        f"<code>abc123 🐻 Ayiqcha\ndef456 🧸 Panda</code>\n"
+        f"(shunda foydalanuvchi qaysi birini xohlashini o'zi tanlaydi)\n\n"
         f"O'chirish uchun <code>-</code> yozing.",
     )
     await call.answer()
@@ -2793,16 +3055,41 @@ async def admin_tggift_set_start(call: CallbackQuery, state: FSMContext) -> None
 async def admin_tggift_id_input(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     item_id = data.get("item_id")
-    raw = message.text.strip()
+    raw = (message.text or "").strip()
 
-    new_value = "" if raw == "-" else raw
-    await update_shop_item(item_id, tg_gift_id=new_value)
-    await state.clear()
-
-    if new_value:
-        await message.answer(f"✅ Bog'landi! Endi bu gift avtomatik yuboriladi.\nID: <code>{new_value}</code>")
-    else:
+    if raw == "-":
+        await update_shop_item(item_id, tg_gift_id="")
+        await clear_gift_variants(item_id)
+        await state.clear()
         await message.answer("✅ Bog'lanish o'chirildi — bu gift endi qo'lda tasdiqlanadi.")
+        return
+
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+
+    if len(lines) == 1:
+        # Bitta gift ID — eski oddiy usul (variantlar bo'lsa, tozalanadi)
+        gift_id = lines[0].split(maxsplit=1)[0]
+        await update_shop_item(item_id, tg_gift_id=gift_id)
+        await clear_gift_variants(item_id)
+        await state.clear()
+        await message.answer(f"✅ Bog'landi! Endi bu gift avtomatik yuboriladi.\nID: <code>{gift_id}</code>")
+        return
+
+    # Bir nechta qator — har biri alohida gift turi (variant) sifatida saqlanadi
+    await clear_gift_variants(item_id)
+    await update_shop_item(item_id, tg_gift_id="")
+    saved = []
+    for ln in lines:
+        parts = ln.split(maxsplit=1)
+        gift_id = parts[0]
+        label = parts[1] if len(parts) > 1 else ""
+        await add_gift_variant(item_id, gift_id, label)
+        saved.append(f"• {label or '—'}: <code>{gift_id}</code>")
+    await state.clear()
+    await message.answer(
+        f"✅ {len(saved)} ta gift turi bog'landi! Foydalanuvchi sotib olganda/yutib olganda "
+        f"tanlaydi:\n\n" + "\n".join(saved),
+    )
 
 
 @router.message(F.text == "👑 Admin panel")
@@ -5029,9 +5316,10 @@ async def webapp_buy_balance_handler(request):
 
         await deduct_stars(telegram_id, item["price_stars"])
 
-        delivered, error = await try_auto_deliver_gift(_bot, telegram_id, item)
-        warn = f"⚠️ Avtomatik yuborish muvaffaqiyatsiz bo'ldi ({error}) — qo'lda yuboring!\n\n" if error else ""
-        status_line = "✅ Gift avtomatik yuborildi — hech narsa qilish shart emas.\n\n" if delivered else warn
+        gift_result = await deliver_gift(
+            _bot, telegram_id, item, price_stars=item["price_stars"], source="purchase",
+        )
+        status_line, user_note = gift_delivery_texts(gift_result)
 
         for admin_id in ADMIN_IDS:
             try:
@@ -5048,10 +5336,6 @@ async def webapp_buy_balance_handler(request):
             except TelegramForbiddenError:
                 pass
 
-        user_note = (
-            "✅ Gift avtomatik yuborildi — Telegram'dagi \"Sovg'alar\" bo'limingizni tekshiring! ✨"
-            if delivered else "Buyurtma adminga yuborildi, tez orada siz bilan bog'lanamiz. 🎁"
-        )
         message = (
             f"✅ <b>Xarid muvaffaqiyatli!</b><br><br>"
             f"{label} <b>{item['name']}</b> — {item['price_stars']} ⭐ ayirildi. "
@@ -5124,6 +5408,23 @@ async def webapp_gift_claim_handler(request):
 
     if action == "real":
         item = await get_shop_item(claim["item_id"])
+
+        variants = await get_gift_variants(claim["item_id"]) if item else []
+        if len(variants) >= 2:
+            # Bir nechta gift turi bog'langan — tanlovni Telegram chatidagi
+            # tugmalar orqali qildiramiz (claim hali "pending" holatida qoladi,
+            # giftvariant: callback uni yakunlaydi — bot-chat bilan bir xil yo'l).
+            try:
+                await _bot.send_message(
+                    telegram_id,
+                    f"🎁 <b>{claim['item_name']}</b>\n\nQaysi turini xohlaysiz?",
+                    reply_markup=gift_variant_choice_keyboard(claim["id"], variants),
+                )
+            except TelegramForbiddenError:
+                pass
+            message = "🎯 Sizga botning shaxsiy chatiga gift turini tanlash uchun xabar yubordik — shu yerdan tanlang!"
+            return web.json_response({"ok": True, "message": message})
+
         delivered, error = await try_auto_deliver_gift(_bot, telegram_id, item)
         if delivered:
             await update_gift_claim_status(claim["id"], "claimed_gift")
