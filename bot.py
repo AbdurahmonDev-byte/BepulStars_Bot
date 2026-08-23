@@ -726,7 +726,7 @@ async def update_gift_claim_status(claim_id: int, status: str) -> None:
 
 
 # ---------- Bitta mahsulotga bog'langan bir nechta haqiqiy gift turi ----------
-# (masalan "💝 Ayiqcha / 🧸 Panda" — foydalanuvchi sotib olganda yoki yutib
+# (masalan "💝 Ayiqcha / 🧸 Yurakcha" — foydalanuvchi sotib olganda yoki yutib
 # olganda aynan qaysi birini xohlashini o'zi tanlaydi.)
 
 async def add_gift_variant(item_id: int, tg_gift_id: str, label: str = "") -> int:
@@ -3044,7 +3044,7 @@ async def admin_tggift_set_start(call: CallbackQuery, state: FSMContext) -> None
         f"💡 Bitta gift ID — bitta qatorda yuboring (masalan: <code>abc123</code>).\n"
         f"💡 BIR NECHTA turni bog'lash uchun — har birini ALOHIDA qatorga, "
         f"xohlasangiz nomi bilan yozing:\n"
-        f"<code>abc123 💝 Ayiqcha\ndef456 🧸 Panda</code>\n"
+        f"<code>abc123 💝 Ayiqcha\ndef456 🧸 Yurakcha</code>\n"
         f"(shunda foydalanuvchi qaysi birini xohlashini o'zi tanlaydi)\n\n"
         f"O'chirish uchun <code>-</code> yozing.",
     )
