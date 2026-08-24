@@ -3812,8 +3812,11 @@ async def admin_delete_channel(call: CallbackQuery) -> None:
 async def admin_add_channel(call: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AddChannelStates.channel_id)
     await call.message.edit_text(
-        "🔗 <b>Kanal ID sini yuboring:</b>\n"
-        "(masalan: <code>-1001234567890</code>)\n"
+        "🔗 <b>Kanalni yuboring:</b>\n"
+        "Quyidagilardan birini yozing:\n"
+        "• Username: <code>@mychannel</code> yoki <code>mychannel</code>\n"
+        "• Havola: <code>https://t.me/mychannel</code>\n"
+        "• Yoki raqamli ID: <code>-1001234567890</code> (faqat yopiq/private kanallar uchun kerak)\n\n"
         "Bot kanalda admin bo'lishi kerak!",
     )
     await call.answer()
