@@ -125,6 +125,20 @@ pending_ref = {}
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+
+def safe_error_text(e: object, limit: int = 300) -> str:
+    """Python xatosini Telegram HTML xabariga xavfsiz qo'yish uchun tayyorlaydi:
+    HTML-escape qiladi (Telegram "<...>" ni noto'g'ri teg deb hisoblab, butun
+    xabarni rad etmasligi uchun) VA uzunligini cheklaydi (ba'zi xatolar,
+    masalan pydantic validatsiya xatolari, minglab belgidan iborat bo'lishi
+    mumkin — Telegram xabarlari 4096 belgidan oshsa "message is too long"
+    xatosi bilan butunlay yuborilmay qoladi)."""
+    text = str(e)
+    if len(text) > limit:
+        text = text[:limit] + "…"
+    return html.escape(text)
+
+
 router = Router()
 dp = Dispatcher()
 
@@ -836,7 +850,7 @@ async def check_subscriptions(bot: Bot, telegram_id: int, channels: list[dict]) 
                 warning_text = (
                     f"⚠️ <b>Majburiy kanal tekshiruvida xatolik!</b>\n\n"
                     f"Kanal: <code>{html.escape(str(ch['channel_id']))}</code>\n"
-                    f"Xato: <code>{html.escape(str(e))}</code>\n\n"
+                    f"Xato: <code>{safe_error_text(e)}</code>\n\n"
                     f"Sabablari:\n"
                     f"• Bot shu kanalda <b>admin</b> emas\n"
                     f"• Kanal ID/username noto'g'ri kiritilgan\n\n"
@@ -1572,7 +1586,7 @@ async def try_auto_deliver_gift(
         # buni noto'g'ri HTML teg deb hisoblab, BUTUN xabarni rad etadi va
         # keyingi urinishlar ham xuddi shu tarzda "hech narsa chiqmasdan"
         # muvaffaqiyatsiz tugaydi.
-        return False, html.escape(str(e))
+        return False, safe_error_text(e)
 
 
 def gift_variant_choice_keyboard(claim_id: int, variants: list[dict]) -> InlineKeyboardMarkup:
@@ -2875,7 +2889,7 @@ async def admin_star_balance(call: CallbackQuery, bot: Bot) -> None:
     except Exception as e:
         logger.error("Stars balansi hisoblanmadi: %s", e)
         await call.message.answer(
-            f"⚠️ Balansni hisoblab bo'lmadi: <code>{html.escape(str(e))}</code>\n\n"
+            f"⚠️ Balansni hisoblab bo'lmadi: <code>{safe_error_text(e)}</code>\n\n"
             f"Aniq balansni @BotFather → Bot Settings orqali tekshiring.",
             reply_markup=admin_keyboard(),
         )
