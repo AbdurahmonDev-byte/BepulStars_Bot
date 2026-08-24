@@ -20,6 +20,7 @@ Render uchun: WEBHOOK_URL o'rnatilsa — webhook rejimi, aks holda polling.
 import asyncio
 import hashlib
 import hmac
+import html
 import json
 import logging
 import os
@@ -799,7 +800,12 @@ _notified_bad_channels: set[str] = set()
 
 async def check_subscriptions(bot: Bot, telegram_id: int, channels: list[dict]) -> list[dict]:
     """Foydalanuvchi majburiy kanallarga a'zo ekanligini tekshiradi.
-    A'zo bo'lmagan kanallar ro'yxatini qaytaradi."""
+    A'zo bo'lmagan kanallar ro'yxatini qaytaradi.
+
+    Adminlar bu tekshiruvdan mustasno — ular botni sinash/boshqarish uchun
+    kanallarga a'zo bo'lishlari shart emas."""
+    if is_admin(telegram_id):
+        return []
     not_subscribed = []
     for ch in channels:
         chat_id = normalize_channel_id(ch["channel_id"])
@@ -829,8 +835,8 @@ async def check_subscriptions(bot: Bot, telegram_id: int, channels: list[dict]) 
                 _notified_bad_channels.add(chat_id)
                 warning_text = (
                     f"⚠️ <b>Majburiy kanal tekshiruvida xatolik!</b>\n\n"
-                    f"Kanal: <code>{ch['channel_id']}</code>\n"
-                    f"Xato: <code>{e}</code>\n\n"
+                    f"Kanal: <code>{html.escape(str(ch['channel_id']))}</code>\n"
+                    f"Xato: <code>{html.escape(str(e))}</code>\n\n"
                     f"Sabablari:\n"
                     f"• Bot shu kanalda <b>admin</b> emas\n"
                     f"• Kanal ID/username noto'g'ri kiritilgan\n\n"
@@ -1559,7 +1565,14 @@ async def try_auto_deliver_gift(
         return True, ""
     except Exception as e:
         logger.error("Avtomatik gift yuborilmadi (item=%s, user=%s): %s", item.get("name"), telegram_id, e)
-        return False, str(e)
+        # HTML-escape qilingan holda qaytariladi — chunki bu matn keyinchalik
+        # to'g'ridan-to'g'ri Telegram HTML xabarlariga qo'shiladi (masalan
+        # "<code>{error}</code>"). Escape qilinmasa, xato matni ichida "<...>"
+        # bo'lsa (masalan ba'zi Python xatolarining ichki repr'i), Telegram
+        # buni noto'g'ri HTML teg deb hisoblab, BUTUN xabarni rad etadi va
+        # keyingi urinishlar ham xuddi shu tarzda "hech narsa chiqmasdan"
+        # muvaffaqiyatsiz tugaydi.
+        return False, html.escape(str(e))
 
 
 def gift_variant_choice_keyboard(claim_id: int, variants: list[dict]) -> InlineKeyboardMarkup:
@@ -2862,7 +2875,7 @@ async def admin_star_balance(call: CallbackQuery, bot: Bot) -> None:
     except Exception as e:
         logger.error("Stars balansi hisoblanmadi: %s", e)
         await call.message.answer(
-            f"⚠️ Balansni hisoblab bo'lmadi: <code>{e}</code>\n\n"
+            f"⚠️ Balansni hisoblab bo'lmadi: <code>{html.escape(str(e))}</code>\n\n"
             f"Aniq balansni @BotFather → Bot Settings orqali tekshiring.",
             reply_markup=admin_keyboard(),
         )
