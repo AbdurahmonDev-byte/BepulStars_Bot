@@ -726,7 +726,7 @@ async def update_gift_claim_status(claim_id: int, status: str) -> None:
 
 
 # ---------- Bitta mahsulotga bog'langan bir nechta haqiqiy gift turi ----------
-# (masalan "💝 Ayiqcha / 🧸 Yurakcha" — foydalanuvchi sotib olganda yoki yutib
+# (masalan "🐻 Ayiqcha / 🧸 Panda" — foydalanuvchi sotib olganda yoki yutib
 # olganda aynan qaysi birini xohlashini o'zi tanlaydi.)
 
 async def add_gift_variant(item_id: int, tg_gift_id: str, label: str = "") -> int:
@@ -2822,14 +2822,14 @@ async def admin_star_balance(call: CallbackQuery, bot: Bot) -> None:
         return
     await call.answer("⏳ Hisoblanmoqda...")
 
-    income = 0
-    outcome = 0
-    count = 0
-    offset = 0
-    limit = 100
-    try:
+    async def _compute() -> tuple[int, int, int]:
+        income = 0
+        outcome = 0
+        count = 0
+        offset = 0
+        limit = 100
         while True:
-            result = await bot.get_star_transactions(offset=offset, limit=limit)
+            result = await bot.get_star_transactions(offset=offset, limit=limit, request_timeout=15)
             txns = result.transactions
             if not txns:
                 break
@@ -2842,6 +2842,23 @@ async def admin_star_balance(call: CallbackQuery, bot: Bot) -> None:
             if len(txns) < limit or count >= 2000:
                 break
             offset += limit
+        return income, outcome, count
+
+    try:
+        # Umumiy 30 soniyalik "zaxira" chegara — API sekin javob bersa yoki
+        # bot uyg'onayotgan (Render "sleep") bo'lsa ham, funksiya cheksiz
+        # osilib qolmasdan, albatta aniq xato bilan tugaydi.
+        income, outcome, count = await asyncio.wait_for(_compute(), timeout=30)
+    except TimeoutError:
+        logger.error("Stars balansi hisoblanmadi: 30 soniyada javob kelmadi (timeout)")
+        await call.message.answer(
+            "⚠️ Balansni hisoblab bo'lmadi: Telegram/serverdan 30 soniyada javob kelmadi.\n\n"
+            "Bir necha soniyadan keyin qayta urinib ko'ring — ba'zan Render xizmati "
+            "uyg'onayotgan bo'ladi (bepul tarifda vaqtincha 'uxlab qoladi').\n\n"
+            "Aniq balansni @BotFather → Bot Settings orqali ham tekshirishingiz mumkin.",
+            reply_markup=admin_keyboard(),
+        )
+        return
     except Exception as e:
         logger.error("Stars balansi hisoblanmadi: %s", e)
         await call.message.answer(
@@ -2852,16 +2869,22 @@ async def admin_star_balance(call: CallbackQuery, bot: Bot) -> None:
         return
 
     balance = income - outcome
-    await call.message.answer(
-        f"💰 <b>Botning haqiqiy Telegram Stars balansi</b>\n\n"
-        f"📥 Jami kirim: <b>{income} ⭐</b>\n"
-        f"📤 Jami chiqim (gift/refund): <b>{outcome} ⭐</b>\n"
-        f"➖➖➖➖➖➖➖➖➖➖\n"
-        f"💎 Joriy balans: <b>{balance} ⭐</b>\n\n"
-        f"🧾 Tekshirilgan tranzaksiyalar: {count} ta\n\n"
-        f"Aniqroq/rasmiy ma'lumot uchun: @BotFather → botingiz → Bot Settings → Payments.",
-        reply_markup=admin_keyboard(),
-    )
+    try:
+        await call.message.answer(
+            f"💰 <b>Botning haqiqiy Telegram Stars balansi</b>\n\n"
+            f"📥 Jami kirim: <b>{income} ⭐</b>\n"
+            f"📤 Jami chiqim (gift/refund): <b>{outcome} ⭐</b>\n"
+            f"➖➖➖➖➖➖➖➖➖➖\n"
+            f"💎 Joriy balans: <b>{balance} ⭐</b>\n\n"
+            f"🧾 Tekshirilgan tranzaksiyalar: {count} ta\n\n"
+            f"Aniqroq/rasmiy ma'lumot uchun: @BotFather → botingiz → Bot Settings → Payments.",
+            reply_markup=admin_keyboard(),
+        )
+    except Exception as e:
+        # Natija hisoblandi, lekin xabar yuborishning o'zi xato berdi (masalan
+        # vaqtinchalik tarmoq muammosi) — hech bo'lmasa loglarda ko'rinsin,
+        # aks holda admin hech qanday javob olmay qoladi.
+        logger.error("Stars balansi hisoblandi (%s ⭐), lekin xabar yuborilmadi: %s", balance, e)
 
 
 @router.callback_query(F.data == "admin:topup")
@@ -2978,7 +3001,7 @@ async def admin_tggifts_menu(call: CallbackQuery) -> None:
         "qo'lda bosishi shart emas). Bog'lanmagan mahsulotlar eskichasiga "
         "qo'lda tasdiqlanadi.\n\n"
         "💡 Bitta mahsulotga BIR NECHTA gift turini bog'lasangiz (masalan "
-        "\"💝/🧸\" — ikkalasi ham), foydalanuvchi sotib olganda yoki yutib "
+        "\"🐻/🧸\" — ikkalasi ham), foydalanuvchi sotib olganda yoki yutib "
         "olganda aynan qaysi birini xohlashini o'zi tanlaydi.\n\n"
         "✅ — gift ID bog'langan (bitta), ✅ (N tur) — bir nechta tur "
         "bog'langan (foydalanuvchi tanlaydi), ❌ — bog'lanmagan.\n"
@@ -3044,7 +3067,7 @@ async def admin_tggift_set_start(call: CallbackQuery, state: FSMContext) -> None
         f"💡 Bitta gift ID — bitta qatorda yuboring (masalan: <code>abc123</code>).\n"
         f"💡 BIR NECHTA turni bog'lash uchun — har birini ALOHIDA qatorga, "
         f"xohlasangiz nomi bilan yozing:\n"
-        f"<code>abc123 💝 Ayiqcha\ndef456 🧸 Yurakcha</code>\n"
+        f"<code>abc123 🐻 Ayiqcha\ndef456 🧸 Panda</code>\n"
         f"(shunda foydalanuvchi qaysi birini xohlashini o'zi tanlaydi)\n\n"
         f"O'chirish uchun <code>-</code> yozing.",
     )
