@@ -114,6 +114,7 @@ CATEGORIES = {
     "star": "⭐ Yulduz",
     "premium": "💎 Premium",
     "nft": "🖼 NFT",
+    "promo": "🎟 Promokodlar",
 }
 
 # Haqiqiy Telegram gift avtomatik yuborilganda unga qo'shiladigan sarlavha matni
@@ -369,6 +370,8 @@ async def db_init() -> None:
                 expires_at TEXT NOT NULL DEFAULT '',
                 is_active INTEGER NOT NULL DEFAULT 1,
                 used_count INTEGER NOT NULL DEFAULT 0,
+                shop_price_stars INTEGER NOT NULL DEFAULT 0,
+                shop_name TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             )
         """)
@@ -404,6 +407,8 @@ async def db_init() -> None:
             "ALTER TABLE promo_codes ADD COLUMN gift_category TEXT NOT NULL DEFAULT 'gift'",
             "ALTER TABLE promo_codes ADD COLUMN once_per_day INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE promo_codes ADD COLUMN desc_text TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE promo_codes ADD COLUMN shop_price_stars INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE promo_codes ADD COLUMN shop_name TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE promo_redemptions ADD COLUMN redeem_count INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE promo_redemptions ADD COLUMN last_redeemed_at TEXT NOT NULL DEFAULT ''",
         ):
@@ -663,6 +668,32 @@ async def get_promo_by_id(promo_id: int) -> dict | None:
         cur = await db.execute("SELECT * FROM promo_codes WHERE id = ?", (promo_id,))
         row = await cur.fetchone()
         return dict(row) if row else None
+
+
+async def get_purchasable_promo_codes() -> list[dict]:
+    """Do'konda sotiladigan promokodlar — faqat admin ATAYLAB narx VA do'kon
+    nomini qo'ygan, faol va muddati o'tmagan promokodlar chiqadi. Haqiqiy
+    `code` maydoni bu ro'yxatda HECH QACHON ishlatilmasligi kerak — aks holda
+    foydalanuvchi pullik promoni bepul kod sifatida kiritib yuborishi mumkin."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM promo_codes WHERE shop_price_stars > 0 AND shop_name != '' AND is_active = 1 ORDER BY id DESC",
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+
+    now = datetime.now()
+    result = []
+    for p in rows:
+        if p["expires_at"]:
+            try:
+                expires = datetime.strptime(p["expires_at"], "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                expires = None
+            if expires and now > expires:
+                continue
+        result.append(p)
+    return result
 
 
 async def create_promo_code(code: str, name: str) -> int:
@@ -1124,7 +1155,7 @@ def shop_categories_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for key, label in CATEGORIES.items():
         kb.button(text=label, callback_data=f"shop:{key}")
-    kb.button(text="🎟 Promokod", callback_data="promo_redeem_start")
+    kb.button(text="🔑 Promokodni kiritish", callback_data="promo_redeem_start")
     kb.button(text="🔙 Bosh menyu", callback_data="main_menu")
     kb.adjust(1)
     return kb.as_markup()
@@ -1918,41 +1949,37 @@ async def open_box_and_award(bot: Bot, box: dict, telegram_id: int, first_name: 
     }
 
 
-async def redeem_promo_code(
-    bot: Bot, telegram_id: int, first_name: str, username: str, raw_code: str,
-) -> dict:
-    """Promokodni tekshiradi va amal qilsa — uni ODDIY BOX sifatida ochadi
-    (open_box_and_award orqali, xuddi box_open_callback'dagi kabi): yulduz
-    yoki gift chiqishi mumkin, natija matni/ratio/claim_id bir xil shaklda.
-
-    Qaytaradi: {"ok": False, "error": "..."} yoki
-               {"ok": True, **open_box_and_award() natijasi}."""
-    code = (raw_code or "").strip().upper()
-    if not code:
-        return {"ok": False, "error": "❌ Promokodni kiriting!"}
-
-    promo = await get_promo_by_code(code)
-    if not promo:
-        return {"ok": False, "error": "❌ Bunday promokod topilmadi!"}
+async def _promo_eligibility_error(promo: dict, telegram_id: int) -> str | None:
+    """Promokodni HOZIR ishlatish/sotib olish mumkinmi tekshiradi (faol,
+    muddati, va bu foydalanuvchi allaqachon ishlatganmi) — mos kelmasa xato
+    matnini, aks holda None qaytaradi. Kod bepul kiritilganda ham, do'kondan
+    sotib olinganda ham bir xil ishlatiladi."""
     if not promo["is_active"]:
-        return {"ok": False, "error": "⛔ Bu promokod faolsizlantirilgan!"}
+        return "⛔ Bu promokod faolsizlantirilgan!"
     if promo["expires_at"]:
         try:
             expires = datetime.strptime(promo["expires_at"], "%Y-%m-%d %H:%M:%S")
         except ValueError:
             expires = None
         if expires and datetime.now() > expires:
-            return {"ok": False, "error": "⏰ Bu promokodning muddati tugagan!"}
+            return "⏰ Bu promokodning muddati tugagan!"
 
-    today = datetime.now().strftime("%Y-%m-%d")
     redemption = await get_promo_redemption(promo["id"], telegram_id)
     if redemption:
         if promo["once_per_day"]:
+            today = datetime.now().strftime("%Y-%m-%d")
             if redemption["last_redeemed_at"][:10] == today:
-                return {"ok": False, "error": "❌ Bu promokodni bugun ishlatgansiz! Ertaga qayta urinib ko'ring."}
+                return "❌ Bu promokodni bugun ishlatgansiz! Ertaga qayta urinib ko'ring."
         else:
-            return {"ok": False, "error": "⚠️ Siz bu promokodni allaqachon ishlatgansiz!"}
+            return "⚠️ Siz bu promokodni allaqachon ishlatgansiz!"
+    return None
 
+
+async def _award_promo(bot: Bot, promo: dict, telegram_id: int, first_name: str, username: str) -> dict:
+    """Promokodni ODDIY BOX sifatida ochadi (open_box_and_award orqali, xuddi
+    box_open_callback'dagi kabi): yulduz yoki gift chiqishi mumkin. Chaqiruvchi
+    tomonidan eligibility (_promo_eligibility_error) allaqachon tekshirilgan
+    deb hisoblanadi."""
     await upsert_promo_redemption(promo["id"], telegram_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
     box_like = {
@@ -1965,6 +1992,51 @@ async def redeem_promo_code(
     }
     result = await open_box_and_award(bot, box_like, telegram_id, first_name, username)
     return {"ok": True, **result}
+
+
+async def redeem_promo_code(
+    bot: Bot, telegram_id: int, first_name: str, username: str, raw_code: str,
+) -> dict:
+    """Foydalanuvchi qo'lda kiritgan (bepul) promokodni tekshiradi va amal
+    qilsa ochadi. Qaytaradi: {"ok": False, "error": "..."} yoki
+    {"ok": True, **open_box_and_award() natijasi}."""
+    code = (raw_code or "").strip().upper()
+    if not code:
+        return {"ok": False, "error": "❌ Promokodni kiriting!"}
+
+    promo = await get_promo_by_code(code)
+    if not promo:
+        return {"ok": False, "error": "❌ Bunday promokod topilmadi!"}
+
+    error = await _promo_eligibility_error(promo, telegram_id)
+    if error:
+        return {"ok": False, "error": error}
+
+    return await _award_promo(bot, promo, telegram_id, first_name, username)
+
+
+async def buy_promo_from_shop(
+    bot: Bot, telegram_id: int, first_name: str, username: str, promo_id: int,
+) -> dict:
+    """Do'kondan ⭐ balans evaziga promokod sotib olish — narx ayiriladi,
+    keyin xuddi bepul kod kiritilgandagidek ochiladi (bir xil eligibility
+    va bir xil mukofot mantig'i, faqat kod o'rniga to'lov orqali kirish)."""
+    promo = await get_promo_by_id(promo_id)
+    if not promo:
+        return {"ok": False, "error": "❌ Bunday mahsulot topilmadi!"}
+    if promo["shop_price_stars"] <= 0 or not promo["shop_name"]:
+        return {"ok": False, "error": "❌ Bu promokod do'konda sotilmaydi!"}
+
+    error = await _promo_eligibility_error(promo, telegram_id)
+    if error:
+        return {"ok": False, "error": error}
+
+    user = await get_user(telegram_id)
+    if not user or user["balance_stars"] < promo["shop_price_stars"]:
+        return {"ok": False, "error": f"❌ Balans yetarli emas! Kerak: {promo['shop_price_stars']} ⭐"}
+
+    await deduct_stars(telegram_id, promo["shop_price_stars"])
+    return await _award_promo(bot, promo, telegram_id, first_name, username)
 
 
 def gift_claim_keyboard(claim_id: int, price_stars: int) -> InlineKeyboardMarkup:
@@ -2403,6 +2475,24 @@ async def shop_category_callback(call: CallbackQuery) -> None:
         await call.answer()
         return
 
+    # Promokodlar bo'limi ham boshqacha — do'kondan sotib olinadigan
+    # promokodlar shop_items jadvalida emas, promo_codes jadvalida saqlanadi
+    # (haqiqiy kod matni hech qachon ko'rsatilmaydi — faqat admin qo'ygan
+    # do'kon nomi, tavsifi va narxi).
+    if category == "promo":
+        promos = await get_purchasable_promo_codes()
+        if not promos:
+            await call.answer("❌ Hozircha sotuvda promokod yo'q", show_alert=True)
+            return
+        kb = InlineKeyboardBuilder()
+        for p in promos:
+            kb.button(text=f"{p['shop_name']} — {p['shop_price_stars']} ⭐", callback_data=f"shoppromo:{p['id']}")
+        kb.button(text="🔙 Ortga", callback_data="shop")
+        kb.adjust(1)
+        await call.message.edit_text(f"{label} <b>bo'limi:</b>", reply_markup=kb.as_markup())
+        await call.answer()
+        return
+
     items = await get_shop_items(category)
 
     if not items:
@@ -2421,6 +2511,61 @@ async def shop_category_callback(call: CallbackQuery) -> None:
 
     await call.message.edit_text(f"{label} <b>bo'limi:</b>", reply_markup=kb.as_markup())
     await call.answer()
+
+
+@router.callback_query(F.data.startswith("shoppromo:"))
+async def shop_promo_detail_callback(call: CallbackQuery) -> None:
+    """Do'kondagi promokod tafsilotlari — ATAYLAB TO'LIQ EMAS: star
+    diapazoni va gift foizi ko'rsatilmaydi, aks holda foydalanuvchi eng kam
+    mukofotni ko'rib xarid qilishni xohlamasligi mumkin (marketing uchun
+    zararli). Faqat admin yozgan do'kon nomi va tavsifi ko'rsatiladi."""
+    promo_id = int(call.data.split(":")[1])
+    p = await get_promo_by_id(promo_id)
+    if not p or p["shop_price_stars"] <= 0 or not p["shop_name"]:
+        await call.answer("❌ Bu mahsulot endi mavjud emas", show_alert=True)
+        return
+
+    text = f"🎟 <b>{p['shop_name']}</b>\n\n💰 Narxi: <b>{p['shop_price_stars']} ⭐</b> (bot balansidan)"
+    if p["desc_text"]:
+        text += f"\n\n{p['desc_text']}"
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"💳 Sotib olish ({p['shop_price_stars']} ⭐)", callback_data=f"shoppromobuy:{promo_id}")
+    kb.button(text="🔙 Ortga", callback_data="shop:promo")
+    kb.adjust(1)
+    await call.message.edit_text(text, reply_markup=kb.as_markup())
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("shoppromobuy:"))
+async def shop_promo_buy_callback(call: CallbackQuery, bot: Bot) -> None:
+    """Do'kondan promokodni ⭐ balans evaziga sotib olish — narx ayiriladi
+    va promokod xuddi bepul kod kiritilgandek darhol ochiladi."""
+    promo_id = int(call.data.split(":")[1])
+    user = await get_user(call.from_user.id)
+    if not user:
+        await call.answer("❌ Avval /start ni bosing!", show_alert=True)
+        return
+
+    result = await buy_promo_from_shop(
+        bot, call.from_user.id, call.from_user.first_name, call.from_user.username, promo_id,
+    )
+    if not result["ok"]:
+        await call.answer(result["error"], show_alert=True)
+        return
+
+    await call.answer("🎉 Sotib olindi!", show_alert=False)
+    try:
+        await call.message.delete()
+    except TelegramBadRequest:
+        pass
+    if result["claim_id"]:
+        await call.message.answer(
+            result["text"],
+            reply_markup=gift_claim_keyboard(result["claim_id"], result["gift_price_stars"]),
+        )
+    else:
+        await call.message.answer(result["text"])
 
 
 @router.callback_query(F.data.startswith("item:"))
@@ -3970,6 +4115,10 @@ def promo_detail_text(p: dict) -> str:
     reuse = "✅ Ha (har kuni qayta ishlatsa bo'ladi)" if p["once_per_day"] else "❌ Yo'q (faqat 1 marta)"
     status = "✅ Faol" if p["is_active"] else "⛔ Faolsizlantirilgan"
     expiry = "♾️ Umrbod" if not p["expires_at"] else f"⏳ {p['expires_at']} gacha"
+    if p["shop_price_stars"] > 0 and p["shop_name"]:
+        shop_line = f"✅ Ha — <b>{p['shop_name']}</b>, narxi <b>{p['shop_price_stars']} ⭐</b>"
+    else:
+        shop_line = "❌ Yo'q (faqat bepul kod orqali)"
     return (
         f"🎟️ <b>{p['code']}</b>\n\n"
         f"✏️ Nomi: <b>{p['name']}</b>\n"
@@ -3979,6 +4128,7 @@ def promo_detail_text(p: dict) -> str:
         f"📂 Gift toifasi: <b>{p['gift_category']}</b>\n"
         f"🔁 Qayta ishlatish: {reuse}\n"
         f"📝 Tavsif: {p['desc_text']}\n\n"
+        f"🛍 Do'konda sotiladimi: {shop_line}\n\n"
         f"{expiry}\n"
         f"📌 Holati: <b>{status}</b>\n"
         f"👥 Ishlatilgan: <b>{p['used_count']}</b> marta\n"
@@ -3999,6 +4149,8 @@ def promo_edit_keyboard(p: dict) -> InlineKeyboardMarkup:
     kb.button(text="🔁 Qayta ishlatish", callback_data=f"admin:promodaily:{pid}")
     kb.button(text="📝 Tavsif", callback_data=f"admin:promofield:desc:{pid}")
     kb.button(text="⏳ Muddat", callback_data=f"admin:promofield:duration:{pid}")
+    kb.button(text="🛍 Do'kon narxi (⭐)", callback_data=f"admin:promofield:shopprice:{pid}")
+    kb.button(text="🏷 Do'kon nomi", callback_data=f"admin:promofield:shopname:{pid}")
     toggle_text = "⛔ Faolsizlantirish" if p["is_active"] else "✅ Faollashtirish"
     kb.button(text=toggle_text, callback_data=f"admin:promotoggle:{pid}")
     kb.button(text="🗑 O'chirish", callback_data=f"admin:promodel:{pid}")
@@ -4051,8 +4203,10 @@ PROMO_FIELD_PROMPTS = {
     "starmax": "⭐ <b>Yangi star maksimumini yozing:</b>",
     "prob": "🎁 <b>Gift tushish foizini yozing (0–100):</b>\nMasalan: 50 — 50% gift, 50% stars. 0 yozsangiz, faqat stars tushadi.",
     "pool": "🎟️ <b>Gift tanlovi sonini yozing:</b>\nDo'kondagi eng arzon shuncha giftdan biri tushadi. Masalan: 2",
-    "desc": "📝 <b>Yangi tavsifni yozing:</b>",
+    "desc": "📝 <b>Yangi tavsifni yozing:</b>\n(Bu — do'kon vitrinasida ko'rinadigan marketing matni ham bo'ladi, star diapazoni ko'rsatilmaydi.)",
     "duration": "⏳ <b>Necha kunga amal qilsin?</b>\nSon kiriting (masalan: 7). <b>0</b> yozsangiz — promokod <b>umrbod</b> (cheksiz muddatli) bo'ladi.",
+    "shopprice": "🛍 <b>Do'kondagi narxini yozing (⭐, bot balansidan):</b>\n0 yozsangiz — bu promokod do'konda sotilmaydi (faqat bepul kod orqali ishlaydi).",
+    "shopname": "🏷 <b>Do'konda ko'rinadigan nomni yozing:</b>\n(Diqqat: bu haqiqiy promokod matni emas — foydalanuvchilar buni ko'radi, xaqiqiy kod hech qachon ko'rsatilmaydi.)",
 }
 
 
@@ -4113,7 +4267,7 @@ async def promo_field_input(message: Message, state: FSMContext) -> None:
         return
 
     value = raw
-    if field in ("starmin", "starmax", "pool"):
+    if field in ("starmin", "starmax", "pool", "shopprice"):
         try:
             value = int(raw)
         except ValueError:
@@ -4153,6 +4307,8 @@ async def promo_field_input(message: Message, state: FSMContext) -> None:
         "prob": "gift_drop_prob",
         "pool": "gift_pool_size",
         "desc": "desc_text",
+        "shopprice": "shop_price_stars",
+        "shopname": "shop_name",
     }[field]
     await update_promo_code(promo_id, **{column: value})
     await state.clear()
@@ -5186,10 +5342,11 @@ const TABS = [
   { key: 'premium', label: '💎 Premium' },
   { key: 'star', label: '⭐ Yulduz' },
   { key: 'box', label: '🎰 Jekpot', jackpot: true },
+  { key: 'promo', label: '🎟 Promokod' },
   { key: 'nft', label: '🖼 NFT' },
 ];
 
-let SHOP = { items: [], boxes: [], nft: {}, settings: {} };
+let SHOP = { items: [], boxes: [], shop_promos: [], nft: {}, settings: {} };
 let USER = null;
 let ACTIVE_CAT = 'gift';
 
@@ -5350,6 +5507,20 @@ function promoCard() {
   return card;
 }
 
+function shopPromoCard(p) {
+  const card = document.createElement('div');
+  card.className = 'card jackpot promo';
+  card.innerHTML = `
+    <div class="icon-tile">🎟</div>
+    <div class="name">${p.name}</div>
+    <div class="desc">${p.desc || ''}</div>
+    <div class="price">${p.price_stars} ⭐</div>
+    <div class="btnrow"><button>💳 Sotib olish</button></div>
+  `;
+  card.querySelector('button').onclick = (e) => buyShopPromo(p.id, e.target);
+  return card;
+}
+
 function nftCard() {
   const card = document.createElement('div');
   card.className = 'banner-card';
@@ -5385,7 +5556,18 @@ function renderGrid() {
     SHOP.boxes.forEach(b => grid.appendChild(boxCard(b)));
     return;
   }
-  grid.appendChild(promoCard());
+  if (ACTIVE_CAT === 'promo') {
+    grid.appendChild(promoCard());
+    if (SHOP.shop_promos.length) {
+      SHOP.shop_promos.forEach(p => grid.appendChild(shopPromoCard(p)));
+    } else {
+      const empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = 'Hozircha sotuvda promokod yo\\'q.';
+      grid.appendChild(empty);
+    }
+    return;
+  }
   const items = SHOP.items.filter(i => i.cat === ACTIVE_CAT);
   if (!items.length) {
     const empty = document.createElement('div');
@@ -5604,6 +5786,37 @@ async function redeemPromo(code, btnEl, inputEl) {
   } finally {
     btnEl.disabled = false;
     inputEl.disabled = false;
+    btnEl.textContent = oldText;
+  }
+}
+
+async function buyShopPromo(id, btnEl) {
+  if (!INIT_DATA) { toast('Bu amal uchun botni Telegram ilovasi ichidan oching'); return; }
+  const row = btnEl.parentElement;
+  row.querySelectorAll('button').forEach(b => b.disabled = true);
+  const oldText = btnEl.textContent;
+  btnEl.textContent = 'Kutilmoqda...';
+  try {
+    const res = await fetch('/api/buy_promo', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ init_data: INIT_DATA, id }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      toast(data.error || 'Xatolik yuz berdi');
+      row.querySelectorAll('button').forEach(b => b.disabled = false);
+      btnEl.textContent = oldText;
+      return;
+    }
+    if (typeof data.ratio === 'number') {
+      await launchRocket(data.ratio, data.kind);
+    }
+    showResult(data.message, data.claim_id ? { claim_id: data.claim_id, gift_price_stars: data.gift_price_stars } : null);
+    await refreshMe();
+    await refreshShop();
+  } catch (e) {
+    toast('Tarmoq xatosi, qayta urinib ko\\'ring');
+    row.querySelectorAll('button').forEach(b => b.disabled = false);
     btnEl.textContent = oldText;
   }
 }
@@ -5981,11 +6194,22 @@ async def webapp_shop_api_handler(request):
             "once_per_day": bool(b["once_per_day"]),
         })
 
+    shop_promos = []
+    for p in await get_purchasable_promo_codes():
+        shop_promos.append({
+            "kind": "shop_promo",
+            "id": p["id"],
+            "name": p["shop_name"],
+            "desc": p["desc_text"] or "",
+            "price_stars": p["shop_price_stars"],
+        })
+
     s = await get_settings()
 
     return web.json_response({
         "items": items,
         "boxes": boxes,
+        "shop_promos": shop_promos,
         "nft": {"group_url": channel_url(s["nft_group"]) if s["nft_group"] else None},
         "settings": {"pay_card": format_card(s["pay_card"])},
         "server_date": datetime.now().strftime("%Y-%m-%d"),
@@ -6168,6 +6392,44 @@ async def webapp_redeem_promo_handler(request):
     first_name = tg_user.get("first_name", "")
     username = tg_user.get("username", "")
     result = await redeem_promo_code(_bot, telegram_id, first_name, username, code)
+    if not result["ok"]:
+        return web.json_response({"error": result["error"]}, status=400)
+
+    return web.json_response({
+        "ok": True,
+        "message": result["text"],
+        "ratio": result["ratio"],
+        "kind": result["kind"],
+        "claim_id": result["claim_id"],
+        "gift_price_stars": result["gift_price_stars"],
+    })
+
+
+async def webapp_buy_promo_handler(request):
+    """Mini App'dan do'kondagi promokodni ⭐ balans evaziga sotib olish —
+    bot-chat'dagi shop_promo_buy_callback bilan bir xil markazlashgan
+    buy_promo_from_shop() funksiyasidan foydalanadi."""
+    if _bot is None:
+        return web.json_response({"error": "Bot hali tayyor emas"}, status=503)
+
+    tg_user, user = await _webapp_identify(request)
+    if not user:
+        return web.json_response({"error": "Foydalanuvchi aniqlanmadi — botni Telegram ichidan oching"}, status=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Noto'g'ri so'rov"}, status=400)
+
+    try:
+        promo_id = int(body.get("id"))
+    except (TypeError, ValueError):
+        return web.json_response({"error": "Noto'g'ri so'rov"}, status=400)
+
+    telegram_id = int(tg_user["id"])
+    first_name = tg_user.get("first_name", "")
+    username = tg_user.get("username", "")
+    result = await buy_promo_from_shop(_bot, telegram_id, first_name, username, promo_id)
     if not result["ok"]:
         return web.json_response({"error": result["error"]}, status=400)
 
@@ -6462,6 +6724,7 @@ def register_webapp_routes(app: "web.Application") -> None:
     app.router.add_post("/api/upload_proof", webapp_upload_proof_handler)
     app.router.add_post("/api/gift_claim", webapp_gift_claim_handler)
     app.router.add_post("/api/redeem_promo", webapp_redeem_promo_handler)
+    app.router.add_post("/api/buy_promo", webapp_buy_promo_handler)
 
 
 # ============================================================
