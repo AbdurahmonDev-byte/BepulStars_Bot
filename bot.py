@@ -206,10 +206,10 @@ class PromoRedeemStates(StatesGroup):
 
 
 class PromoAdminStates(StatesGroup):
-    """Admin yangi promokod yaratish bosqichlari: kod -> mukofot -> muddat."""
+    """Admin promokod yaratishi (kod) va uning box-sozlamalarini
+    tahrirlashi (bitta maydonni kiritish — oddiy box tahrirlash bilan bir xil)."""
     new_code = State()
-    new_reward = State()
-    new_duration = State()
+    field_input = State()
 
 
 class TopupStates(StatesGroup):
@@ -358,7 +358,14 @@ async def db_init() -> None:
             CREATE TABLE IF NOT EXISTS promo_codes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 code TEXT UNIQUE NOT NULL,
-                reward_stars INTEGER NOT NULL DEFAULT 0,
+                name TEXT NOT NULL DEFAULT '',
+                star_min INTEGER NOT NULL DEFAULT 0,
+                star_max INTEGER NOT NULL DEFAULT 10,
+                gift_drop_prob REAL NOT NULL DEFAULT 0.0,
+                gift_pool_size INTEGER NOT NULL DEFAULT 1,
+                gift_category TEXT NOT NULL DEFAULT 'gift',
+                once_per_day INTEGER NOT NULL DEFAULT 0,
+                desc_text TEXT NOT NULL DEFAULT '',
                 expires_at TEXT NOT NULL DEFAULT '',
                 is_active INTEGER NOT NULL DEFAULT 1,
                 used_count INTEGER NOT NULL DEFAULT 0,
@@ -370,7 +377,8 @@ async def db_init() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 promo_id INTEGER NOT NULL,
                 telegram_id INTEGER NOT NULL,
-                redeemed_at TEXT NOT NULL,
+                redeem_count INTEGER NOT NULL DEFAULT 0,
+                last_redeemed_at TEXT NOT NULL DEFAULT '',
                 UNIQUE(promo_id, telegram_id)
             )
         """)
@@ -388,6 +396,16 @@ async def db_init() -> None:
             "ALTER TABLE boxes ADD COLUMN cost_tgstars INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE shop_items ADD COLUMN tg_gift_id TEXT DEFAULT ''",
             "ALTER TABLE settings ADD COLUMN gift_caption TEXT DEFAULT ''",
+            "ALTER TABLE promo_codes ADD COLUMN name TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE promo_codes ADD COLUMN star_min INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE promo_codes ADD COLUMN star_max INTEGER NOT NULL DEFAULT 10",
+            "ALTER TABLE promo_codes ADD COLUMN gift_drop_prob REAL NOT NULL DEFAULT 0.0",
+            "ALTER TABLE promo_codes ADD COLUMN gift_pool_size INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE promo_codes ADD COLUMN gift_category TEXT NOT NULL DEFAULT 'gift'",
+            "ALTER TABLE promo_codes ADD COLUMN once_per_day INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE promo_codes ADD COLUMN desc_text TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE promo_redemptions ADD COLUMN redeem_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE promo_redemptions ADD COLUMN last_redeemed_at TEXT NOT NULL DEFAULT ''",
         ):
             try:
                 await db.execute(alter_sql)
@@ -618,6 +636,10 @@ async def pick_shop_gifts(category: str, pool_size: int) -> list[dict]:
 
 
 # ---------- Promokodlar ----------
+# Har bir promokod — aslida ALOHIDA "box" (o'ziga xos star diapazoni, gift
+# foizi, gift toifasi va h.k. bilan), faqat pul/⭐ evaziga emas, admin bergan
+# kod evaziga ochiladi. Shu sababli sozlamalari ham oddiy boxlarniki bilan
+# bir xil (pastdagi admin bo'limiga qarang).
 
 async def get_all_promo_codes() -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -643,12 +665,24 @@ async def get_promo_by_id(promo_id: int) -> dict | None:
         return dict(row) if row else None
 
 
-async def create_promo_code(code: str, reward_stars: int, expires_at: str) -> None:
+async def create_promo_code(code: str, name: str) -> int:
+    """Yangi promokodni standart (oddiy box'dagidek) sozlamalar bilan
+    yaratadi — keyin admin uni xuddi box kabi (star diapazoni, gift foizi,
+    muddati va h.k.) moslashtiradi."""
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO promo_codes (code, reward_stars, expires_at, created_at) VALUES (?, ?, ?, ?)",
-            (code, reward_stars, expires_at, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        cur = await db.execute(
+            "INSERT INTO promo_codes (code, name, created_at) VALUES (?, ?, ?)",
+            (code, name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def update_promo_code(promo_id: int, **kwargs) -> None:
+    keys = ", ".join(f"{k} = ?" for k in kwargs)
+    vals = list(kwargs.values())
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(f"UPDATE promo_codes SET {keys} WHERE id = ?", vals + [promo_id])
         await db.commit()
 
 
@@ -665,75 +699,30 @@ async def delete_promo_code(promo_id: int) -> None:
         await db.commit()
 
 
-async def has_redeemed_promo(promo_id: int, telegram_id: int) -> bool:
+async def get_promo_redemption(promo_id: int, telegram_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT 1 FROM promo_redemptions WHERE promo_id = ? AND telegram_id = ?",
+            "SELECT * FROM promo_redemptions WHERE promo_id = ? AND telegram_id = ?",
             (promo_id, telegram_id),
         )
         row = await cur.fetchone()
-        return row is not None
+        return dict(row) if row else None
 
 
-async def record_promo_redemption(promo_id: int, telegram_id: int) -> bool:
-    """Promokodni ushbu foydalanuvchi uchun "ishlatilgan" deb belgilaydi.
-
-    UNIQUE(promo_id, telegram_id) cheklovi tufayli bir xil foydalanuvchi
-    bitta kodni ikki marta ishlata olmaydi — poyga holatida ham xavfsiz."""
+async def upsert_promo_redemption(promo_id: int, telegram_id: int, when: str) -> None:
+    """Foydalanuvchi shu promokodni ishlatganini belgilaydi (yoki, kunlik
+    qayta ishlatishga ruxsat berilgan bo'lsa, sanasini yangilaydi)."""
     async with aiosqlite.connect(DB_PATH) as db:
-        try:
-            await db.execute(
-                "INSERT INTO promo_redemptions (promo_id, telegram_id, redeemed_at) VALUES (?, ?, ?)",
-                (promo_id, telegram_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-            )
-        except Exception:
-            return False
+        await db.execute(
+            "INSERT INTO promo_redemptions (promo_id, telegram_id, redeem_count, last_redeemed_at) "
+            "VALUES (?, ?, 1, ?) "
+            "ON CONFLICT(promo_id, telegram_id) DO UPDATE SET "
+            "redeem_count = redeem_count + 1, last_redeemed_at = excluded.last_redeemed_at",
+            (promo_id, telegram_id, when),
+        )
         await db.execute("UPDATE promo_codes SET used_count = used_count + 1 WHERE id = ?", (promo_id,))
         await db.commit()
-        return True
-
-
-async def redeem_promo_code(telegram_id: int, raw_code: str) -> dict:
-    """Promokodni tekshiradi va amal qilsa mukofotni beradi.
-
-    Qaytaradi: {"ok": True, "text": ..., "reward": N, "ratio": 0..1}
-            yoki {"ok": False, "error": "..."}"""
-    code = (raw_code or "").strip().upper()
-    if not code:
-        return {"ok": False, "error": "❌ Promokodni kiriting!"}
-
-    promo = await get_promo_by_code(code)
-    if not promo:
-        return {"ok": False, "error": "❌ Bunday promokod topilmadi!"}
-    if not promo["is_active"]:
-        return {"ok": False, "error": "⛔ Bu promokod faolsizlantirilgan!"}
-    if promo["expires_at"]:
-        try:
-            expires = datetime.strptime(promo["expires_at"], "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            expires = None
-        if expires and datetime.now() > expires:
-            return {"ok": False, "error": "⏰ Bu promokodning muddati tugagan!"}
-
-    if await has_redeemed_promo(promo["id"], telegram_id):
-        return {"ok": False, "error": "⚠️ Siz bu promokodni allaqachon ishlatgansiz!"}
-
-    if not await record_promo_redemption(promo["id"], telegram_id):
-        return {"ok": False, "error": "⚠️ Siz bu promokodni allaqachon ishlatgansiz!"}
-
-    await add_stars(telegram_id, promo["reward_stars"])
-    ratio = round(min(0.95, 0.15 + promo["reward_stars"] / 200), 3)
-
-    return {
-        "ok": True,
-        "reward": promo["reward_stars"],
-        "ratio": ratio,
-        "text": (
-            f"🎟️ <b>Promokod qabul qilindi!</b>\n\n"
-            f"⭐ Mukofot: <b>+{promo['reward_stars']} ⭐</b>\n\n"
-            f"Yulduzlar hisobingizga qo'shildi!"
-        ),
-    }
 
 
 # ---------- Majburiy kanallar ----------
@@ -1135,6 +1124,7 @@ def shop_categories_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for key, label in CATEGORIES.items():
         kb.button(text=label, callback_data=f"shop:{key}")
+    kb.button(text="🎟 Promokod", callback_data="promo_redeem_start")
     kb.button(text="🔙 Bosh menyu", callback_data="main_menu")
     kb.adjust(1)
     return kb.as_markup()
@@ -1680,7 +1670,7 @@ async def show_boxes(answer_func, telegram_id: int, result_text: str | None = No
                 line = f"{line}\n(Kuniga 1 marta)"
         text += f"{line}\n\n"
 
-    text += "🎟️ <b>Promokod box</b> — admin bergan promokodni kiritib bepul ⭐ yutib oling!\n\n"
+    text += "🎟️ <b>Promokod box</b> — admin bergan promokodni kiriting, u ham oddiy box kabi ⭐ yoki gift beradi, lekin bepul!\n\n"
 
     if user:
         text += f"💰 Balansingiz: <b>{user['balance_stars']} ⭐</b>"
@@ -1713,19 +1703,25 @@ async def promo_redeem_start(call: CallbackQuery, state: FSMContext) -> None:
 async def promo_redeem_cancel(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await call.answer()
-    await show_boxes(call.message.edit_text, call.from_user.id)
+    try:
+        await call.message.edit_text("❌ Bekor qilindi.")
+    except TelegramBadRequest:
+        pass
 
 
 @router.message(PromoRedeemStates.code)
-async def promo_redeem_input(message: Message, state: FSMContext) -> None:
+async def promo_redeem_input(message: Message, state: FSMContext, bot: Bot) -> None:
     await state.clear()
-    result = await redeem_promo_code(message.from_user.id, message.text or "")
+    result = await redeem_promo_code(
+        bot, message.from_user.id, message.from_user.first_name, message.from_user.username, message.text or "",
+    )
     if not result["ok"]:
         await message.answer(result["error"])
-        await show_boxes(message.answer, message.from_user.id)
         return
-    await message.answer(result["text"])
-    await show_boxes(message.answer, message.from_user.id)
+    if result["claim_id"]:
+        await message.answer(result["text"], reply_markup=gift_claim_keyboard(result["claim_id"], result["gift_price_stars"]))
+    else:
+        await message.answer(result["text"])
 
 
 async def try_auto_deliver_gift(
@@ -1920,6 +1916,55 @@ async def open_box_and_award(bot: Bot, box: dict, telegram_id: int, first_name: 
         "gift_name": prize["gifts"][0]["name"] if prize["kind"] == "gifts" else None,
         "gift_price_stars": prize["gifts"][0]["price_stars"] if prize["kind"] == "gifts" else None,
     }
+
+
+async def redeem_promo_code(
+    bot: Bot, telegram_id: int, first_name: str, username: str, raw_code: str,
+) -> dict:
+    """Promokodni tekshiradi va amal qilsa — uni ODDIY BOX sifatida ochadi
+    (open_box_and_award orqali, xuddi box_open_callback'dagi kabi): yulduz
+    yoki gift chiqishi mumkin, natija matni/ratio/claim_id bir xil shaklda.
+
+    Qaytaradi: {"ok": False, "error": "..."} yoki
+               {"ok": True, **open_box_and_award() natijasi}."""
+    code = (raw_code or "").strip().upper()
+    if not code:
+        return {"ok": False, "error": "❌ Promokodni kiriting!"}
+
+    promo = await get_promo_by_code(code)
+    if not promo:
+        return {"ok": False, "error": "❌ Bunday promokod topilmadi!"}
+    if not promo["is_active"]:
+        return {"ok": False, "error": "⛔ Bu promokod faolsizlantirilgan!"}
+    if promo["expires_at"]:
+        try:
+            expires = datetime.strptime(promo["expires_at"], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            expires = None
+        if expires and datetime.now() > expires:
+            return {"ok": False, "error": "⏰ Bu promokodning muddati tugagan!"}
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    redemption = await get_promo_redemption(promo["id"], telegram_id)
+    if redemption:
+        if promo["once_per_day"]:
+            if redemption["last_redeemed_at"][:10] == today:
+                return {"ok": False, "error": "❌ Bu promokodni bugun ishlatgansiz! Ertaga qayta urinib ko'ring."}
+        else:
+            return {"ok": False, "error": "⚠️ Siz bu promokodni allaqachon ishlatgansiz!"}
+
+    await upsert_promo_redemption(promo["id"], telegram_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    box_like = {
+        "name": promo["name"] or f"🎟️ {promo['code']}",
+        "star_min": promo["star_min"],
+        "star_max": promo["star_max"],
+        "gift_drop_prob": promo["gift_drop_prob"],
+        "gift_pool_size": promo["gift_pool_size"],
+        "gift_category": promo["gift_category"],
+    }
+    result = await open_box_and_award(bot, box_like, telegram_id, first_name, username)
+    return {"ok": True, **result}
 
 
 def gift_claim_keyboard(claim_id: int, price_stars: int) -> InlineKeyboardMarkup:
@@ -3915,13 +3960,25 @@ async def admin_box_daily(call: CallbackQuery) -> None:
 
 
 # ---------- Promokodlar boshqaruvi ----------
+# Har bir promokod — aslida alohida "box": xuddi admin:boxes bilan bir xil
+# sozlamalar (star diapazoni, gift foizi, gift soni, gift toifasi, kunlik
+# cheklov, tavsif), faqat qo'shimcha ravishda kod matni, faol/faolsiz holati
+# va muddati (umrbod yoki N kun) bilan.
 
 def promo_detail_text(p: dict) -> str:
+    prob = f"{p['gift_drop_prob'] * 100:.0f}%"
+    reuse = "✅ Ha (har kuni qayta ishlatsa bo'ladi)" if p["once_per_day"] else "❌ Yo'q (faqat 1 marta)"
     status = "✅ Faol" if p["is_active"] else "⛔ Faolsizlantirilgan"
     expiry = "♾️ Umrbod" if not p["expires_at"] else f"⏳ {p['expires_at']} gacha"
     return (
         f"🎟️ <b>{p['code']}</b>\n\n"
-        f"⭐ Mukofot: <b>{p['reward_stars']} ⭐</b>\n"
+        f"✏️ Nomi: <b>{p['name']}</b>\n"
+        f"⭐ Star diapazoni: <b>{p['star_min']}–{p['star_max']}</b>\n"
+        f"🎁 Gift tushish foizi: <b>{prob}</b>\n"
+        f"🎟️ Gift tanlovi: eng arzon <b>{p['gift_pool_size']}</b> tasidan biri\n"
+        f"📂 Gift toifasi: <b>{p['gift_category']}</b>\n"
+        f"🔁 Qayta ishlatish: {reuse}\n"
+        f"📝 Tavsif: {p['desc_text']}\n\n"
         f"{expiry}\n"
         f"📌 Holati: <b>{status}</b>\n"
         f"👥 Ishlatilgan: <b>{p['used_count']}</b> marta\n"
@@ -3930,12 +3987,23 @@ def promo_detail_text(p: dict) -> str:
 
 
 def promo_edit_keyboard(p: dict) -> InlineKeyboardMarkup:
+    pid = p["id"]
     kb = InlineKeyboardBuilder()
+    kb.button(text="✏️ Kod", callback_data=f"admin:promofield:code:{pid}")
+    kb.button(text="✏️ Nom", callback_data=f"admin:promofield:name:{pid}")
+    kb.button(text="⭐ Star min", callback_data=f"admin:promofield:starmin:{pid}")
+    kb.button(text="⭐ Star max", callback_data=f"admin:promofield:starmax:{pid}")
+    kb.button(text="🎁 Gift foizi %", callback_data=f"admin:promofield:prob:{pid}")
+    kb.button(text="🎟️ Gift soni (N)", callback_data=f"admin:promofield:pool:{pid}")
+    kb.button(text="📂 Gift toifasi", callback_data=f"admin:promocat:{pid}")
+    kb.button(text="🔁 Qayta ishlatish", callback_data=f"admin:promodaily:{pid}")
+    kb.button(text="📝 Tavsif", callback_data=f"admin:promofield:desc:{pid}")
+    kb.button(text="⏳ Muddat", callback_data=f"admin:promofield:duration:{pid}")
     toggle_text = "⛔ Faolsizlantirish" if p["is_active"] else "✅ Faollashtirish"
-    kb.button(text=toggle_text, callback_data=f"admin:promotoggle:{p['id']}")
-    kb.button(text="🗑 O'chirish", callback_data=f"admin:promodel:{p['id']}")
+    kb.button(text=toggle_text, callback_data=f"admin:promotoggle:{pid}")
+    kb.button(text="🗑 O'chirish", callback_data=f"admin:promodel:{pid}")
     kb.button(text="🔙 Ortga", callback_data="admin:promo")
-    kb.adjust(1)
+    kb.adjust(2)
     return kb.as_markup()
 
 
@@ -3944,11 +4012,11 @@ async def _promo_list_render() -> tuple[str, InlineKeyboardMarkup]:
     kb = InlineKeyboardBuilder()
     for p in promos:
         emoji = "✅" if p["is_active"] else "⛔"
-        kb.button(text=f"{emoji} {p['code']} — {p['reward_stars']}⭐", callback_data=f"admin:promoview:{p['id']}")
+        kb.button(text=f"{emoji} {p['code']} — {p['star_min']}–{p['star_max']}⭐", callback_data=f"admin:promoview:{p['id']}")
     kb.button(text="➕ Yangi promokod", callback_data="admin:promoadd")
     kb.button(text="🔙 Ortga", callback_data="admin")
     kb.adjust(1)
-    text = "🎟 <b>Promokodlar boshqaruvi</b>\n\nMavjud promokodlar:" if promos else "🎟 <b>Promokodlar boshqaruvi</b>\n\nHozircha promokod yo'q."
+    text = "🎟 <b>Promokodlar boshqaruvi</b>\n\nJoriy promokodlar (✅ faol / ⛔ faolsiz):" if promos else "🎟 <b>Promokodlar boshqaruvi</b>\n\nHozircha promokod yo'q."
     return text, kb.as_markup()
 
 
@@ -3974,6 +4042,167 @@ async def admin_promo_view(call: CallbackQuery) -> None:
         return
     await call.message.edit_text(promo_detail_text(p), reply_markup=promo_edit_keyboard(p))
     await call.answer()
+
+
+PROMO_FIELD_PROMPTS = {
+    "code": "✏️ <b>Yangi promokod matnini yozing:</b>",
+    "name": "✏️ <b>Yangi nomni yozing:</b>",
+    "starmin": "⭐ <b>Yangi star minimumini yozing:</b>",
+    "starmax": "⭐ <b>Yangi star maksimumini yozing:</b>",
+    "prob": "🎁 <b>Gift tushish foizini yozing (0–100):</b>\nMasalan: 50 — 50% gift, 50% stars. 0 yozsangiz, faqat stars tushadi.",
+    "pool": "🎟️ <b>Gift tanlovi sonini yozing:</b>\nDo'kondagi eng arzon shuncha giftdan biri tushadi. Masalan: 2",
+    "desc": "📝 <b>Yangi tavsifni yozing:</b>",
+    "duration": "⏳ <b>Necha kunga amal qilsin?</b>\nSon kiriting (masalan: 7). <b>0</b> yozsangiz — promokod <b>umrbod</b> (cheksiz muddatli) bo'ladi.",
+}
+
+
+@router.callback_query(F.data.startswith("admin:promofield:"))
+async def admin_promo_field(call: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    parts = call.data.split(":")
+    field = parts[2]
+    promo_id = int(parts[3])
+    await state.set_state(PromoAdminStates.field_input)
+    await state.update_data(promo_id=promo_id, field=field)
+    await call.message.edit_text(PROMO_FIELD_PROMPTS.get(field, "✏️ Qiymatni yozing:"))
+    await call.answer()
+
+
+@router.message(PromoAdminStates.field_input)
+async def promo_field_input(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        await message.answer("❌ Siz admin emassiz!")
+        return
+    data = await state.get_data()
+    promo_id = data.get("promo_id")
+    field = data.get("field")
+    raw = message.text.strip()
+
+    if field == "duration":
+        try:
+            days = int(raw)
+        except ValueError:
+            await message.answer("❌ Iltimos, butun son kiriting!")
+            return
+        if days < 0:
+            await message.answer("❌ Manfiy bo'lishi mumkin emas!")
+            return
+        expires_at = "" if days == 0 else (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        await update_promo_code(promo_id, expires_at=expires_at)
+        await state.clear()
+        p = await get_promo_by_id(promo_id)
+        await message.answer(promo_detail_text(p), reply_markup=promo_edit_keyboard(p))
+        return
+
+    if field == "code":
+        code = raw.upper()
+        if not code or len(code) < 3:
+            await message.answer("❌ Promokod kamida 3 ta belgidan iborat bo'lishi kerak!")
+            return
+        existing = await get_promo_by_code(code)
+        if existing and existing["id"] != promo_id:
+            await message.answer("❌ Bu promokod allaqachon mavjud! Boshqa kod yozing:")
+            return
+        await update_promo_code(promo_id, code=code)
+        await state.clear()
+        p = await get_promo_by_id(promo_id)
+        await message.answer(promo_detail_text(p), reply_markup=promo_edit_keyboard(p))
+        return
+
+    value = raw
+    if field in ("starmin", "starmax", "pool"):
+        try:
+            value = int(raw)
+        except ValueError:
+            await message.answer("❌ Iltimos, butun son kiriting!")
+            return
+        if value < 0:
+            await message.answer("❌ Manfiy bo'lishi mumkin emas!")
+            return
+        if field == "pool" and value < 1:
+            await message.answer("❌ Kamida 1 bo'lishi kerak!")
+            return
+    elif field == "prob":
+        try:
+            value = float(raw.replace("%", "").replace(",", "."))
+        except ValueError:
+            await message.answer("❌ Iltimos, son kiriting (0–100)!")
+            return
+        if value < 0 or value > 100:
+            await message.answer("❌ Foiz 0 dan 100 gacha bo'lishi kerak!")
+            return
+        value = value / 100.0
+    else:
+        if len(raw) < 1:
+            await message.answer("❌ Bo'sh bo'lishi mumkin emas!")
+            return
+
+    if field == "starmax":
+        p = await get_promo_by_id(promo_id)
+        if p and value < p["star_min"]:
+            await message.answer("❌ Star max, star min dan kichik bo'lishi mumkin emas!")
+            return
+
+    column = {
+        "name": "name",
+        "starmin": "star_min",
+        "starmax": "star_max",
+        "prob": "gift_drop_prob",
+        "pool": "gift_pool_size",
+        "desc": "desc_text",
+    }[field]
+    await update_promo_code(promo_id, **{column: value})
+    await state.clear()
+
+    p = await get_promo_by_id(promo_id)
+    await message.answer(promo_detail_text(p), reply_markup=promo_edit_keyboard(p))
+
+
+@router.callback_query(F.data.startswith("admin:promocat:"))
+async def admin_promo_cat(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    promo_id = int(call.data.split(":")[2])
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🎁 Gift", callback_data=f"admin:promocatset:{promo_id}:gift")
+    kb.button(text="💎 Premium", callback_data=f"admin:promocatset:{promo_id}:premium")
+    kb.button(text="🔙 Ortga", callback_data=f"admin:promoview:{promo_id}")
+    kb.adjust(2)
+    await call.message.edit_text("📂 <b>Gift toifasini tanlang:</b>", reply_markup=kb.as_markup())
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin:promocatset:"))
+async def admin_promo_catset(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    parts = call.data.split(":")
+    promo_id, cat = int(parts[2]), parts[3]
+    await update_promo_code(promo_id, gift_category=cat)
+    p = await get_promo_by_id(promo_id)
+    await call.message.edit_text(promo_detail_text(p), reply_markup=promo_edit_keyboard(p))
+    await call.answer("✅ Saqlandi!", show_alert=False)
+
+
+@router.callback_query(F.data.startswith("admin:promodaily:"))
+async def admin_promo_daily(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    promo_id = int(call.data.split(":")[2])
+    p = await get_promo_by_id(promo_id)
+    if not p:
+        await call.answer("❌ Promokod topilmadi!", show_alert=True)
+        return
+    await update_promo_code(promo_id, once_per_day=0 if p["once_per_day"] else 1)
+    p = await get_promo_by_id(promo_id)
+    await call.message.edit_text(promo_detail_text(p), reply_markup=promo_edit_keyboard(p))
+    await call.answer("✅ Saqlandi!", show_alert=False)
 
 
 @router.callback_query(F.data.startswith("admin:promotoggle:"))
@@ -4041,66 +4270,13 @@ async def admin_promo_add_code(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Bu promokod allaqachon mavjud! Boshqa kod yozing:")
         return
 
-    await state.update_data(code=code)
-    await state.set_state(PromoAdminStates.new_reward)
-    await message.answer(f"✅ Kod: <code>{code}</code>\n\n💰 Necha ⭐ mukofot berilsin?")
-
-
-@router.message(PromoAdminStates.new_reward)
-async def admin_promo_add_reward(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
-        await state.clear()
-        await message.answer("❌ Siz admin emassiz!")
-        return
-    try:
-        reward = int((message.text or "").strip())
-    except ValueError:
-        await message.answer("❌ Iltimos, butun son kiriting!")
-        return
-    if reward <= 0:
-        await message.answer("❌ Mukofot musbat son bo'lishi kerak!")
-        return
-
-    await state.update_data(reward=reward)
-    await state.set_state(PromoAdminStates.new_duration)
-    await message.answer(
-        "⏳ <b>Necha kunga amal qilsin?</b>\n\n"
-        "Son kiriting (masalan: 7). <b>0</b> yozsangiz — promokod <b>umrbod</b> (cheksiz muddatli) bo'ladi.",
-    )
-
-
-@router.message(PromoAdminStates.new_duration)
-async def admin_promo_add_duration(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
-        await state.clear()
-        await message.answer("❌ Siz admin emassiz!")
-        return
-    try:
-        days = int((message.text or "").strip())
-    except ValueError:
-        await message.answer("❌ Iltimos, butun son kiriting!")
-        return
-    if days < 0:
-        await message.answer("❌ Manfiy bo'lishi mumkin emas!")
-        return
-
-    data = await state.get_data()
-    code = data["code"]
-    reward = data["reward"]
-    expires_at = "" if days == 0 else (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-
-    await create_promo_code(code, reward, expires_at)
     await state.clear()
-
-    duration_line = "♾️ Umrbod" if days == 0 else f"⏳ {days} kun ({expires_at} gacha)"
+    promo_id = await create_promo_code(code, f"🎟️ {code}")
+    p = await get_promo_by_id(promo_id)
     await message.answer(
-        f"✅ <b>Promokod yaratildi!</b>\n\n"
-        f"🎟️ Kod: <code>{code}</code>\n"
-        f"⭐ Mukofot: <b>{reward} ⭐</b>\n"
-        f"{duration_line}",
+        f"✅ <b>Promokod yaratildi!</b> Endi uni xuddi oddiy box kabi sozlang 👇",
     )
-    text, markup = await _promo_list_render()
-    await message.answer(text, reply_markup=markup)
+    await message.answer(promo_detail_text(p), reply_markup=promo_edit_keyboard(p))
 
 
 # ---------- Rassilka ----------
@@ -5209,9 +5385,13 @@ function renderGrid() {
     SHOP.boxes.forEach(b => grid.appendChild(boxCard(b)));
     return;
   }
+  grid.appendChild(promoCard());
   const items = SHOP.items.filter(i => i.cat === ACTIVE_CAT);
   if (!items.length) {
-    grid.innerHTML = '<div class="empty">Bu bo\\'limda hozircha mahsulot yo\\'q.</div>';
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'Bu bo\\'limda hozircha mahsulot yo\\'q.';
+    grid.appendChild(empty);
     return;
   }
   items.forEach(i => grid.appendChild(itemCard(i)));
@@ -5415,9 +5595,10 @@ async function redeemPromo(code, btnEl, inputEl) {
     if (typeof data.ratio === 'number') {
       await launchRocket(data.ratio, data.kind);
     }
-    showResult(data.message, null);
+    showResult(data.message, data.claim_id ? { claim_id: data.claim_id, gift_price_stars: data.gift_price_stars } : null);
     inputEl.value = '';
     await refreshMe();
+    await refreshShop();
   } catch (e) {
     toast('Tarmoq xatosi, qayta urinib ko\\'ring');
   } finally {
@@ -5970,6 +6151,9 @@ async def webapp_buy_balance_handler(request):
 async def webapp_redeem_promo_handler(request):
     """Mini App'dan promokod kiritish — bot-chat'dagi promo_redeem_input bilan
     bir xil markazlashgan redeem_promo_code() funksiyasidan foydalanadi."""
+    if _bot is None:
+        return web.json_response({"error": "Bot hali tayyor emas"}, status=503)
+
     tg_user, user = await _webapp_identify(request)
     if not user:
         return web.json_response({"error": "Foydalanuvchi aniqlanmadi — botni Telegram ichidan oching"}, status=401)
@@ -5980,7 +6164,10 @@ async def webapp_redeem_promo_handler(request):
         return web.json_response({"error": "Noto'g'ri so'rov"}, status=400)
 
     code = str(body.get("code") or "")
-    result = await redeem_promo_code(int(tg_user["id"]), code)
+    telegram_id = int(tg_user["id"])
+    first_name = tg_user.get("first_name", "")
+    username = tg_user.get("username", "")
+    result = await redeem_promo_code(_bot, telegram_id, first_name, username, code)
     if not result["ok"]:
         return web.json_response({"error": result["error"]}, status=400)
 
@@ -5988,7 +6175,9 @@ async def webapp_redeem_promo_handler(request):
         "ok": True,
         "message": result["text"],
         "ratio": result["ratio"],
-        "kind": "stars",
+        "kind": result["kind"],
+        "claim_id": result["claim_id"],
+        "gift_price_stars": result["gift_price_stars"],
     })
 
 
