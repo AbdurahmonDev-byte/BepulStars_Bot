@@ -4505,13 +4505,54 @@ async def admin_channels(call: CallbackQuery) -> None:
 
     kb = InlineKeyboardBuilder()
     for ch in channels:
+        kb.button(text=f"🔍 {ch['channel_id']}", callback_data=f"admin:chcheck:{ch['id']}")
         kb.button(text=f"🗑️ {ch['invite_link'][:30]}", callback_data=f"admin:chdel:{ch['id']}")
     kb.button(text="➕ Kanal qo'shish", callback_data="admin:channel_add")
     kb.button(text="🔙 Ortga", callback_data="admin")
-    kb.adjust(1)
+    kb.adjust(2)
 
     await call.message.edit_text(text, reply_markup=kb.as_markup())
     await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin:chcheck:"))
+async def admin_check_channel(call: CallbackQuery, bot: Bot) -> None:
+    """Botning shu kanalda ADMIN ekanligini darhol tekshiradi — "obuna
+    bo'lsa ham obuna emas deyapti" xatosining asosiy sababi (bot admin emas
+    yoki kanal ID xato) shu yerda haqiqiy foydalanuvchi kutmasdan aniqlanadi."""
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    row_id = int(call.data.split(":")[2])
+    channels = await get_channels()
+    ch = next((c for c in channels if c["id"] == row_id), None)
+    if not ch:
+        await call.answer("❌ Kanal topilmadi!", show_alert=True)
+        return
+
+    chat_id = normalize_channel_id(ch["channel_id"])
+    try:
+        me = await bot.me()
+        member = await bot.get_chat_member(chat_id, me.id)
+        if member.status == ChatMemberStatus.ADMINISTRATOR:
+            result = "✅ Hammasi joyida — bot bu kanalda <b>admin</b>, a'zolik tekshiruvi ishlaydi."
+        elif member.status == ChatMemberStatus.CREATOR:
+            result = "✅ Hammasi joyida — bot bu kanalning egasi, a'zolik tekshiruvi ishlaydi."
+        else:
+            result = (
+                f"❌ Bot bu kanalda admin EMAS (holati: <code>{member.status}</code>)!\n\n"
+                f"Botni kanalga <b>admin</b> qilib qo'shing, aks holda a'zolik hech qachon "
+                f"to'g'ri tekshirilmaydi."
+            )
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        result = (
+            f"❌ Kanalni tekshirib bo'lmadi: <code>{safe_error_text(e)}</code>\n\n"
+            f"Ehtimol: kanal ID/username noto'g'ri kiritilgan, yoki bot bu kanalga "
+            f"umuman qo'shilmagan. Kanal ID: <code>{chat_id}</code>"
+        )
+
+    await call.answer()
+    await call.message.answer(f"🔍 <b>{ch['channel_id']}</b>\n\n{result}")
 
 
 @router.callback_query(F.data.startswith("admin:chdel:"))
@@ -4539,6 +4580,27 @@ async def admin_add_channel(call: CallbackQuery, state: FSMContext) -> None:
 @router.message(AddChannelStates.channel_id)
 async def channel_id_received(message: Message, state: FSMContext) -> None:
     raw = message.text.strip()
+
+    # Taklif (invite) havolasi — t.me/+hash yoki t.me/joinchat/hash — a'zolikni
+    # tekshirish uchun ISHLATIB BO'LMAYDI (bot API bunday havoladan chat_id'ni
+    # bilib ola olmaydi). Bu — "obuna bo'lsa ham obuna emas" xatosining eng
+    # ko'p uchraydigan sababi, shuning uchun darhol ogohlantiramiz.
+    stripped = raw
+    for prefix in ("https://", "http://"):
+        if stripped.lower().startswith(prefix):
+            stripped = stripped[len(prefix):]
+            break
+    if stripped.lower().startswith("t.me/+") or "t.me/joinchat/" in stripped.lower():
+        await message.answer(
+            "❌ <b>Bu — taklif (invite) havolasi, uni ishlatib bo'lmaydi!</b>\n\n"
+            "Yopiq/private kanal uchun a'zolikni tekshirish faqat <b>raqamli kanal ID</b> "
+            "orqali ishlaydi (masalan: <code>-1001234567890</code>).\n\n"
+            "Raqamli ID'ni olish uchun: kanalga istalgan xabarni forward qiling "
+            "@userinfobot ga, yoki kanal sozlamalaridan foydalaning.\n\n"
+            "Boshqa qiymat yuboring:",
+        )
+        return
+
     normalized = normalize_channel_id(raw)
     await state.update_data(channel_id=normalized)
     await state.set_state(AddChannelStates.invite_link)
