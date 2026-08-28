@@ -1664,7 +1664,9 @@ async def show_boxes(answer_func, telegram_id: int, result_text: str | None = No
             price_line += f" / {b['cost_tgstars']} 💫 (Telegram Stars)"
         line = f"{b['name']} — <b>{price_line}</b>\n{b['desc_text']}"
         if b["once_per_day"]:
-            if user and user["last_daily_box"] == today:
+            if is_admin(telegram_id):
+                line = f"{line}\n(♾️ Admin uchun cheklovsiz)"
+            elif user and user["last_daily_box"] == today:
                 line = f"✅ {line}\n(Bugun ishlatilgan — ertaga qayta ochiladi)"
             else:
                 line = f"{line}\n(Kuniga 1 marta)"
@@ -2193,7 +2195,7 @@ async def box_open_callback(call: CallbackQuery, bot: Bot) -> None:
         return
 
     today = datetime.now().strftime("%Y-%m-%d")
-    if box["once_per_day"]:
+    if box["once_per_day"] and not is_admin(call.from_user.id):
         if user["last_daily_box"] == today:
             await call.answer("❌ Kunlik boxni bugun ishlatgansiz! Ertaga qayta oching.", show_alert=True)
             return
@@ -2204,7 +2206,7 @@ async def box_open_callback(call: CallbackQuery, bot: Bot) -> None:
 
     # Box narxini ayiramiz
     await deduct_stars(call.from_user.id, box["cost"])
-    if box["once_per_day"]:
+    if box["once_per_day"] and not is_admin(call.from_user.id):
         await set_daily_box_used(call.from_user.id, today)
 
     result = await open_box_and_award(
@@ -2245,7 +2247,7 @@ async def box_open_tgstars_callback(call: CallbackQuery, bot: Bot) -> None:
         return
 
     today = datetime.now().strftime("%Y-%m-%d")
-    if box["once_per_day"] and user["last_daily_box"] == today:
+    if box["once_per_day"] and not is_admin(call.from_user.id) and user["last_daily_box"] == today:
         await call.answer("❌ Kunlik boxni bugun ishlatgansiz! Ertaga qayta oching.", show_alert=True)
         return
 
@@ -2640,7 +2642,7 @@ async def _handle_box_stars_payment(message: Message, bot: Bot, payload: str, pa
         await message.answer("⚠️ To'lov qabul qilindi, lekin box topilmadi. Admin bilan bog'laning: @Kottabolladan")
         return
 
-    if box["once_per_day"]:
+    if box["once_per_day"] and not is_admin(message.from_user.id):
         today = datetime.now().strftime("%Y-%m-%d")
         await set_daily_box_used(message.from_user.id, today)
 
@@ -5432,7 +5434,7 @@ async function refreshShop() {
   if (USER) {
     SHOP.boxes = SHOP.boxes.map(b => ({
       ...b,
-      locked: !!(b.once_per_day && USER.last_daily_box === data.server_date),
+      locked: !USER.is_admin && !!(b.once_per_day && USER.last_daily_box === data.server_date),
     }));
   }
   renderGrid();
@@ -5929,6 +5931,7 @@ async def webapp_me_handler(request):
         "balance_stars": db_user["balance_stars"],
         "referals_count": db_user["referals_count"],
         "last_daily_box": db_user["last_daily_box"],
+        "is_admin": is_admin(db_user["telegram_id"]),
         "ref_link": ref_link,
     })
 
@@ -6125,14 +6128,14 @@ async def webapp_buy_balance_handler(request):
             return web.json_response({"error": "Box topilmadi"}, status=404)
 
         today = datetime.now().strftime("%Y-%m-%d")
-        if box["once_per_day"] and user["last_daily_box"] == today:
+        if box["once_per_day"] and not is_admin(telegram_id) and user["last_daily_box"] == today:
             return web.json_response({"error": "Kunlik boxni bugun ishlatgansiz! Ertaga qayta oching."}, status=403)
 
         if user["balance_stars"] < box["cost"]:
             return web.json_response({"error": f"Balans yetarli emas! Kerak: {box['cost']} ⭐"}, status=402)
 
         await deduct_stars(telegram_id, box["cost"])
-        if box["once_per_day"]:
+        if box["once_per_day"] and not is_admin(telegram_id):
             await set_daily_box_used(telegram_id, today)
 
         result = await open_box_and_award(_bot, box, telegram_id, first_name, username)
