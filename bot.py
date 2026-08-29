@@ -4887,7 +4887,8 @@ async def admin_add_channel(call: CallbackQuery, state: FSMContext) -> None:
     await call.message.edit_text(
         "🔗 <b>Kanal qo'shish (2 xil usul):</b>\n\n"
         "1️⃣ <b>Eng oson:</b> kanaldan istalgan xabarni <b>forward</b> qiling — "
-        "bot kanal ID'si va havolasini o'zi aniqlaydi. ID qidirish shart emas!\n\n"
+        "bot kanal ID'si va havolasini o'zi aniqlaydi. ID qidirish shart emas!\n"
+        "   • Guruh uchun: guruhda <b>anonim admin</b> sifatida yozgan xabarni forward qiling.\n\n"
         "2️⃣ Yoki o'zi yozing:\n"
         "• Username: <code>@mychannel</code> yoki <code>mychannel</code>\n"
         "• Havola: <code>https://t.me/mychannel</code>\n"
@@ -4902,10 +4903,20 @@ async def channel_from_forward(message: Message, bot: Bot, state: FSMContext) ->
     """Admin kanaldan xabar forward qilganda kanal ID'si va havolasi avtomatik
     aniqlanadi — ID qidirish yoki yozish shart emas."""
     fo = message.forward_origin
-    if fo is None or getattr(fo, "type", "") != "channel":
+    ftype = getattr(fo, "type", "")
+    if ftype == "channel":
+        chat = fo.chat
+    elif ftype == "chat":
+        # Guruh/supergroup: "anonim admin" sifatida yozilgan post forward
+        # qilinganda sender_chat orqali guruh ID'si keladi.
+        chat = fo.sender_chat
+    else:
         await message.answer(
-            "❌ Bu — kanaldan forward emas!\n"
-            "Iltimos, <b>kanaldan</b> istalgan xabarni forward (qayta yuborish) qiling.",
+            "❌ Bu — kanaldan yoki guruhdan forward emas!\n"
+            "Iltimos, <b>kanaldan</b> xabar yoki <b>guruhdagi anonim admin</b> "
+            "postini forward qiling.\n\n"
+            "Yopiq guruh uchun eng ishonchli usul — raqamli ID yozish "
+            "(masalan: <code>-1001234567890</code>).",
         )
         return
     chat = fo.chat
