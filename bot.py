@@ -4885,14 +4885,64 @@ async def admin_delete_channel(call: CallbackQuery) -> None:
 async def admin_add_channel(call: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AddChannelStates.channel_id)
     await call.message.edit_text(
-        "🔗 <b>Kanalni yuboring:</b>\n"
-        "Quyidagilardan birini yozing:\n"
+        "🔗 <b>Kanal qo'shish (2 xil usul):</b>\n\n"
+        "1️⃣ <b>Eng oson:</b> kanaldan istalgan xabarni <b>forward</b> qiling — "
+        "bot kanal ID'si va havolasini o'zi aniqlaydi. ID qidirish shart emas!\n\n"
+        "2️⃣ Yoki o'zi yozing:\n"
         "• Username: <code>@mychannel</code> yoki <code>mychannel</code>\n"
         "• Havola: <code>https://t.me/mychannel</code>\n"
-        "• Yoki raqamli ID: <code>-1001234567890</code> (faqat yopiq/private kanallar uchun kerak)\n\n"
-        "Bot kanalda admin bo'lishi kerak!",
+        "• Raqamli ID: <code>-1001234567890</code> (faqat yopiq/private kanallar)\n\n"
+        "<b>Eslatma:</b> bot kanalda <b>admin</b> bo'lishi kerak!",
     )
     await call.answer()
+
+
+@router.message(AddChannelStates.channel_id, F.forward_origin)
+async def channel_from_forward(message: Message, bot: Bot, state: FSMContext) -> None:
+    """Admin kanaldan xabar forward qilganda kanal ID'si va havolasi avtomatik
+    aniqlanadi — ID qidirish yoki yozish shart emas."""
+    fo = message.forward_origin
+    if fo is None or getattr(fo, "type", "") != "channel":
+        await message.answer(
+            "❌ Bu — kanaldan forward emas!\n"
+            "Iltimos, <b>kanaldan</b> istalgan xabarni forward (qayta yuborish) qiling.",
+        )
+        return
+    chat = fo.chat
+    title = html.escape(getattr(chat, "title", None) or "Kanal")
+    chat_id_value = str(chat.id)
+    username = getattr(chat, "username", None)
+    if username:
+        normalized = f"@{username}"
+        link = f"https://t.me/{username}"
+    else:
+        # Yopiq kanal — username yo'q, havolani bot o'zi yaratib ko'radi
+        normalized = chat_id_value
+        link = ""
+        try:
+            invite = await bot.export_chat_invite_link(chat_id_value)
+            link = getattr(invite, "invite_link", "") or str(invite)
+        except Exception as e:
+            logger.warning("Private kanal havolasini olib bo'lmadi: %s", e)
+    if link:
+        await add_channel(normalized, link)
+        await state.clear()
+        await message.answer(
+            f"✅ <b>Kanal qo'shildi!</b>\n\n"
+            f"📢 {title}\n"
+            f"🆔 <code>{chat_id_value}</code>\n"
+            f"🔗 <code>{html.escape(link)}</code>\n\n"
+            "Endi foydalanuvchilar shu kanalga a'zo bo'lmaguncha botdan foydalana olmaydi.",
+            reply_markup=admin_keyboard(),
+        )
+        return
+    await state.update_data(channel_id=normalized)
+    await state.set_state(AddChannelStates.invite_link)
+    await message.answer(
+        f"✅ Kanal topildi: <b>{title}</b> (ID: <code>{chat_id_value}</code>)\n"
+        "Bu kanal <b>yopiq</b>, bot havolani o'zi olib bo'lmadi.\n\n"
+        "🔗 <b>Kanalning taklif havolasini yuboring:</b>",
+    )
 
 
 @router.message(AddChannelStates.channel_id)
@@ -4920,6 +4970,20 @@ async def channel_id_received(message: Message, state: FSMContext) -> None:
         return
 
     normalized = normalize_channel_id(raw)
+    if normalized.startswith("@"):
+        # Ochiq kanal — havolasi username'dan avtomatik chiqariladi, alohida
+        # "havola yuboring" qadami shart emas.
+        link = f"https://t.me/{normalized[1:]}"
+        await add_channel(normalized, link)
+        await state.clear()
+        await message.answer(
+            f"✅ <b>Kanal qo'shildi!</b>\n\n"
+            f"📢 <code>{normalized}</code>\n"
+            f"🔗 <code>{link}</code>\n\n"
+            "Endi foydalanuvchilar shu kanalga a'zo bo'lmaguncha botdan foydalana olmaydi.",
+            reply_markup=admin_keyboard(),
+        )
+        return
     await state.update_data(channel_id=normalized)
     await state.set_state(AddChannelStates.invite_link)
     await message.answer(
