@@ -352,7 +352,8 @@ async def db_init() -> None:
                 gift_pool_size INTEGER NOT NULL DEFAULT 1,
                 gift_category TEXT NOT NULL DEFAULT 'gift',
                 once_per_day INTEGER NOT NULL DEFAULT 0,
-                desc_text TEXT NOT NULL DEFAULT ''
+                desc_text TEXT NOT NULL DEFAULT '',
+                tgstars_bonus_percent REAL NOT NULL DEFAULT 0
             )
         """)
         await db.execute("""
@@ -397,6 +398,7 @@ async def db_init() -> None:
             "ALTER TABLE settings ADD COLUMN reviews_channel TEXT DEFAULT ''",
             "ALTER TABLE settings ADD COLUMN nft_group TEXT DEFAULT ''",
             "ALTER TABLE boxes ADD COLUMN cost_tgstars INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE boxes ADD COLUMN tgstars_bonus_percent REAL NOT NULL DEFAULT 0",
             "ALTER TABLE shop_items ADD COLUMN tg_gift_id TEXT DEFAULT ''",
             "ALTER TABLE settings ADD COLUMN gift_caption TEXT DEFAULT ''",
             "ALTER TABLE promo_codes ADD COLUMN name TEXT NOT NULL DEFAULT ''",
@@ -1655,9 +1657,19 @@ async def shop_handler(message: Message) -> None:
 # eng arzon N ta giftdan biri, gift toifasi, kunlik cheklov, tavsif.
 
 
-async def roll_box(box: dict) -> dict:
-    """Box ochish natijasini hisoblaydi. {'kind': 'stars'|'gifts', 'amount', 'gifts'}"""
-    if box["gift_drop_prob"] > 0 and random.random() < box["gift_drop_prob"]:
+async def roll_box(box: dict, via_tgstars: bool = False) -> dict:
+    """Box ochish natijasini hisoblaydi. {'kind': 'stars'|'gifts', 'amount', 'gifts'}
+
+    via_tgstars=True bo'lsa (box haqiqiy Telegram Stars bilan to'langan) —
+    gift tushish ehtimoli box['tgstars_bonus_percent'] foiz punktiga
+    oshiriladi. Shu orqali foydalanuvchilar ichki balans o'rniga haqiqiy
+    Stars bilan to'lashga rag'batlantiriladi (yutish imkoniyati kattaroq)."""
+    gift_drop_prob = box["gift_drop_prob"]
+    if via_tgstars:
+        bonus = box.get("tgstars_bonus_percent") or 0
+        gift_drop_prob = min(1.0, gift_drop_prob + bonus / 100.0)
+
+    if gift_drop_prob > 0 and random.random() < gift_drop_prob:
         gifts = await pick_shop_gifts(box["gift_category"], box["gift_pool_size"])
         if gifts:
             return {"kind": "gifts", "amount": 0, "gifts": gifts}
@@ -1889,11 +1901,18 @@ def gift_delivery_texts(result: dict) -> tuple[str, str]:
     return "", "Buyurtma adminga yuborildi, tez orada siz bilan bog'lanamiz. 🎁"
 
 
-async def open_box_and_award(bot: Bot, box: dict, telegram_id: int, first_name: str, username: str) -> dict:
+async def open_box_and_award(
+    bot: Bot, box: dict, telegram_id: int, first_name: str, username: str, via_tgstars: bool = False,
+) -> dict:
     """Boxni yechadi (roll_box) va mukofotni beradi — yulduz bo'lsa balansga
     qo'shiladi, gift bo'lsa adminlarga xabar boradi. Bot balansi ORQALI ham,
     haqiqiy Telegram Stars ORQALI ham ochilgan boxlar uchun bir xil
     ishlatiladi.
+
+    via_tgstars=True — box haqiqiy Telegram Stars bilan to'langan
+    (box_open_tgstars_callback -> _handle_box_stars_payment): roll_box'ga
+    uzatiladi, u yerda gift tushish ehtimoli box'ning tgstars_bonus_percent
+    qiymati qadar oshiriladi.
 
     Natija sifatida dict qaytaradi:
       - text: Telegram HTML formatidagi natija matni
@@ -1903,7 +1922,7 @@ async def open_box_and_award(bot: Bot, box: dict, telegram_id: int, first_name: 
         App'dagi raketa animatsiyasi qay balandlikka uchishini shu belgilaydi
         (gift har doim eng baland/portlash, yulduz esa box'ning star_min..
         star_max oralig'idagi o'rniga qarab hisoblanadi)."""
-    prize = await roll_box(box)
+    prize = await roll_box(box, via_tgstars=via_tgstars)
 
     if prize["kind"] == "stars":
         await add_stars(telegram_id, prize["amount"])
@@ -2791,6 +2810,7 @@ async def _handle_box_stars_payment(message: Message, bot: Bot, payload: str, pa
 
     result = await open_box_and_award(
         bot, box, message.from_user.id, message.from_user.first_name or "", message.from_user.username or "",
+        via_tgstars=True,
     )
 
     for admin_id in ADMIN_IDS:
@@ -3913,12 +3933,19 @@ def box_detail_text(b: dict) -> str:
     prob = f"{b['gift_drop_prob'] * 100:.0f}%"
     daily = "✅ Ha" if b["once_per_day"] else "❌ Yo'q"
     tgstars_line = f"💫 Telegram Stars narxi: <b>{b['cost_tgstars']} ⭐</b>\n" if b["cost_tgstars"] > 0 else "💫 Telegram Stars narxi: <b>o'rnatilmagan</b>\n"
+    bonus = b.get("tgstars_bonus_percent") or 0
+    if bonus > 0:
+        boosted = min(100.0, b["gift_drop_prob"] * 100 + bonus)
+        bonus_line = f"🚀 TG Stars bonusi: <b>+{bonus:.0f}%</b> (real Stars bilan ochsa gift foizi ≈ <b>{boosted:.0f}%</b> bo'ladi)\n"
+    else:
+        bonus_line = "🚀 TG Stars bonusi: <b>yo'q</b>\n"
     return (
         f"📦 <b>{b['name']}</b>\n\n"
         f"💰 Narxi (bot balansi): <b>{b['cost']} ⭐</b>\n"
         f"{tgstars_line}"
         f"⭐ Star diapazoni: <b>{b['star_min']}–{b['star_max']}</b>\n"
         f"🎁 Gift tushish foizi: <b>{prob}</b>\n"
+        f"{bonus_line}"
         f"🎟️ Gift tanlovi: eng arzon <b>{b['gift_pool_size']}</b> tasidan biri\n"
         f"📂 Gift toifasi: <b>{b['gift_category']}</b>\n"
         f"⏳ Kuniga 1 marta: {daily}\n"
@@ -3934,6 +3961,7 @@ def box_edit_keyboard(box_id: str) -> InlineKeyboardMarkup:
     kb.button(text="⭐ Star min", callback_data=f"admin:box:field:starmin:{box_id}")
     kb.button(text="⭐ Star max", callback_data=f"admin:box:field:starmax:{box_id}")
     kb.button(text="🎁 Gift foizi %", callback_data=f"admin:box:field:prob:{box_id}")
+    kb.button(text="🚀 TG Stars bonusi %", callback_data=f"admin:box:field:tgbonus:{box_id}")
     kb.button(text="🎟️ Gift soni (N)", callback_data=f"admin:box:field:pool:{box_id}")
     kb.button(text="📂 Gift toifasi", callback_data=f"admin:box:cat:{box_id}")
     kb.button(text="⏳ Kunlik cheklov", callback_data=f"admin:box:daily:{box_id}")
@@ -3979,6 +4007,7 @@ BOX_FIELD_PROMPTS = {
     "starmin": "⭐ <b>Yangi star minimumini yozing:</b>",
     "starmax": "⭐ <b>Yangi star maksimumini yozing:</b>",
     "prob": "🎁 <b>Gift tushish foizini yozing (0–100):</b>\nMasalan: 50 — 50% gift, 50% stars. 0 yozsangiz, faqat stars tushadi.",
+    "tgbonus": "🚀 <b>TG Stars bonusini yozing (foiz punkti, 0–100):</b>\nBox haqiqiy Telegram Stars bilan ochilganda gift foiziga shuncha qo'shiladi. Masalan: gift foizi 50% bo'lib, bu yerga 20 yozsangiz — Stars bilan ochganda gift foizi 70% bo'ladi. 0 — bonus yo'q.",
     "pool": "🎟️ <b>Gift tanlovi sonini yozing:</b>\nDo'kondagi eng arzon shuncha giftdan biri tushadi. Masalan: 2",
     "desc": "📝 <b>Yangi tavsifni yozing:</b>",
 }
@@ -4031,6 +4060,15 @@ async def box_field_input(message: Message, state: FSMContext) -> None:
             await message.answer("❌ Foiz 0 dan 100 gacha bo'lishi kerak!")
             return
         value = value / 100.0
+    elif field == "tgbonus":
+        try:
+            value = float(raw.replace("%", "").replace(",", "."))
+        except ValueError:
+            await message.answer("❌ Iltimos, son kiriting (0–100)!")
+            return
+        if value < 0 or value > 100:
+            await message.answer("❌ Foiz 0 dan 100 gacha bo'lishi kerak!")
+            return
     else:
         if len(raw) < 1:
             await message.answer("❌ Bo'sh bo'lishi mumkin emas!")
@@ -4049,6 +4087,7 @@ async def box_field_input(message: Message, state: FSMContext) -> None:
         "starmin": "star_min",
         "starmax": "star_max",
         "prob": "gift_drop_prob",
+        "tgbonus": "tgstars_bonus_percent",
         "pool": "gift_pool_size",
         "desc": "desc_text",
     }[field]
