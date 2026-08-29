@@ -1695,7 +1695,9 @@ async def show_boxes(answer_func, telegram_id: int, result_text: str | None = No
     for b in boxes:
         kb.button(text=f"{b['name']} — {b['cost']} ⭐ (balans)", callback_data=f"box_open:{b['box_id']}")
         if b["cost_tgstars"] > 0:
-            kb.button(text=f"{b['name']} — {b['cost_tgstars']} 💫 (Telegram Stars)", callback_data=f"box_open_tgstars:{b['box_id']}")
+            bonus = b.get("tgstars_bonus_percent") or 0
+            star_label = f"🚀 {b['name']} — {b['cost_tgstars']} 💫 (katta imkoniyat!)" if bonus > 0 else f"{b['name']} — {b['cost_tgstars']} 💫 (Telegram Stars)"
+            kb.button(text=star_label, callback_data=f"box_open_tgstars:{b['box_id']}")
     kb.button(text="🎟️ Promokod box", callback_data="promo_redeem_start")
     kb.button(text="🔙 Bosh menyu", callback_data="main_menu")
     kb.adjust(1)
@@ -1703,9 +1705,12 @@ async def show_boxes(answer_func, telegram_id: int, result_text: str | None = No
     text = "🎰 <b>BOXLAR</b>\n\nQaysi boxni ochasiz?\n\n"
     for b in boxes:
         price_line = f"{b['cost']} ⭐ (balans)"
+        bonus = b.get("tgstars_bonus_percent") or 0
         if b["cost_tgstars"] > 0:
             price_line += f" / {b['cost_tgstars']} 💫 (Telegram Stars)"
         line = f"{b['name']} — <b>{price_line}</b>\n{b['desc_text']}"
+        if b["cost_tgstars"] > 0 and bonus > 0:
+            line += f"\n🚀 <b>Telegram Stars bilan olsangiz — gift yutish imkoniyati +{bonus:.0f}% katta!</b>"
         if b["once_per_day"]:
             if user and user["last_daily_box"] == today:
                 line = f"✅ {line}\n(Bugun ishlatilgan — ertaga qayta ochiladi)"
@@ -2377,6 +2382,9 @@ async def about_bot_handler(message: Message) -> None:
         "Gift yutib olsangiz, uni <b>saqlab qo'yasiz</b>: keyin xohlaganingizda "
         "\"🎁 Giftni olish\" (haqiqiy sovg'a) yoki \"⭐ ga aylantirish\" (ichki balansga "
         "qo'shish) tugmalaridan birini bosasiz — shoshilish shart emas.\n\n"
+        "🚀 <b>Telegram Stars bilan oching — imkoniyat kattaroq!</b>\n"
+        "Boxni ichki balans o'rniga <b>haqiqiy Telegram Stars</b> bilan ochsangiz, "
+        "gift yutish ehtimoli SEZILARLI oshadi! 💎\n\n"
         "💸 <b>Yulduz yechish</b>\n"
         f"Balansingiz kamida <b>{settings['min_withdraw_stars']} ⭐</b> bo'lsa, ⭐ (real to'lov) "
         "yoki gift sifatida yechib olishingiz mumkin. Ba'zi giftlar avtomatik yuboriladi, "
@@ -4966,6 +4974,11 @@ MINI_APP_HTML = """<!doctype html>
   .card button:disabled { opacity: 0.5; cursor: default; }
   .card button:active { opacity: 0.8; }
   .lock-badge { font-size: 11px; font-weight: 700; color: #ffd54a; margin-top: 2px; }
+  .bonus-badge {
+    font-size: 11px; font-weight: 700; color: #1a1a1a; margin-top: 2px;
+    background: linear-gradient(135deg,#ffd54a,#ff9500); border-radius: 8px;
+    padding: 5px 8px; line-height: 1.3;
+  }
 
   .card.promo {
     grid-column: 1 / -1;
@@ -5424,6 +5437,9 @@ function renderAbout() {
     yutib olsangiz, uni <b>saqlab qo'yasiz</b>: keyin xohlaganingizda "🎁 Giftni olish"
     (haqiqiy sovg'a) yoki "⭐ ga aylantirish" (ichki balansga qo'shish) tugmalaridan
     birini bosasiz — shoshilish shart emas.</p>
+    <p><b>🚀 Telegram Stars bilan oching — imkoniyat kattaroq!</b><br>
+    Boxni ichki balans o'rniga <b>haqiqiy Telegram Stars</b> bilan ochsangiz, gift
+    yutish ehtimoli sezilarli oshadi — bunday boxlar 🚀 belgisi bilan ko'rsatiladi.</p>
     <p><b>💸 Yulduz yechish</b><br>
     Balansingiz kamida <b>${INFO.min_withdraw_stars || 0} ⭐</b> bo'lsa, ⭐ (real to'lov)
     yoki gift sifatida yechib olishingiz mumkin. Ba'zi giftlar avtomatik yuboriladi,
@@ -5566,15 +5582,21 @@ function itemCard(item) {
 function boxCard(box) {
   const card = document.createElement('div');
   card.className = 'card jackpot' + (box.locked ? ' locked' : '');
+  const hasBonus = box.cost_tgstars > 0 && box.tgstars_bonus_percent > 0;
   let buttons = '';
   if (!box.locked) {
     buttons += `<button data-act="balance">⭐ Ochish (${box.cost})</button>`;
-    if (box.cost_tgstars > 0) buttons += `<button data-act="tgstars" class="stars">✨ Stars (${box.cost_tgstars})</button>`;
+    if (box.cost_tgstars > 0) {
+      buttons += hasBonus
+        ? `<button data-act="tgstars" class="stars">🚀 Stars (${box.cost_tgstars}) — katta imkoniyat!</button>`
+        : `<button data-act="tgstars" class="stars">✨ Stars (${box.cost_tgstars})</button>`;
+    }
   }
   card.innerHTML = `
     <div class="icon-tile">🎰</div>
     <div class="name">${box.name}</div>
     <div class="desc">${box.desc || ''}</div>
+    ${hasBonus ? `<div class="bonus-badge">🚀 Telegram Stars bilan olsangiz — gift yutish imkoniyati +${box.tgstars_bonus_percent}% katta!</div>` : ''}
     <div class="price">${box.cost} ⭐${box.cost_tgstars > 0 ? ` <small>yoki</small> ${box.cost_tgstars} 💫` : ''}</div>
     ${box.locked ? '<div class="lock-badge">✅ Bugun ishlatilgan — ertaga qayta oching</div>' : `<div class="btnrow">${buttons}</div>`}
   `;
@@ -6292,6 +6314,7 @@ async def webapp_shop_api_handler(request):
             "desc": b["desc_text"] or "",
             "cost": b["cost"],
             "cost_tgstars": b["cost_tgstars"],
+            "tgstars_bonus_percent": b.get("tgstars_bonus_percent") or 0,
             "once_per_day": bool(b["once_per_day"]),
         })
 
