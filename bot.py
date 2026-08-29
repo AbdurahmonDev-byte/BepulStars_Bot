@@ -2111,7 +2111,12 @@ async def gift_claim_callback(call: CallbackQuery, bot: Bot) -> None:
             f"va balansingizga qo'shildi!"
         )
         try:
-            await call.message.edit_text(text)
+            # reply_markup=None chinakam olib tashlamaydi — aiogram bo'sh/None
+            # qiymatlarni so'rovdan butunlay chiqarib tashlaydi, shu sababli
+            # avvalgi "Giftni olish"/"Starsga aylantirish" tugmalari xabarda
+            # QOLIB KETADI va foydalanuvchi ularni qayta bosishga urinadi.
+            # Aniq bo'sh klaviatura yuborilsa, tugmalar chinakam yo'qoladi.
+            await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
         except TelegramBadRequest:
             await call.message.answer(text)
         await call.answer("✅ Starsga aylantirildi!", show_alert=False)
@@ -2189,7 +2194,7 @@ async def gift_claim_callback(call: CallbackQuery, bot: Bot) -> None:
         text = "✅ So'rovingiz qabul qilindi — gift tez orada admin tomonidan yuboriladi."
 
     try:
-        await call.message.edit_text(text)
+        await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
     except TelegramBadRequest:
         await call.message.answer(text)
     await call.answer("✅ Tanlandi!", show_alert=False)
@@ -2281,7 +2286,7 @@ async def gift_variant_choice_callback(call: CallbackQuery, bot: Bot) -> None:
         text = "✅ Tanlovingiz qabul qilindi — gift tez orada admin tomonidan yuboriladi."
 
     try:
-        await call.message.edit_text(text)
+        await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
     except TelegramBadRequest:
         await call.message.answer(text)
     await call.answer("✅ Tanlandi!", show_alert=False)
