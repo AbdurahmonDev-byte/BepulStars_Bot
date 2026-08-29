@@ -44,6 +44,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -1120,12 +1121,17 @@ def main_menu_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     return kb
 
 
-def channels_keyboard(channels: list[dict]) -> InlineKeyboardMarkup:
-    """Majburiy kanallar ro'yxati + tekshirish tugmasi."""
+def channels_keyboard(channels: list[dict], referrer_id: int | None = None) -> InlineKeyboardMarkup:
+    """Majburiy kanallar ro'yxati + tekshirish tugmasi.
+
+    referrer_id callback_data'ning ICHIGA yoziladi (pending_ref xotira
+    lug'atiga emas) — shunda bot qayta ishga tushsa (masalan Render'da
+    bo'sh turganda avtomatik uxlab/qayta uyg'onsa) ham referal
+    yo'qolmaydi, chunki bu qiymat Telegram xabarining o'zida saqlanadi."""
     kb = InlineKeyboardBuilder()
     for i, ch in enumerate(channels, start=1):
         kb.button(text=f"📢 {i}-kanal", url=ch["invite_link"])
-    kb.button(text="✅ A'zo bo'ldim", callback_data="check_sub")
+    kb.button(text="✅ A'zo bo'ldim", callback_data=f"check_sub:{referrer_id or 0}")
     return kb.as_markup()
 
 
@@ -1203,7 +1209,7 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext) -> None:
                         logger.warning("Referrer xabarnoma xatosi: %s", e)
             await message.answer(
                 "❌ <b>Botdan foydalanish uchun quyidagi kanallarga a'zo bo'ling:</b>",
-                reply_markup=channels_keyboard(not_sub),
+                reply_markup=channels_keyboard(not_sub, referrer_id),
             )
             return
 
@@ -1219,7 +1225,7 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext) -> None:
     )
 
 
-@router.callback_query(F.data == "check_sub")
+@router.callback_query(F.data.startswith("check_sub"))
 async def check_sub_handler(call: CallbackQuery, bot: Bot, state: FSMContext) -> None:
     global _bot
     _bot = bot
@@ -1231,8 +1237,15 @@ async def check_sub_handler(call: CallbackQuery, bot: Bot, state: FSMContext) ->
         await call.answer("❌ Hali ham a'zo bo'lmagansiz!", show_alert=True)
         return
 
-    # A'zo bo'ldi — foydalanuvchini ro'yxatga olamiz (kutilayotgan referrer bilan)
-    ref = pending_ref.get(call.from_user.id)
+    # A'zo bo'ldi — foydalanuvchini ro'yxatga olamiz. Referrer birinchi
+    # navbatda callback_data'dan o'qiladi ("check_sub:<id>") — bot qayta
+    # ishga tushgan bo'lsa ham ishlaydi; pending_ref faqat eski (shu
+    # o'zgarishdan oldin yuborilgan) xabarlar uchun zaxira sifatida qoladi.
+    parts = call.data.split(":", 1)
+    if len(parts) == 2 and parts[1].isdigit() and parts[1] != "0":
+        ref = int(parts[1])
+    else:
+        ref = pending_ref.get(call.from_user.id)
     user = await get_user(call.from_user.id)
     if not user:
         await register_user_with_referral(call.from_user.id, ref, call.from_user.full_name)
@@ -1290,7 +1303,7 @@ async def referral_handler(message: Message, bot: Bot) -> None:
     share_url = f"https://t.me/share/url?url={quote(ref_link)}&text={quote(share_text)}"
     kb = InlineKeyboardBuilder()
     kb.button(text="📤 Do'stlarga ulashish", url=share_url)
-    kb.button(text="🔗 Havolani nusxalash", url=ref_link)
+    kb.button(text="🔗 Havolani nusxalash", copy_text=CopyTextButton(text=ref_link))
 
     await message.answer(
         f"🔗 <b>Referal havolangiz</b>\n\n"
