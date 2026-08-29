@@ -159,6 +159,7 @@ class SettingsStates(StatesGroup):
     reviews_channel = State() # otziv kanali
     nft_group = State()       # NFT sotiladigan guruh linki
     gift_caption = State()    # avtomatik gift bilan boradigan matn
+    max_ref_daily = State()   # bitta referrer uchun kunlik referal chegarasi (nakrutka)
 
 
 class AddItemStates(StatesGroup):
@@ -254,7 +255,8 @@ async def db_init() -> None:
                 min_withdraw_stars INTEGER NOT NULL DEFAULT 100,
                 pay_card TEXT NOT NULL DEFAULT '9860180104681937',
                 reviews_channel TEXT DEFAULT '',
-                nft_group TEXT DEFAULT ''
+                nft_group TEXT DEFAULT '',
+                max_referrals_per_day INTEGER NOT NULL DEFAULT 10
             )
         """)
         await db.execute("""
@@ -404,6 +406,7 @@ async def db_init() -> None:
             "ALTER TABLE boxes ADD COLUMN tgstars_bonus_percent REAL NOT NULL DEFAULT 0",
             "ALTER TABLE shop_items ADD COLUMN tg_gift_id TEXT DEFAULT ''",
             "ALTER TABLE settings ADD COLUMN gift_caption TEXT DEFAULT ''",
+            "ALTER TABLE settings ADD COLUMN max_referrals_per_day INTEGER NOT NULL DEFAULT 10",
             "ALTER TABLE promo_codes ADD COLUMN name TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE promo_codes ADD COLUMN star_min INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE promo_codes ADD COLUMN star_max INTEGER NOT NULL DEFAULT 10",
@@ -480,7 +483,7 @@ async def get_settings() -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT ref_reward_stars, min_referals_required, min_withdraw_stars, pay_card, reviews_channel, nft_group, gift_caption FROM settings WHERE id = 1"
+            "SELECT ref_reward_stars, min_referals_required, min_withdraw_stars, pay_card, reviews_channel, nft_group, gift_caption, max_referrals_per_day FROM settings WHERE id = 1"
         )
         row = await cur.fetchone()
         return dict(row) if row else None
@@ -545,6 +548,20 @@ async def increment_referals(telegram_id: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE users SET referals_count = referals_count + 1 WHERE telegram_id = ?", (telegram_id,))
         await db.commit()
+
+
+async def get_referrals_today_count(referrer_id: int) -> int:
+    """Shu referrer bugun taklif qilgan (ro'yxatdan o'tgan) foydalanuvchilar
+    soni — kunlik nakrutka (soxta referal) chegarasini tekshirish uchun."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT COUNT(*) as c FROM users WHERE referrer_id = ? AND joined_at LIKE ?",
+            (referrer_id, f"{today}%"),
+        )
+        row = await cur.fetchone()
+        return row["c"] if row else 0
 
 
 async def get_all_users() -> list[dict]:
@@ -1090,9 +1107,24 @@ async def register_user_with_referral(telegram_id: int, referrer_id: int | None,
     await add_user(telegram_id, referrer["telegram_id"] if referrer else None)
     user = await get_user(telegram_id)
 
-    # Referal mukofoti: referrerning hisobiga yulduz + referals_count
+    # Referal mukofoti: referrerning hisobiga yulduz + referals_count.
+    # Kunlik chegara — bitta odam soxta akkountlar bilan cheksiz "nakrutka"
+    # qilib bot balansini bo'shatib qo'yishining oldini oladi: chegaradan
+    # oshgan referallar RO'YXATGA OLINADI (statistikada ko'rinadi), lekin
+    # mukofot va referals_count (xarid huquqiga ta'sir qiluvchi hisoblagich)
+    # oshirilmaydi.
     if referrer:
         settings = await get_settings()
+        max_per_day = settings["max_referrals_per_day"]
+        if max_per_day > 0:
+            today_count = await get_referrals_today_count(referrer["telegram_id"])
+            if today_count > max_per_day:
+                logger.info(
+                    "Referal mukofoti berilmadi (kunlik chegara %s): referrer=%s, yangi=%s",
+                    max_per_day, referrer["telegram_id"], telegram_id,
+                )
+                return user, True
+
         reward = settings["ref_reward_stars"]
         await add_stars(referrer["telegram_id"], reward)
         await increment_referals(referrer["telegram_id"])
@@ -3675,6 +3707,7 @@ def settings_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="⭐ Referal mukofoti", callback_data="admin:set:ref_reward")
     kb.button(text="👥 Min. referallar", callback_data="admin:set:min_ref")
+    kb.button(text="🚫 Kunlik referal chegarasi", callback_data="admin:set:max_ref_daily")
     kb.button(text="💸 Yulduz yechish minimumi", callback_data="admin:set:min_withdraw")
     kb.button(text="💳 To'lov kartasi", callback_data="admin:set:pay_card")
     kb.button(text="⭐ Otziv kanali", callback_data="admin:set:reviews_channel")
@@ -3698,6 +3731,7 @@ async def admin_settings(call: CallbackQuery) -> None:
         f"⚙️ <b>Sozlamalar</b>\n\n"
         f"⭐ Referal mukofoti: <b>{s['ref_reward_stars']} ⭐</b>\n"
         f"👥 Xarid uchun min. referallar: <b>{s['min_referals_required']}</b>\n"
+        f"🚫 Kunlik referal chegarasi: <b>{s['max_referrals_per_day'] if s['max_referrals_per_day'] > 0 else 'cheklanmagan'}</b>\n"
         f"💸 Yulduz yechish minimumi: <b>{s['min_withdraw_stars']} ⭐</b>\n"
         f"💳 To'lov kartasi: <code>{s['pay_card']}</code>\n"
         f"⭐ Otziv: {reviews_display}\n"
@@ -3757,6 +3791,32 @@ async def min_ref_input(message: Message, state: FSMContext) -> None:
     await update_settings(min_referals_required=value)
     await state.clear()
     await message.answer(f"✅ Minimal referallar <b>{value}</b> qilib o'rnatildi.", reply_markup=admin_keyboard())
+
+
+@router.callback_query(F.data == "admin:set:max_ref_daily")
+async def set_max_ref_daily(call: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(SettingsStates.max_ref_daily)
+    await call.message.edit_text(
+        "✏️ <b>Bitta odam uchun kunlik referal chegarasini yozing:</b>\n"
+        "(shu sondan ortiq taklif uchun mukofot berilmaydi — nakrutkadan himoya. 0 = cheklanmagan)",
+    )
+    await call.answer()
+
+
+@router.message(SettingsStates.max_ref_daily)
+async def max_ref_daily_input(message: Message, state: FSMContext) -> None:
+    try:
+        value = int(message.text)
+    except ValueError:
+        await message.answer("❌ Iltimos, butun son kiriting!")
+        return
+    if value < 0:
+        await message.answer("❌ Chegara manfiy bo'lishi mumkin emas!")
+        return
+    await update_settings(max_referrals_per_day=value)
+    await state.clear()
+    display = value if value > 0 else "cheklanmagan"
+    await message.answer(f"✅ Kunlik referal chegarasi <b>{display}</b> qilib o'rnatildi.", reply_markup=admin_keyboard())
 
 
 @router.callback_query(F.data == "admin:set:min_withdraw")
