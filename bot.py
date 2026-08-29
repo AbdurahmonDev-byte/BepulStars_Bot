@@ -242,7 +242,8 @@ async def db_init() -> None:
                 referals_count INTEGER NOT NULL DEFAULT 0,
                 referrer_id INTEGER,
                 last_daily_box TEXT DEFAULT '',
-                joined_at TEXT NOT NULL
+                joined_at TEXT NOT NULL,
+                is_banned INTEGER NOT NULL DEFAULT 0
             )
         """)
         await db.execute("""
@@ -392,6 +393,7 @@ async def db_init() -> None:
         for alter_sql in (
             "ALTER TABLE users ADD COLUMN last_daily_box TEXT DEFAULT ''",
             "ALTER TABLE users ADD COLUMN last_free_ticket TEXT DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN is_banned INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE settings ADD COLUMN min_withdraw_stars INTEGER NOT NULL DEFAULT 100",
             "ALTER TABLE shop_items ADD COLUMN price_uzs INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE settings ADD COLUMN pay_card TEXT NOT NULL DEFAULT '9860180104681937'",
@@ -529,6 +531,13 @@ async def set_user_balance(telegram_id: int, amount: int) -> None:
     admin nazorati uchun (masalan xohlagan payt 0 ga tushirish)."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE users SET balance_stars = ? WHERE telegram_id = ?", (amount, telegram_id))
+        await db.commit()
+
+
+async def set_user_banned(telegram_id: int, banned: bool) -> None:
+    """Foydalanuvchini botdan foydalanishdan ban qiladi/ban'ni bekor qiladi."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET is_banned = ? WHERE telegram_id = ?", (1 if banned else 0, telegram_id))
         await db.commit()
 
 
@@ -957,6 +966,32 @@ async def clear_gift_variants(item_id: int) -> None:
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+BAN_MESSAGE = "⛔ Siz botdan foydalanish huquqidan mahrum qilingansiz."
+
+
+async def ban_check_middleware(handler, event, data):
+    """Bot chatidagi HAR BIR xabar/callback uchun yagona tekshiruv nuqtasi —
+    ban qilingan foydalanuvchi hech qanday handler'ga (box ochish, do'kon,
+    yechish va h.k.) yetib bora olmaydi. Adminlar bundan mustasno."""
+    tg_user = getattr(event, "from_user", None)
+    if tg_user and not is_admin(tg_user.id):
+        user = await get_user(tg_user.id)
+        if user and user["is_banned"]:
+            if isinstance(event, CallbackQuery):
+                await event.answer(BAN_MESSAGE, show_alert=True)
+            else:
+                try:
+                    await event.answer(BAN_MESSAGE)
+                except Exception:
+                    pass
+            return None
+    return await handler(event, data)
+
+
+router.message.outer_middleware.register(ban_check_middleware)
+router.callback_query.outer_middleware.register(ban_check_middleware)
 
 
 def normalize_channel_id(raw: str) -> str:
@@ -3149,10 +3184,12 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def _user_manage_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
+def _user_manage_keyboard(telegram_id: int, is_banned: bool = False) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="0️⃣ Balansni 0 ga tushirish", callback_data=f"admin:userzero:{telegram_id}")
     kb.button(text="✏️ Aniq qiymat qo'yish", callback_data=f"admin:usersetbal:{telegram_id}")
+    ban_text = "✅ Ban'ni bekor qilish" if is_banned else "⛔ Ban qilish"
+    kb.button(text=ban_text, callback_data=f"admin:userban:{telegram_id}")
     kb.button(text="🔍 Boshqa foydalanuvchi", callback_data="admin:usersearch")
     kb.button(text="🔙 Ortga", callback_data="admin")
     kb.adjust(1)
@@ -3168,15 +3205,17 @@ async def _show_user_profile(target, telegram_id: int) -> None:
             reply_markup=_user_manage_keyboard(telegram_id),
         )
         return
+    status_line = "⛔ <b>BAN QILINGAN</b>\n" if user["is_banned"] else ""
     await target.answer(
         f"👤 <b>Foydalanuvchi profili</b>\n\n"
+        f"{status_line}"
         f"🆔 ID: <code>{user['telegram_id']}</code>\n"
         f"⭐ Ichki balans: <b>{user['balance_stars']}</b>\n"
         f"🔗 Referallar: <b>{user['referals_count']}</b>\n"
         f"👥 Taklif qilgan: <code>{user['referrer_id'] or '—'}</code>\n"
         f"📅 Qo'shilgan: {user['joined_at']}\n\n"
-        f"Quyidagi tugmalar orqali balansni boshqarishingiz mumkin:",
-        reply_markup=_user_manage_keyboard(telegram_id),
+        f"Quyidagi tugmalar orqali balansni/ruxsatini boshqarishingiz mumkin:",
+        reply_markup=_user_manage_keyboard(telegram_id, bool(user["is_banned"])),
     )
 
 
@@ -3220,6 +3259,25 @@ async def admin_user_zero(call: CallbackQuery) -> None:
         return
     await set_user_balance(telegram_id, 0)
     await call.answer("✅ Balans 0 ga tushirildi!", show_alert=True)
+    await _show_user_profile(call.message, telegram_id)
+
+
+@router.callback_query(F.data.startswith("admin:userban:"))
+async def admin_user_ban_toggle(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    telegram_id = int(call.data.split(":")[2])
+    user = await get_user(telegram_id)
+    if not user:
+        await call.answer("❌ Foydalanuvchi topilmadi", show_alert=True)
+        return
+    if is_admin(telegram_id):
+        await call.answer("❌ Adminni ban qilib bo'lmaydi!", show_alert=True)
+        return
+    new_banned = not user["is_banned"]
+    await set_user_banned(telegram_id, new_banned)
+    await call.answer("⛔ Ban qilindi!" if new_banned else "✅ Ban bekor qilindi!", show_alert=True)
     await _show_user_profile(call.message, telegram_id)
 
 
@@ -3402,6 +3460,7 @@ async def admin_pending_withdrawals(call: CallbackQuery) -> None:
         return
 
     pending = await get_pending_withdrawals()
+    kb = InlineKeyboardBuilder()
     if not pending:
         text = "💸 <b>Kutilayotgan to'lovlar</b>\n\n✅ Hozircha kutilayotgan so'rov yo'q."
     else:
@@ -3413,11 +3472,16 @@ async def admin_pending_withdrawals(call: CallbackQuery) -> None:
             else:
                 lines.append(f"#{w['id']} — ⭐ {w['amount_stars']} ⭐ — {w['user_name']} (@{w['username'] or '—'}, ID: {w['telegram_id']})")
             total_stars += w["amount_stars"]
+            kb.button(text=f"✅ #{w['id']} to'landi", callback_data=f"wd_approve:{w['id']}")
+            kb.button(text=f"❌ #{w['id']} bekor", callback_data=f"wd_reject:{w['id']}")
         lines.append(f"\nJami: <b>{len(pending)}</b> ta so'rov, <b>{total_stars} ⭐</b> qiymatida.")
-        lines.append("\nHar birini tasdiqlash/bekor qilish uchun o'sha so'rov yuborilgan admin xabaridagi tugmalardan foydalaning.")
+        lines.append("\nHar birini shu yerdagi tugmalardan yoki o'sha so'rov yuborilgan admin xabaridagi tugmalardan tasdiqlashingiz/bekor qilishingiz mumkin.")
         text = "\n".join(lines)
 
-    await call.message.edit_text(text, reply_markup=back_to_admin_keyboard())
+    kb.button(text="🔙 Ortga", callback_data="admin")
+    kb.adjust(2)
+
+    await call.message.edit_text(text, reply_markup=kb.as_markup())
     await call.answer()
 
 
@@ -6258,6 +6322,10 @@ async def _webapp_identify(request) -> tuple[dict | None, dict | None]:
     if not db_user:
         await add_user(telegram_id)
         db_user = await get_user(telegram_id)
+    if db_user["is_banned"] and not is_admin(telegram_id):
+        # Ban qilingan foydalanuvchi Mini App API'dan ham foydalana olmasin —
+        # bot chatidagi ban_check_middleware bilan bir xil qoida shu yerda.
+        return tg_user, None
     return tg_user, db_user
 
 
