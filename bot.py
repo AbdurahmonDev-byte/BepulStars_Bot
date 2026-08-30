@@ -45,6 +45,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    ChatMemberUpdated,
     CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -292,6 +293,15 @@ async def db_init() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 channel_id TEXT NOT NULL,
                 invite_link TEXT NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS channel_membership_cache (
+                channel_id TEXT NOT NULL,
+                telegram_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (channel_id, telegram_id)
             )
         """)
         await db.execute("""
@@ -819,6 +829,35 @@ async def delete_channel(channel_id_row: int) -> None:
         await db.commit()
 
 
+async def upsert_channel_membership(channel_keys: list[str], telegram_id: int, status: str) -> None:
+    """Telegramdan kelgan chat_member eventidagi aniq a'zolik holatini
+    keshlaydi. So'rov (join-request) orqali qo'shiladigan kanallarda
+    getChatMember on-demand chaqiruvi ba'zan haqiqiy a'zolarni ham
+    "topilmadi" deb xato qaytaradi (Telegram tomonidagi tanilgan xato) —
+    shu kesh o'sha holatda zaxira manba bo'lib xizmat qiladi."""
+    now = datetime.now().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        for key in channel_keys:
+            await db.execute(
+                "INSERT INTO channel_membership_cache (channel_id, telegram_id, status, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(channel_id, telegram_id) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at",
+                (key, telegram_id, status, now),
+            )
+        await db.commit()
+
+
+async def get_cached_channel_membership(channel_id: str, telegram_id: int) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT status FROM channel_membership_cache WHERE channel_id = ? AND telegram_id = ?",
+            (channel_id, telegram_id),
+        )
+        row = await cur.fetchone()
+        return row["status"] if row else None
+
+
 # ---------- Aloqa kontaktlari ----------
 
 async def get_contacts() -> list[dict]:
@@ -1044,6 +1083,14 @@ def normalize_channel_id(raw: str) -> str:
     return f"@{value}"
 
 
+def _membership_cache_key(value: str) -> str:
+    """channel_membership_cache kalitini izchil holga keltiradi — Telegram
+    username'lari katta/kichik harflarga sezgir emas, lekin admin panelga
+    turlicha yozilishi mumkin edi; raqamli chat ID'lar o'zgarishsiz qoladi."""
+    v = (value or "").strip()
+    return v.lower() if v.startswith("@") else v
+
+
 # Konfiguratsiya xatosi haqida adminlarga faqat bir marta xabar berish uchun
 _notified_bad_channels: set[str] = set()
 
@@ -1069,7 +1116,20 @@ async def check_subscriptions(bot: Bot, telegram_id: int, channels: list[dict]) 
             ):
                 not_subscribed.append(ch)
         except (TelegramBadRequest, TelegramForbiddenError) as e:
-            # Odatda bu xato ikki sababdan bo'ladi:
+            # Telegramning tanilgan xatosi: xususan so'rov (join-request)
+            # orqali qo'shiladigan kanallarda getChatMember ba'zan HAQIQIY
+            # a'zolarni ham "user not found" deb qaytaradi. chat_member
+            # update handler orqali keshlangan so'nggi ma'lum holat bo'lsa,
+            # shu on-demand chaqiruv xatosidan ko'ra unga ishonamiz.
+            cached_status = await get_cached_channel_membership(_membership_cache_key(chat_id), telegram_id)
+            if cached_status in ("member", "administrator", "creator", "restricted"):
+                logger.info(
+                    "getChatMember xato berdi, lekin keshda '%s' holati bor — obuna deb hisoblanmoqda "
+                    "(channel_id=%s, telegram_id=%s)",
+                    cached_status, chat_id, telegram_id,
+                )
+                continue
+            # Boshqa hollarda bu xato odatda ikki sababdan bo'ladi:
             #  1) Bot kanalda admin emas (getChatMember chaqira olmaydi)
             #  2) channel_id noto'g'ri kiritilgan (masalan "@" yo'q yoki xato ID)
             # Bunday holatda foydalanuvchini "obuna emas" deb belgilashning o'zi
@@ -1100,6 +1160,20 @@ async def check_subscriptions(bot: Bot, telegram_id: int, channels: list[dict]) 
                         pass
             not_subscribed.append(ch)
     return not_subscribed
+
+
+@router.chat_member()
+async def channel_membership_update_handler(event: ChatMemberUpdated) -> None:
+    """Telegram bot admin bo'lgan har qanday kanal/guruhda a'zolik holati
+    o'zgarganda keladi (masalan, admin bir kishining so'rovini tasdiqlaganda).
+    Bu aniq holatni keshlaymiz, chunki check_subscriptions'dagi on-demand
+    getChatMember chaqiruvi ba'zan (Telegramning ma'lum xatosi tufayli,
+    ayniqsa so'rov orqali qo'shiladigan kanallarda) haqiqiy a'zolarni ham
+    topib bera olmaydi."""
+    keys = [str(event.chat.id)]
+    if event.chat.username:
+        keys.append(_membership_cache_key(f"@{event.chat.username}"))
+    await upsert_channel_membership(keys, event.new_chat_member.user.id, str(event.new_chat_member.status))
 
 
 async def register_user_with_referral(telegram_id: int, referrer_id: int | None, friend_name: str = "") -> dict:
@@ -7211,7 +7285,7 @@ async def on_startup(bot: Bot) -> None:
     await db_init()
     if WEBHOOK_URL:
         webhook_full = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
-        await bot.set_webhook(webhook_full)
+        await bot.set_webhook(webhook_full, allowed_updates=dp.resolve_used_update_types())
         logger.info("Webhook o'rnatildi: %s", webhook_full)
     else:
         await bot.delete_webhook(drop_pending_updates=True)
@@ -7279,7 +7353,7 @@ async def main() -> None:
         # qo'lda chaqirilsa, db_init/webhook o'chirish 2 marta bajariladi (zararsiz,
         # lekin ortiqcha), shuning uchun faqat bitta marta ishlaydi.
         await start_web_server()
-        await dp.start_polling(bot)
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
 if __name__ == "__main__":
