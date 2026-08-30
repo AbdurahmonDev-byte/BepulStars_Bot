@@ -59,6 +59,11 @@ class _TursoCursor:
     def __init__(self, result_set):
         self._rows = list(result_set.rows) if result_set is not None else []
         self.lastrowid = getattr(result_set, "last_insert_rowid", None)
+        # aiosqlite'dagi cursor.rowcount bilan bir xil ism/ma'no — UPDATE/DELETE
+        # nechta qatorga ta'sir qilganini bildiradi (masalan atomik "yetarli
+        # balans bo'lsagina ayirish" kabi shart bilan yozilgan UPDATE'lar
+        # muvaffaqiyatli bo'lganini tekshirish uchun).
+        self.rowcount = getattr(result_set, "rows_affected", -1) if result_set is not None else -1
         self._pos = 0
 
     @staticmethod
