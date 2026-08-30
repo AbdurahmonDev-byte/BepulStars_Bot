@@ -1040,7 +1040,14 @@ BAN_MESSAGE = "⛔ Siz botdan foydalanish huquqidan mahrum qilingansiz."
 async def ban_check_middleware(handler, event, data):
     """Bot chatidagi HAR BIR xabar/callback uchun yagona tekshiruv nuqtasi —
     ban qilingan foydalanuvchi hech qanday handler'ga (box ochish, do'kon,
-    yechish va h.k.) yetib bora olmaydi. Adminlar bundan mustasno."""
+    yechish va h.k.) yetib bora olmaydi. Adminlar bundan mustasno.
+
+    Muhim istisno: haqiqiy to'lov (Telegram Stars) allaqachon amalga oshgan
+    successful_payment xabari hech qachon bloklanmaydi — aks holda Telegram
+    foydalanuvchidan pulni yechib olgan, lekin bot mahsulotni hech qachon
+    yetkazib bermaydigan holat yuzaga kelardi."""
+    if isinstance(event, Message) and event.successful_payment:
+        return await handler(event, data)
     tg_user = getattr(event, "from_user", None)
     if tg_user and not is_admin(tg_user.id):
         user = await get_user(tg_user.id)
@@ -1184,7 +1191,13 @@ async def subscription_check_middleware(handler, event, data):
     chaqirilardi — ya'ni allaqachon botdan foydalanib turgan (bir marta
     o'tgan) foydalanuvchi yangi qo'shilgan majburiy kanalga obuna bo'lmasdan
     ham hamma narsadan (do'kon, box, yechish va h.k.) foydalana olardi,
-    chunki ular /start'ni qayta bosishmaydi. Adminlar mustasno."""
+    chunki ular /start'ni qayta bosishmaydi. Adminlar mustasno.
+
+    Muhim istisno: allaqachon amalga oshgan Telegram Stars to'lovi
+    (successful_payment) hech qachon bloklanmaydi — pul yechilib bo'lgan,
+    mahsulot baribir yetkazilishi shart."""
+    if isinstance(event, Message) and event.successful_payment:
+        return await handler(event, data)
     tg_user = getattr(event, "from_user", None)
     if not tg_user or is_admin(tg_user.id):
         return await handler(event, data)
@@ -6756,6 +6769,27 @@ async def _webapp_identify(request) -> tuple[dict | None, dict | None]:
     return tg_user, db_user
 
 
+async def _webapp_not_subscribed(telegram_id: int) -> list[dict]:
+    """Mini App'dagi 'amal' endpointlari (sotib olish, yechish, promo, gift,
+    invoys yaratish) uchun majburiy-obuna tekshiruvi — bot chatidagi
+    subscription_check_middleware bilan bir xil qoida, shu yerga ham qo'llanadi,
+    chunki foydalanuvchi bot-chatga kirmasdan to'g'ridan-to'g'ri Mini App orqali
+    ham xarid/yechish qila olardi. Bo'sh ro'yxat = obuna OK yoki tekshiruv
+    shart emas (admin / hali kanal qo'shilmagan)."""
+    if is_admin(telegram_id) or _bot is None:
+        return []
+    channels = await get_channels()
+    if not channels:
+        return []
+    return await check_subscriptions(_bot, telegram_id, channels)
+
+
+def _webapp_subscription_error() -> "web.Response":
+    return web.json_response({
+        "error": "Avval botdagi majburiy kanallarga a'zo bo'ling, keyin qayta urinib ko'ring.",
+    }, status=403)
+
+
 async def webapp_me_handler(request):
     """Mini App header'ida va Profil bo'limida ko'rsatiladigan foydalanuvchi
     ma'lumotlari (balans, referallar soni, referal havola) — initData
@@ -6865,6 +6899,12 @@ async def webapp_create_invoice_handler(request):
     except Exception:
         return web.json_response({"error": "Noto'g'ri so'rov"}, status=400)
 
+    tg_user = verify_webapp_init_data(body.get("init_data", "") if isinstance(body, dict) else "")
+    if not tg_user:
+        return web.json_response({"error": "Foydalanuvchi aniqlanmadi — botni Telegram ichidan oching"}, status=401)
+    if await _webapp_not_subscribed(int(tg_user["id"])):
+        return _webapp_subscription_error()
+
     kind = body.get("kind")
     raw_id = body.get("id")
 
@@ -6914,6 +6954,8 @@ async def webapp_buy_balance_handler(request):
     tg_user, user = await _webapp_identify(request)
     if not user:
         return web.json_response({"error": "Foydalanuvchi aniqlanmadi — botni Telegram ichidan oching"}, status=401)
+    if await _webapp_not_subscribed(user["telegram_id"]):
+        return _webapp_subscription_error()
 
     try:
         body = await request.json()
@@ -7018,6 +7060,8 @@ async def webapp_redeem_promo_handler(request):
     tg_user, user = await _webapp_identify(request)
     if not user:
         return web.json_response({"error": "Foydalanuvchi aniqlanmadi — botni Telegram ichidan oching"}, status=401)
+    if await _webapp_not_subscribed(user["telegram_id"]):
+        return _webapp_subscription_error()
 
     try:
         body = await request.json()
@@ -7052,6 +7096,8 @@ async def webapp_buy_promo_handler(request):
     tg_user, user = await _webapp_identify(request)
     if not user:
         return web.json_response({"error": "Foydalanuvchi aniqlanmadi — botni Telegram ichidan oching"}, status=401)
+    if await _webapp_not_subscribed(user["telegram_id"]):
+        return _webapp_subscription_error()
 
     try:
         body = await request.json()
@@ -7090,6 +7136,8 @@ async def webapp_gift_claim_handler(request):
     tg_user, user = await _webapp_identify(request)
     if not user:
         return web.json_response({"error": "Foydalanuvchi aniqlanmadi — botni Telegram ichidan oching"}, status=401)
+    if await _webapp_not_subscribed(user["telegram_id"]):
+        return _webapp_subscription_error()
 
     try:
         body = await request.json()
@@ -7209,6 +7257,8 @@ async def webapp_upload_proof_handler(request):
     tg_user = verify_webapp_init_data(init_data)
     if not tg_user:
         return web.json_response({"error": "Foydalanuvchi aniqlanmadi — botni Telegram ichidan oching"}, status=401)
+    if await _webapp_not_subscribed(int(tg_user["id"])):
+        return _webapp_subscription_error()
     if not photo_bytes:
         return web.json_response({"error": "Chek (screenshot) topilmadi"}, status=400)
 
@@ -7274,6 +7324,8 @@ async def webapp_withdraw_handler(request):
     tg_user, user = await _webapp_identify(request)
     if not user:
         return web.json_response({"error": "Foydalanuvchi aniqlanmadi — botni Telegram ichidan oching"}, status=401)
+    if await _webapp_not_subscribed(user["telegram_id"]):
+        return _webapp_subscription_error()
 
     try:
         body = await request.json()
