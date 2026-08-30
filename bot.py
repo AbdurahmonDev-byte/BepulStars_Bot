@@ -1177,6 +1177,65 @@ async def check_subscriptions(bot: Bot, telegram_id: int, channels: list[dict]) 
     return not_subscribed
 
 
+async def subscription_check_middleware(handler, event, data):
+    """Bot chatidagi HAR BIR xabar/callback uchun majburiy-obuna tekshiruvi —
+    ban_check_middleware'ga o'xshab, yagona tekshiruv nuqtasi. Buning kerakligi
+    sababi: oldin check_subscriptions FAQAT /start va "check_sub" bosilganda
+    chaqirilardi — ya'ni allaqachon botdan foydalanib turgan (bir marta
+    o'tgan) foydalanuvchi yangi qo'shilgan majburiy kanalga obuna bo'lmasdan
+    ham hamma narsadan (do'kon, box, yechish va h.k.) foydalana olardi,
+    chunki ular /start'ni qayta bosishmaydi. Adminlar mustasno."""
+    tg_user = getattr(event, "from_user", None)
+    if not tg_user or is_admin(tg_user.id):
+        return await handler(event, data)
+
+    # /start va "check_sub"/"captcha:" o'zlari to'liq tekshiruvni allaqachon
+    # bajaradi (referalni saqlash bilan birga) — middleware ularga tegmaydi,
+    # aks holda ikki marta tekshirilib, referal oqimi buzilishi mumkin.
+    if isinstance(event, Message):
+        if event.text and event.text.startswith("/start"):
+            return await handler(event, data)
+    elif isinstance(event, CallbackQuery):
+        if event.data and (event.data.startswith("check_sub") or event.data.startswith("captcha:")):
+            return await handler(event, data)
+
+    channels = await get_channels()
+    if not channels:
+        return await handler(event, data)
+
+    bot = data.get("bot")
+    if bot is None:
+        return await handler(event, data)
+
+    not_sub = await check_subscriptions(bot, tg_user.id, channels)
+    if not_sub:
+        text = (
+            "❌ <b>Botdan foydalanishni davom ettirish uchun quyidagi "
+            "kanal(lar)ga a'zo bo'ling:</b>"
+        )
+        kb = channels_keyboard(not_sub, None)
+        if isinstance(event, CallbackQuery):
+            try:
+                await event.answer("❌ Avval majburiy kanallarga a'zo bo'ling!", show_alert=True)
+            except Exception:
+                pass
+            try:
+                await event.message.answer(text, reply_markup=kb)
+            except Exception:
+                pass
+        else:
+            try:
+                await event.answer(text, reply_markup=kb)
+            except Exception:
+                pass
+        return None
+    return await handler(event, data)
+
+
+router.message.outer_middleware.register(subscription_check_middleware)
+router.callback_query.outer_middleware.register(subscription_check_middleware)
+
+
 @router.chat_member()
 async def channel_membership_update_handler(event: ChatMemberUpdated) -> None:
     """Telegram bot admin bo'lgan har qanday kanal/guruhda a'zolik holati
