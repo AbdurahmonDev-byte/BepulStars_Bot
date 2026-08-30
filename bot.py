@@ -45,6 +45,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    ChatJoinRequest,
     ChatMemberUpdated,
     CopyTextButton,
     InlineKeyboardButton,
@@ -1095,6 +1096,14 @@ def _membership_cache_key(value: str) -> str:
 _notified_bad_channels: set[str] = set()
 
 
+#  Haqiqiy a'zolik (member/administrator/creator/restricted) — hisobga olinadi.
+#  "requested" — so'rov (join-request) yuborilgan, admin hali tasdiqlamagan
+#  bo'lishi mumkin; ko'p botlarda bo'lgani kabi, so'rovning o'zini "obuna"
+#  deb hisoblaymiz, chunki adminni tasdiqlashini kutish foydalanuvchi uchun
+#  keraksiz to'siq bo'ladi.
+_MEMBERSHIP_PASSING_STATUSES = {"member", "administrator", "creator", "restricted", "requested"}
+
+
 async def check_subscriptions(bot: Bot, telegram_id: int, channels: list[dict]) -> list[dict]:
     """Foydalanuvchi majburiy kanallarga a'zo ekanligini tekshiradi.
     A'zo bo'lmagan kanallar ro'yxatini qaytaradi.
@@ -1106,6 +1115,7 @@ async def check_subscriptions(bot: Bot, telegram_id: int, channels: list[dict]) 
     not_subscribed = []
     for ch in channels:
         chat_id = normalize_channel_id(ch["channel_id"])
+        cache_key = _membership_cache_key(chat_id)
         try:
             member = await bot.get_chat_member(chat_id, telegram_id)
             if member.status not in (
@@ -1114,6 +1124,11 @@ async def check_subscriptions(bot: Bot, telegram_id: int, channels: list[dict]) 
                 ChatMemberStatus.CREATOR,
                 ChatMemberStatus.RESTRICTED,
             ):
+                # Hali haqiqiy a'zo emas — lekin qo'shilish so'rovi yuborgan
+                # bo'lishi mumkin (join-request kanal/guruh). Shuni tekshiramiz.
+                cached_status = await get_cached_channel_membership(cache_key, telegram_id)
+                if cached_status in _MEMBERSHIP_PASSING_STATUSES:
+                    continue
                 not_subscribed.append(ch)
         except (TelegramBadRequest, TelegramForbiddenError) as e:
             # Telegramning tanilgan xatosi: xususan so'rov (join-request)
@@ -1121,8 +1136,8 @@ async def check_subscriptions(bot: Bot, telegram_id: int, channels: list[dict]) 
             # a'zolarni ham "user not found" deb qaytaradi. chat_member
             # update handler orqali keshlangan so'nggi ma'lum holat bo'lsa,
             # shu on-demand chaqiruv xatosidan ko'ra unga ishonamiz.
-            cached_status = await get_cached_channel_membership(_membership_cache_key(chat_id), telegram_id)
-            if cached_status in ("member", "administrator", "creator", "restricted"):
+            cached_status = await get_cached_channel_membership(cache_key, telegram_id)
+            if cached_status in _MEMBERSHIP_PASSING_STATUSES:
                 logger.info(
                     "getChatMember xato berdi, lekin keshda '%s' holati bor — obuna deb hisoblanmoqda "
                     "(channel_id=%s, telegram_id=%s)",
@@ -1174,6 +1189,21 @@ async def channel_membership_update_handler(event: ChatMemberUpdated) -> None:
     if event.chat.username:
         keys.append(_membership_cache_key(f"@{event.chat.username}"))
     await upsert_channel_membership(keys, event.new_chat_member.user.id, str(event.new_chat_member.status))
+
+
+@router.chat_join_request()
+async def channel_join_request_handler(event: ChatJoinRequest) -> None:
+    """Foydalanuvchi qo'shilish so'rovini (join-request) yuborganda keladi —
+    "Faqat adminlar tasdiqlagan a'zolarni qabul qilish" yoqilgan kanal/guruhlar
+    uchun. Admin tasdiqlashini kutish foydalanuvchi uchun keraksiz to'siq
+    bo'lgani uchun (ba'zan tez orada tasdiqlanmasligi mumkin), so'rovning
+    o'zini yetarli deb hisoblab, majburiy-obuna tekshiruvidan o'tkazamiz —
+    boshqa ko'p botlarda ham shunday qilinadi. Admin haqiqatan tasdiqlasa,
+    keyinroq chat_member eventi kelib bu holatni "member"ga yangilaydi."""
+    keys = [str(event.chat.id)]
+    if event.chat.username:
+        keys.append(_membership_cache_key(f"@{event.chat.username}"))
+    await upsert_channel_membership(keys, event.from_user.id, "requested")
 
 
 async def register_user_with_referral(telegram_id: int, referrer_id: int | None, friend_name: str = "") -> dict:
