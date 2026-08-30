@@ -543,10 +543,22 @@ async def add_stars(telegram_id: int, amount: int) -> None:
         await db.commit()
 
 
-async def deduct_stars(telegram_id: int, amount: int) -> None:
+async def deduct_stars(telegram_id: int, amount: int) -> bool:
+    """Balansdan yulduz ayiradi — ATOMIK: tekshiruv va ayirish bitta SQL
+    ifodasida bajariladi (WHERE balance_stars >= amount), shuning uchun ikki
+    parallel so'rov (masalan tez-tez ikki marta bosish) bir xil balansni
+    "yetarli" deb hisoblab, ikkalasi ham muvaffaqiyatli bo'lib qolishi
+    mumkin emas. Agar balans yetarli bo'lmasa (poyga holatida ham) hech
+    narsa ayirilmaydi va False qaytadi — CHAQIRUVCHI buni albatta
+    tekshirishi shart, aks holda foydalanuvchi to'lamasdan ham mukofot
+    olib qolishi mumkin."""
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET balance_stars = balance_stars - ? WHERE telegram_id = ?", (amount, telegram_id))
+        cur = await db.execute(
+            "UPDATE users SET balance_stars = balance_stars - ? WHERE telegram_id = ? AND balance_stars >= ?",
+            (amount, telegram_id, amount),
+        )
         await db.commit()
+        return cur.rowcount > 0
 
 
 async def set_user_balance(telegram_id: int, amount: int) -> None:
@@ -1249,6 +1261,41 @@ router.message.outer_middleware.register(subscription_check_middleware)
 router.callback_query.outer_middleware.register(subscription_check_middleware)
 
 
+# Faqat admin panelga tegishli callback_data prefikslari — pastdagi
+# admin_callback_guard_middleware shu ro'yxatdagi HAR QANDAY callback'ni
+# is_admin() bilan tekshirmasdan hech qaysi handlerga o'tkazmaydi.
+_ADMIN_ONLY_CALLBACK_PREFIXES = (
+    "admin",  # "admin" (orqaga) va "admin:..." (sozlamalar, do'kon, boxlar,
+              # promo, kanallar, foydalanuvchilar, statistika va h.k.)
+    "wd_approve:", "wd_reject:",        # yulduz/gift yechish so'rovini tasdiqlash/rad etish
+    "order_approve:", "order_reject:",  # UZS chek buyurtmasini tasdiqlash/rad etish
+)
+
+
+async def admin_callback_guard_middleware(handler, event, data):
+    """Admin panelga tegishli HAR BIR callback uchun yagona, markazlashgan
+    is_admin() tekshiruvi. Ayrim handlerlarning o'zida ham is_admin()
+    tekshiruvi bor, lekin ko'plari (masalan to'lov kartasini, referal
+    mukofotini, majburiy kanallar ro'yxatini o'zgartiradigan handlerlar)
+    buni unutib qo'ygan edi — bu esa oddiy foydalanuvchi ADMIN xabarining
+    (masalan forward qilingan nusxasi) tugmasini bosib, to'lov kartasini
+    o'ziniki bilan almashtirishi yoki majburiy kanalni o'chirib tashlashi
+    mumkinligini anglatardi. Bu middleware butun sinfni bir joyda yopadi —
+    yangi qo'shiladigan admin handlerlar ham avtomatik himoyalangan bo'ladi."""
+    if isinstance(event, CallbackQuery) and event.data and event.data.startswith(_ADMIN_ONLY_CALLBACK_PREFIXES):
+        tg_user = event.from_user
+        if not tg_user or not is_admin(tg_user.id):
+            try:
+                await event.answer("❌ Siz admin emassiz!", show_alert=True)
+            except Exception:
+                pass
+            return None
+    return await handler(event, data)
+
+
+router.callback_query.outer_middleware.register(admin_callback_guard_middleware)
+
+
 @router.chat_member()
 async def channel_membership_update_handler(event: ChatMemberUpdated) -> None:
     """Telegram bot admin bo'lgan har qanday kanal/guruhda a'zolik holati
@@ -1733,7 +1780,9 @@ async def process_stars_withdrawal(call: CallbackQuery, bot: Bot, amount: int) -
         await call.answer("❌ Balans yetarli emas!", show_alert=True)
         return
 
-    await deduct_stars(call.from_user.id, amount)
+    if not await deduct_stars(call.from_user.id, amount):
+        await call.answer("❌ Balans yetarli emas!", show_alert=True)
+        return
     w_id = await add_withdrawal(
         telegram_id=call.from_user.id,
         user_name=call.from_user.first_name or "",
@@ -1933,7 +1982,9 @@ async def withdraw_gift_confirm(call: CallbackQuery, bot: Bot) -> None:
         return
 
     # Gift yechib olinadi — yulduz ayriladi
-    await deduct_stars(call.from_user.id, item["price_stars"])
+    if not await deduct_stars(call.from_user.id, item["price_stars"]):
+        await call.answer("❌ Balans yetarli emas!", show_alert=True)
+        return
     w_id = await add_withdrawal(
         telegram_id=call.from_user.id,
         user_name=call.from_user.first_name or "",
@@ -2444,7 +2495,8 @@ async def buy_promo_from_shop(
     if not user or user["balance_stars"] < promo["shop_price_stars"]:
         return {"ok": False, "error": f"❌ Balans yetarli emas! Kerak: {promo['shop_price_stars']} ⭐"}
 
-    await deduct_stars(telegram_id, promo["shop_price_stars"])
+    if not await deduct_stars(telegram_id, promo["shop_price_stars"]):
+        return {"ok": False, "error": f"❌ Balans yetarli emas! Kerak: {promo['shop_price_stars']} ⭐"}
     return await _award_promo(bot, promo, telegram_id, first_name, username)
 
 
@@ -2689,7 +2741,9 @@ async def box_open_callback(call: CallbackQuery, bot: Bot) -> None:
         return
 
     # Box narxini ayiramiz
-    await deduct_stars(call.from_user.id, box["cost"])
+    if not await deduct_stars(call.from_user.id, box["cost"]):
+        await call.answer(f"❌ Balans yetarli emas! Kerak: {box['cost']} ⭐", show_alert=True)
+        return
     if box["once_per_day"]:
         await set_daily_box_used(call.from_user.id, today)
 
@@ -3059,7 +3113,9 @@ async def buy_item_callback(call: CallbackQuery, bot: Bot) -> None:
         return
 
     # Xarid — yulduz ayriladi
-    await deduct_stars(call.from_user.id, item["price_stars"])
+    if not await deduct_stars(call.from_user.id, item["price_stars"]):
+        await call.answer("❌ Balans yetarli emas!", show_alert=True)
+        return
 
     result = await deliver_gift(bot, call.from_user.id, item, price_stars=item["price_stars"], source="purchase")
     status_line, user_note = gift_delivery_texts(result)
@@ -4050,6 +4106,9 @@ async def admin_settings(call: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "admin:set:ref_reward")
 async def set_ref_reward(call: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
     await state.set_state(SettingsStates.ref_reward)
     await call.message.edit_text(
         "✏️ <b>Yangi referal mukofotini yozing:</b>\n"
@@ -4075,6 +4134,9 @@ async def ref_reward_input(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "admin:set:min_ref")
 async def set_min_ref(call: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
     await state.set_state(SettingsStates.min_referals)
     await call.message.edit_text(
         "✏️ <b>Yangi minimal cheklovni yozing:</b>\n"
@@ -4100,6 +4162,9 @@ async def min_ref_input(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "admin:set:max_ref_daily")
 async def set_max_ref_daily(call: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
     await state.set_state(SettingsStates.max_ref_daily)
     await call.message.edit_text(
         "✏️ <b>Bitta odam uchun kunlik referal chegarasini yozing:</b>\n"
@@ -4126,6 +4191,9 @@ async def max_ref_daily_input(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "admin:set:min_withdraw")
 async def set_min_withdraw(call: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
     await state.set_state(SettingsStates.min_withdraw)
     await call.message.edit_text(
         "✏️ <b>Yangi yulduz yechish minimumini yozing:</b>\n"
@@ -4151,6 +4219,9 @@ async def min_withdraw_input(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "admin:set:pay_card")
 async def set_pay_card(call: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
     await state.set_state(SettingsStates.pay_card)
     await call.message.edit_text(
         "💳 <b>Yangi to'lov ma'lumotlarini yozing:</b>\n"
@@ -4176,6 +4247,9 @@ async def pay_card_input(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "admin:set:reviews_channel")
 async def set_reviews_channel(call: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
     await state.set_state(SettingsStates.reviews_channel)
     await call.message.edit_text(
         "⭐ <b>Otziv kanalini yuboring:</b>\n"
@@ -4275,6 +4349,9 @@ async def admin_shop(call: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("admin:add:"))
 async def admin_add_item_start(call: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
     category = call.data.split(":")[2]
     await state.set_state(AddItemStates.category)
     await state.update_data(category=category)
@@ -4360,6 +4437,9 @@ async def add_item_stars_price(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "admin:shop_del")
 async def admin_shop_delete_list(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
     items = await get_all_shop_items()
     if not items:
         await call.answer("❌ Hech qanday mahsulot yo'q", show_alert=True)
@@ -4376,6 +4456,9 @@ async def admin_shop_delete_list(call: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("admin:delitem:"))
 async def admin_delete_item(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
     item_id = int(call.data.split(":")[2])
     await delete_shop_item(item_id)
     await call.answer("✅ O'chirildi!", show_alert=True)
@@ -5051,6 +5134,9 @@ async def admin_check_channel(call: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(F.data.startswith("admin:chdel:"))
 async def admin_delete_channel(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
     row_id = int(call.data.split(":")[2])
     await delete_channel(row_id)
     await call.answer("✅ Kanal o'chirildi!", show_alert=True)
@@ -5059,6 +5145,9 @@ async def admin_delete_channel(call: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "admin:channel_add")
 async def admin_add_channel(call: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
     await state.set_state(AddChannelStates.channel_id)
     await call.message.edit_text(
         "🔗 <b>Kanal qo'shish (2 xil usul):</b>\n\n"
@@ -5288,6 +5377,9 @@ async def main_menu_callback(call: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "admin")
 async def admin_back(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
     await call.message.edit_text("👑 <b>Admin panel</b>\n\nQuyidagi bo'limlardan birini tanlang:", reply_markup=admin_keyboard())
     await call.answer()
 
@@ -6711,11 +6803,15 @@ async def webapp_page_handler(request):
     return web.Response(text=MINI_APP_HTML, content_type="text/html")
 
 
+WEBAPP_INIT_DATA_MAX_AGE_SECONDS = 24 * 60 * 60  # Telegram tavsiyasi bo'yicha
+
+
 def verify_webapp_init_data(init_data: str) -> dict | None:
     """Telegram Mini App'dan kelgan initData'ni HMAC orqali tekshiradi
     (https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app).
     Muvaffaqiyatli bo'lsa foydalanuvchi ma'lumotlari lug'atini (id, first_name,
-    username, ...) qaytaradi, aks holda None (soxta/o'zgartirilgan so'rov)."""
+    username, ...) qaytaradi, aks holda None (soxta/o'zgartirilgan yoki
+    muddati o'tgan so'rov)."""
     if not init_data or not BOT_TOKEN:
         return None
     try:
@@ -6731,6 +6827,16 @@ def verify_webapp_init_data(init_data: str) -> dict | None:
     secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
     computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(computed_hash, received_hash):
+        return None
+
+    # auth_date eskirmaganini tekshiramiz — aks holda bir marta oqib chiqqan
+    # (log, proksi keshi, umumiy qurilma) initData muddatsiz qayta ishlatilishi
+    # mumkin bo'lib qolar edi (Telegramning o'zi shuni tavsiya qiladi).
+    try:
+        auth_date = int(pairs.get("auth_date", "0"))
+    except ValueError:
+        return None
+    if auth_date <= 0 or time.time() - auth_date > WEBAPP_INIT_DATA_MAX_AGE_SECONDS:
         return None
 
     user_raw = pairs.get("user")
@@ -7012,7 +7118,8 @@ async def webapp_buy_balance_handler(request):
                 "error": f"Balansingiz yetarli emas! Yana {need_stars} ⭐ kerak.",
             }, status=402)
 
-        await deduct_stars(telegram_id, item["price_stars"])
+        if not await deduct_stars(telegram_id, item["price_stars"]):
+            return web.json_response({"error": "Balansingiz yetarli emas! Sahifani yangilab qaytadan urinib ko'ring."}, status=402)
 
         gift_result = await deliver_gift(
             _bot, telegram_id, item, price_stars=item["price_stars"], source="purchase",
@@ -7053,7 +7160,8 @@ async def webapp_buy_balance_handler(request):
         if user["balance_stars"] < box["cost"]:
             return web.json_response({"error": f"Balans yetarli emas! Kerak: {box['cost']} ⭐"}, status=402)
 
-        await deduct_stars(telegram_id, box["cost"])
+        if not await deduct_stars(telegram_id, box["cost"]):
+            return web.json_response({"error": f"Balans yetarli emas! Kerak: {box['cost']} ⭐"}, status=402)
         if box["once_per_day"]:
             await set_daily_box_used(telegram_id, today)
 
@@ -7383,7 +7491,8 @@ async def webapp_withdraw_handler(request):
     else:
         return web.json_response({"error": "Noma'lum turi"}, status=400)
 
-    await deduct_stars(telegram_id, amount)
+    if not await deduct_stars(telegram_id, amount):
+        return web.json_response({"error": "Balans yetarli emas! Sahifani yangilab qaytadan urinib ko'ring."}, status=402)
     w_id = await add_withdrawal(
         telegram_id=telegram_id, user_name=first_name, username=username,
         kind=kind, amount_stars=amount, item_name=item_name,
