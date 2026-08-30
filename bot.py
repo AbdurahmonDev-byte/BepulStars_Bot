@@ -6769,6 +6769,22 @@ async def _webapp_identify(request) -> tuple[dict | None, dict | None]:
     return tg_user, db_user
 
 
+async def _webapp_ban_error(telegram_id: int) -> "web.Response | None":
+    """_webapp_identify() faqat JSON tanali so'rovlar uchun ishlaydi — multipart
+    (upload_proof) va init_data'ni JSON tanasidan alohida o'qiydigan
+    (create_invoice) endpointlar allaqachon o'z tg_user'ini olgan bo'ladi,
+    lekin ban holatini hali tekshirmagan bo'ladi. Shu funksiya o'sha
+    tekshiruvni ular uchun ham bajaradi — aks holda ban qilingan foydalanuvchi
+    haqiqiy Stars to'lovi yoki UZS chek yuklash orqali ban'ni chetlab o'tar edi."""
+    user = await get_user(telegram_id)
+    if not user:
+        await add_user(telegram_id)
+        return None
+    if user["is_banned"] and not is_admin(telegram_id):
+        return web.json_response({"error": BAN_MESSAGE}, status=403)
+    return None
+
+
 async def _webapp_not_subscribed(telegram_id: int) -> list[dict]:
     """Mini App'dagi 'amal' endpointlari (sotib olish, yechish, promo, gift,
     invoys yaratish) uchun majburiy-obuna tekshiruvi — bot chatidagi
@@ -6902,6 +6918,9 @@ async def webapp_create_invoice_handler(request):
     tg_user = verify_webapp_init_data(body.get("init_data", "") if isinstance(body, dict) else "")
     if not tg_user:
         return web.json_response({"error": "Foydalanuvchi aniqlanmadi — botni Telegram ichidan oching"}, status=401)
+    ban_error = await _webapp_ban_error(int(tg_user["id"]))
+    if ban_error is not None:
+        return ban_error
     if await _webapp_not_subscribed(int(tg_user["id"])):
         return _webapp_subscription_error()
 
@@ -7257,6 +7276,9 @@ async def webapp_upload_proof_handler(request):
     tg_user = verify_webapp_init_data(init_data)
     if not tg_user:
         return web.json_response({"error": "Foydalanuvchi aniqlanmadi — botni Telegram ichidan oching"}, status=401)
+    ban_error = await _webapp_ban_error(int(tg_user["id"]))
+    if ban_error is not None:
+        return ban_error
     if await _webapp_not_subscribed(int(tg_user["id"])):
         return _webapp_subscription_error()
     if not photo_bytes:
