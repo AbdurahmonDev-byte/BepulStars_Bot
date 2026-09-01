@@ -2996,12 +2996,13 @@ async def shop_promo_detail_callback(call: CallbackQuery) -> None:
         await call.answer("❌ Bu mahsulot endi mavjud emas", show_alert=True)
         return
 
-    text = f"🎟 <b>{p['shop_name']}</b>\n\n💰 Narxi: <b>{p['shop_price_stars']} ⭐</b> (bot balansidan)"
+    text = f"🎟 <b>{p['shop_name']}</b>\n\n💰 Narxi: <b>{p['shop_price_stars']} ⭐</b>"
     if p["desc_text"]:
         text += f"\n\n{p['desc_text']}"
 
     kb = InlineKeyboardBuilder()
-    kb.button(text=f"💳 Sotib olish ({p['shop_price_stars']} ⭐)", callback_data=f"shoppromobuy:{promo_id}")
+    kb.button(text=f"⭐ Bot balansidan ({p['shop_price_stars']} ⭐)", callback_data=f"shoppromobuy:{promo_id}")
+    kb.button(text=f"✨ Telegram Stars bilan ({p['shop_price_stars']} ⭐)", callback_data=f"promobuy_tgstars:{promo_id}")
     kb.button(text="🔙 Ortga", callback_data="shop:promo")
     kb.adjust(1)
     await call.message.edit_text(text, reply_markup=kb.as_markup())
@@ -3037,6 +3038,38 @@ async def shop_promo_buy_callback(call: CallbackQuery, bot: Bot) -> None:
         )
     else:
         await call.message.answer(result["text"])
+
+
+@router.callback_query(F.data.startswith("promobuy_tgstars:"))
+async def shop_promo_buy_tgstars_callback(call: CallbackQuery, bot: Bot) -> None:
+    """Do'kondagi promokodni haqiqiy Telegram Stars bilan to'lash uchun invoys yuboradi."""
+    promo_id = int(call.data.split(":")[1])
+    promo = await get_promo_by_id(promo_id)
+    if not promo or promo["shop_price_stars"] <= 0 or not promo["shop_name"]:
+        await call.answer("❌ Bu mahsulot endi mavjud emas", show_alert=True)
+        return
+
+    error = await _promo_eligibility_error(promo, call.from_user.id)
+    if error:
+        await call.answer(error, show_alert=True)
+        return
+
+    description = promo["desc_text"] or f"Promokod — {promo['shop_price_stars']} ⭐ Telegram Stars"
+    try:
+        await bot.send_invoice(
+            chat_id=call.from_user.id,
+            title=f"🎟 {promo['shop_name']}",
+            description=description[:255],
+            payload=f"promo:{promo_id}",
+            currency="XTR",
+            prices=[LabeledPrice(label=promo["shop_name"], amount=promo["shop_price_stars"])],
+            provider_token="",
+        )
+    except TelegramBadRequest as e:
+        logger.error("Promo Stars invoys yuborilmadi (promo_id=%s): %s", promo_id, e)
+        await call.answer("❌ Invoys yuborib bo'lmadi, keyinroq urinib ko'ring.", show_alert=True)
+        return
+    await call.answer()
 
 
 @router.callback_query(F.data.startswith("item:"))
@@ -3245,6 +3278,17 @@ async def pre_checkout_handler(pre_checkout_query: PreCheckoutQuery, bot: Bot) -
         if not box:
             ok = False
             error_message = "Bu box endi mavjud emas."
+    elif payload.startswith("promo:"):
+        promo_id = int(payload.split(":")[1])
+        promo = await get_promo_by_id(promo_id)
+        if not promo or promo["shop_price_stars"] <= 0 or not promo["shop_name"]:
+            ok = False
+            error_message = "Bu promokod endi sotuvda mavjud emas."
+        else:
+            promo_error = await _promo_eligibility_error(promo, pre_checkout_query.from_user.id)
+            if promo_error:
+                ok = False
+                error_message = promo_error
     await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=ok, error_message=error_message)
 
 
@@ -3291,6 +3335,44 @@ async def _handle_box_stars_payment(message: Message, bot: Bot, payload: str, pa
         await show_boxes(message.answer, message.from_user.id, result["text"])
 
 
+async def _handle_promo_stars_payment(message: Message, bot: Bot, payload: str, payment) -> None:
+    """Promokod haqiqiy Telegram Stars bilan to'langach shu yerda ochiladi
+    (bepul kod kiritilgandagidek _award_promo orqali). Bot balansiga
+    tegilmaydi — bu alohida (real pul) to'lov yo'li."""
+    promo_id = int(payload.split(":")[1])
+    promo = await get_promo_by_id(promo_id)
+    if not promo:
+        await message.answer("⚠️ To'lov qabul qilindi, lekin promokod topilmadi. Admin bilan bog'laning.")
+        return
+
+    result = await _award_promo(
+        bot, promo, message.from_user.id,
+        message.from_user.first_name or "", message.from_user.username or "",
+    )
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🎟 <b>PROMOKOD TELEGRAM STARS BILAN SOTIB OLINDI!</b>\n\n"
+                f"👤 Foydalanuvchi: {message.from_user.first_name} (@{message.from_user.username or '—'})\n"
+                f"🆔 ID: <code>{message.from_user.id}</code>\n"
+                f"🎟 Promokod: <b>{promo['shop_name'] or promo['code']}</b>\n"
+                f"💰 To'lov: <b>{payment.total_amount} ⭐ Telegram Stars</b>\n"
+                f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            )
+        except TelegramForbiddenError:
+            pass
+
+    if result.get("claim_id"):
+        await message.answer(
+            result["text"],
+            reply_markup=gift_claim_keyboard(result["claim_id"], result["gift_price_stars"]),
+        )
+    else:
+        await message.answer(result["text"])
+
+
 @router.message(F.successful_payment)
 async def successful_payment_handler(message: Message, bot: Bot) -> None:
     """To'lov muvaffaqiyatli o'tgach — mahsulotni yetkazib beramiz va adminga xabar beramiz."""
@@ -3299,6 +3381,10 @@ async def successful_payment_handler(message: Message, bot: Bot) -> None:
 
     if payload.startswith("box:"):
         await _handle_box_stars_payment(message, bot, payload, payment)
+        return
+
+    if payload.startswith("promo:"):
+        await _handle_promo_stars_payment(message, bot, payload, payment)
         return
 
     if payload.startswith("topup:"):
@@ -6252,9 +6338,18 @@ function shopPromoCard(p) {
     <div class="name">${p.name}</div>
     <div class="desc">${p.desc || ''}</div>
     <div class="price">${p.price_stars} ⭐</div>
-    <div class="btnrow"><button>💳 Sotib olish</button></div>
+    <div class="btnrow">
+      <button data-act="balance">⭐ Balansdan</button>
+      <button data-act="tgstars" class="stars">✨ Stars bilan</button>
+    </div>
   `;
-  card.querySelector('button').onclick = (e) => buyShopPromo(p.id, e.target);
+  card.querySelectorAll('button').forEach(btn => {
+    btn.onclick = () => {
+      const act = btn.dataset.act;
+      if (act === 'balance') buyShopPromo(p.id, btn);
+      else if (act === 'tgstars') buyStars('shop_promo', p.id, btn);
+    };
+  });
   return card;
 }
 
@@ -7057,6 +7152,21 @@ async def webapp_create_invoice_handler(request):
                 payload=f"box:{box['box_id']}",
                 currency="XTR",
                 prices=[LabeledPrice(label=box["name"], amount=box["cost_tgstars"])],
+                provider_token="",
+            )
+        elif kind == "shop_promo":
+            promo = await get_promo_by_id(int(raw_id))
+            if not promo or promo["shop_price_stars"] <= 0 or not promo["shop_name"]:
+                return web.json_response({"error": "Promokod topilmadi"}, status=404)
+            promo_error = await _promo_eligibility_error(promo, int(tg_user["id"]))
+            if promo_error:
+                return web.json_response({"error": promo_error}, status=403)
+            invoice_url = await _bot.create_invoice_link(
+                title=f"🎟 {promo['shop_name']}",
+                description=(promo["desc_text"] or f"Promokod — {promo['shop_price_stars']} ⭐ Telegram Stars")[:255],
+                payload=f"promo:{promo['id']}",
+                currency="XTR",
+                prices=[LabeledPrice(label=promo["shop_name"], amount=promo["shop_price_stars"])],
                 provider_token="",
             )
         else:
