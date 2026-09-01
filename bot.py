@@ -136,6 +136,11 @@ captcha_pending: dict[int, dict] = {}
 CAPTCHA_MAX_ATTEMPTS = 3
 CAPTCHA_TTL_SECONDS = 300
 
+# Telegram Stars orqali Mini App'da sotib olingan box/promokod natijasi.
+# To'lov chat safida ochilgani uchun webapp bunga raketani ko'rsatishi kerak.
+# telegram_id -> {"result": dict, "ts": float(mototonic)}
+recent_stars_awards: dict[int, dict] = {}
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -3310,6 +3315,7 @@ async def _handle_box_stars_payment(message: Message, bot: Bot, payload: str, pa
         bot, box, message.from_user.id, message.from_user.first_name or "", message.from_user.username or "",
         via_tgstars=True,
     )
+    recent_stars_awards[message.from_user.id] = {"result": result, "ts": time.monotonic()}
 
     for admin_id in ADMIN_IDS:
         try:
@@ -3349,6 +3355,7 @@ async def _handle_promo_stars_payment(message: Message, bot: Bot, payload: str, 
         bot, promo, message.from_user.id,
         message.from_user.first_name or "", message.from_user.username or "",
     )
+    recent_stars_awards[message.from_user.id] = {"result": result, "ts": time.monotonic()}
 
     for admin_id in ADMIN_IDS:
         try:
@@ -6676,6 +6683,7 @@ async function buyStars(kind, id, btnEl) {
       if (status === 'paid') {
         toast('✅ To\\'lov qabul qilindi!');
         await refreshMe(); await refreshShop();
+        await pollLastAward();
       } else if (status === 'failed') {
         toast('❌ To\\'lov amalga oshmadi');
       }
@@ -6694,6 +6702,23 @@ async function buyStars(kind, id, btnEl) {
 }
 
 let UZS_ITEM = null;
+async function pollLastAward() {
+  for (let i = 0; i < 15; i++) {
+    try {
+      const res = await fetch('/api/last_award', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ init_data: INIT_DATA }),
+      });
+      const data = await res.json();
+      if (res.ok && data.ok && typeof data.ratio === 'number') {
+        await launchRocket(data.ratio, data.kind);
+        showResult(data.message, data.claim_id ? { claim_id: data.claim_id, gift_price_stars: data.gift_price_stars } : null);
+        return;
+      }
+    } catch (e) {}
+    await new Promise(r => setTimeout(r, 800));
+  }
+}
 function openUzsModal(item) {
   UZS_ITEM = item;
   document.getElementById('uzsTitle').textContent = `💳 ${item.name}`;
@@ -7323,6 +7348,32 @@ async def webapp_redeem_promo_handler(request):
     })
 
 
+async def webapp_last_award_handler(request):
+    """Mini App'da Telegram Stars bilan box/promokod to'langach, natija chat
+    safida ochiladi. Webapp bu endpoint orqali o'sha natijani so'rab, raketani
+    ko'rsatadi. Natija bir marta olinadi (pop) va 60 soniya ichida amal qiladi."""
+    if _bot is None:
+        return web.json_response({"error": "Bot hali tayyor emas"}, status=503)
+
+    tg_user, user = await _webapp_identify(request)
+    if not user:
+        return web.json_response({"error": "Foydalanuvchi aniqlanmadi — botni Telegram ichidan oching"}, status=401)
+
+    entry = recent_stars_awards.pop(user["telegram_id"], None)
+    if not entry or time.monotonic() - entry["ts"] > 60:
+        return web.json_response({"ok": False})
+
+    result = entry["result"]
+    return web.json_response({
+        "ok": True,
+        "message": result["text"],
+        "ratio": result["ratio"],
+        "kind": result["kind"],
+        "claim_id": result["claim_id"],
+        "gift_price_stars": result["gift_price_stars"],
+    })
+
+
 async def webapp_buy_promo_handler(request):
     """Mini App'dan do'kondagi promokodni ⭐ balans evaziga sotib olish —
     bot-chat'dagi shop_promo_buy_callback bilan bir xil markazlashgan
@@ -7655,6 +7706,7 @@ def register_webapp_routes(app: "web.Application") -> None:
     app.router.add_post("/api/gift_claim", webapp_gift_claim_handler)
     app.router.add_post("/api/redeem_promo", webapp_redeem_promo_handler)
     app.router.add_post("/api/buy_promo", webapp_buy_promo_handler)
+    app.router.add_post("/api/last_award", webapp_last_award_handler)
 
 
 # ============================================================
