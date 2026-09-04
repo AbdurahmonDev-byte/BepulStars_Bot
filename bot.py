@@ -1539,6 +1539,15 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext) -> None:
     # Yangi foydalanuvchi — to'g'ridan-to'g'ri ro'yxatga olamiz (referali
     # bo'lsa ham, bo'lmasa ham; referal mukofoti kunlik chegara bilan
     # nakrutkadan himoyalangan — register_user_with_referral'ga qarang).
+    #
+    # Muhim: agar bu /start'da referal payload bo'lmasa (masalan
+    # foydalanuvchi kanallarga a'zo bo'lgandan keyin "✅ Tekshirdim"
+    # tugmasini emas, oddiy /start'ni qayta yuborgan bo'lsa), avval
+    # saqlangan pending_ref'dan foydalanamiz — aks holda referal
+    # butunlay yo'qolib, "referal ba'zida hisoblanmayapti" shikoyatiga
+    # aynan shu sabab bo'lardi.
+    if referrer_id is None:
+        referrer_id = pending_ref.get(message.from_user.id)
     await register_user_with_referral(message.from_user.id, referrer_id, message.from_user.full_name)
     pending_ref.pop(message.from_user.id, None)
     await message.answer(
@@ -2108,7 +2117,8 @@ async def promo_redeem_input(message: Message, state: FSMContext, bot: Bot) -> N
         await message.answer(result["error"])
         return
     if result["claim_id"]:
-        await message.answer(result["text"], reply_markup=gift_claim_keyboard(result["claim_id"], result["gift_price_stars"]))
+        kb = await gift_claim_keyboard(result["claim_id"], result["gift_price_stars"])
+        await message.answer(result["text"], reply_markup=kb)
     else:
         await message.answer(result["text"])
 
@@ -2405,10 +2415,29 @@ async def buy_promo_from_shop(
     return await _award_promo(bot, promo, telegram_id, first_name, username)
 
 
-def gift_claim_keyboard(claim_id: int, price_stars: int) -> InlineKeyboardMarkup:
+async def _gift_claim_has_auto_delivery(claim_id: int) -> bool:
+    """Shu gift claim'ga tegishli mahsulotda haqiqiy Telegram gift avtomatik
+    yuborish uchun bog'langanmi (tg_gift_id yoki bir nechta gift_variants) —
+    bunday giftlar uchun "starsga aylantirish" tanlovi berilmaydi: mijoz
+    talabiga ko'ra, avtomatik yuboriladigan haqiqiy giftlar albatta shu
+    tarzda yetkazilishi kerak, ichki (arzon) starsga almashtirib olinmasin."""
+    claim = await get_gift_claim(claim_id)
+    if not claim:
+        return False
+    item = await get_shop_item(claim["item_id"])
+    if not item:
+        return False
+    if item.get("tg_gift_id"):
+        return True
+    variants = await get_gift_variants(claim["item_id"])
+    return len(variants) >= 1
+
+
+async def gift_claim_keyboard(claim_id: int, price_stars: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="🎁 Giftni olish", callback_data=f"giftclaim:real:{claim_id}")
-    kb.button(text=f"⭐ {price_stars} ⭐ ga aylantirish", callback_data=f"giftclaim:stars:{claim_id}")
+    if not await _gift_claim_has_auto_delivery(claim_id):
+        kb.button(text=f"⭐ {price_stars} ⭐ ga aylantirish", callback_data=f"giftclaim:stars:{claim_id}")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -2433,6 +2462,12 @@ async def gift_claim_callback(call: CallbackQuery, bot: Bot) -> None:
         return
 
     if action == "stars":
+        if await _gift_claim_has_auto_delivery(claim_id):
+            # Faqat tugmani yashirish yetarli emas — kimdir to'g'ridan-to'g'ri
+            # so'rov yuborishi mumkin, shuning uchun serverda ham qaytadan
+            # tekshiramiz.
+            await call.answer("❌ Bu gift faqat haqiqiy sovg'a sifatida olinadi!", show_alert=True)
+            return
         await update_gift_claim_status(claim_id, "claimed_stars")
         await add_stars(claim["telegram_id"], claim["price_stars"])
         text = (
@@ -2664,7 +2699,7 @@ async def box_open_callback(call: CallbackQuery, bot: Bot) -> None:
     if result["claim_id"]:
         await call.message.answer(
             result["text"],
-            reply_markup=gift_claim_keyboard(result["claim_id"], result["gift_price_stars"]),
+            reply_markup=await gift_claim_keyboard(result["claim_id"], result["gift_price_stars"]),
         )
         await show_boxes(call.message.answer, call.from_user.id)
     else:
@@ -2939,7 +2974,7 @@ async def shop_promo_buy_callback(call: CallbackQuery, bot: Bot) -> None:
     if result["claim_id"]:
         await call.message.answer(
             result["text"],
-            reply_markup=gift_claim_keyboard(result["claim_id"], result["gift_price_stars"]),
+            reply_markup=await gift_claim_keyboard(result["claim_id"], result["gift_price_stars"]),
         )
     else:
         await call.message.answer(result["text"])
@@ -3234,7 +3269,7 @@ async def _handle_box_stars_payment(message: Message, bot: Bot, payload: str, pa
     if result["claim_id"]:
         await message.answer(
             result["text"],
-            reply_markup=gift_claim_keyboard(result["claim_id"], result["gift_price_stars"]),
+            reply_markup=await gift_claim_keyboard(result["claim_id"], result["gift_price_stars"]),
         )
         await show_boxes(message.answer, message.from_user.id)
     else:
@@ -3274,7 +3309,7 @@ async def _handle_promo_stars_payment(message: Message, bot: Bot, payload: str, 
     if result.get("claim_id"):
         await message.answer(
             result["text"],
-            reply_markup=gift_claim_keyboard(result["claim_id"], result["gift_price_stars"]),
+            reply_markup=await gift_claim_keyboard(result["claim_id"], result["gift_price_stars"]),
         )
     else:
         await message.answer(result["text"])
@@ -6127,7 +6162,7 @@ function showResult(html, claim) {
     realBtn.onclick = () => choose('real', realBtn);
     starsBtn.onclick = () => choose('stars', starsBtn);
     actionsEl.appendChild(realBtn);
-    actionsEl.appendChild(starsBtn);
+    if (!claim.has_auto_delivery) actionsEl.appendChild(starsBtn);
   } else {
     actionsEl.style.display = 'none';
     okRow.style.display = 'flex';
@@ -6482,7 +6517,7 @@ async function buyBalance(kind, id, btnEl) {
     if (kind === 'box' && typeof data.ratio === 'number') {
       await launchRocket(data.ratio, data.kind);
     }
-    showResult(data.message, data.claim_id ? { claim_id: data.claim_id, gift_price_stars: data.gift_price_stars } : null);
+    showResult(data.message, data.claim_id ? { claim_id: data.claim_id, gift_price_stars: data.gift_price_stars, has_auto_delivery: data.has_auto_delivery } : null);
     await refreshMe();
     await refreshShop();
   } catch (e) {
@@ -6516,7 +6551,7 @@ async function redeemPromo(code, btnEl, inputEl) {
     if (typeof data.ratio === 'number') {
       await launchRocket(data.ratio, data.kind);
     }
-    showResult(data.message, data.claim_id ? { claim_id: data.claim_id, gift_price_stars: data.gift_price_stars } : null);
+    showResult(data.message, data.claim_id ? { claim_id: data.claim_id, gift_price_stars: data.gift_price_stars, has_auto_delivery: data.has_auto_delivery } : null);
     inputEl.value = '';
     await refreshMe();
     await refreshShop();
@@ -6550,7 +6585,7 @@ async function buyShopPromo(id, btnEl) {
     if (typeof data.ratio === 'number') {
       await launchRocket(data.ratio, data.kind);
     }
-    showResult(data.message, data.claim_id ? { claim_id: data.claim_id, gift_price_stars: data.gift_price_stars } : null);
+    showResult(data.message, data.claim_id ? { claim_id: data.claim_id, gift_price_stars: data.gift_price_stars, has_auto_delivery: data.has_auto_delivery } : null);
     await refreshMe();
     await refreshShop();
   } catch (e) {
@@ -6612,7 +6647,7 @@ async function pollLastAward() {
       const data = await res.json();
       if (res.ok && data.ok && typeof data.ratio === 'number') {
         await launchRocket(data.ratio, data.kind);
-        showResult(data.message, data.claim_id ? { claim_id: data.claim_id, gift_price_stars: data.gift_price_stars } : null);
+        showResult(data.message, data.claim_id ? { claim_id: data.claim_id, gift_price_stars: data.gift_price_stars, has_auto_delivery: data.has_auto_delivery } : null);
         return;
       }
     } catch (e) {}
@@ -7201,6 +7236,7 @@ async def webapp_buy_balance_handler(request):
             await set_daily_box_used(telegram_id, today)
 
         result = await open_box_and_award(_bot, box, telegram_id, first_name, username)
+        has_auto_delivery = await _gift_claim_has_auto_delivery(result["claim_id"]) if result["claim_id"] else False
         return web.json_response({
             "ok": True,
             "message": result["text"],
@@ -7208,6 +7244,7 @@ async def webapp_buy_balance_handler(request):
             "kind": result["kind"],
             "claim_id": result["claim_id"],
             "gift_price_stars": result["gift_price_stars"],
+            "has_auto_delivery": has_auto_delivery,
         })
 
     return web.json_response({"error": "Noma'lum turi"}, status=400)
@@ -7238,6 +7275,7 @@ async def webapp_redeem_promo_handler(request):
     if not result["ok"]:
         return web.json_response({"error": result["error"]}, status=400)
 
+    has_auto_delivery = await _gift_claim_has_auto_delivery(result["claim_id"]) if result["claim_id"] else False
     return web.json_response({
         "ok": True,
         "message": result["text"],
@@ -7245,6 +7283,7 @@ async def webapp_redeem_promo_handler(request):
         "kind": result["kind"],
         "claim_id": result["claim_id"],
         "gift_price_stars": result["gift_price_stars"],
+        "has_auto_delivery": has_auto_delivery,
     })
 
 
@@ -7264,6 +7303,7 @@ async def webapp_last_award_handler(request):
         return web.json_response({"ok": False})
 
     result = entry["result"]
+    has_auto_delivery = await _gift_claim_has_auto_delivery(result["claim_id"]) if result["claim_id"] else False
     return web.json_response({
         "ok": True,
         "message": result["text"],
@@ -7271,6 +7311,7 @@ async def webapp_last_award_handler(request):
         "kind": result["kind"],
         "claim_id": result["claim_id"],
         "gift_price_stars": result["gift_price_stars"],
+        "has_auto_delivery": has_auto_delivery,
     })
 
 
@@ -7304,6 +7345,7 @@ async def webapp_buy_promo_handler(request):
     if not result["ok"]:
         return web.json_response({"error": result["error"]}, status=400)
 
+    has_auto_delivery = await _gift_claim_has_auto_delivery(result["claim_id"]) if result["claim_id"] else False
     return web.json_response({
         "ok": True,
         "message": result["text"],
@@ -7311,6 +7353,7 @@ async def webapp_buy_promo_handler(request):
         "kind": result["kind"],
         "claim_id": result["claim_id"],
         "gift_price_stars": result["gift_price_stars"],
+        "has_auto_delivery": has_auto_delivery,
     })
 
 
@@ -7345,6 +7388,8 @@ async def webapp_gift_claim_handler(request):
         return web.json_response({"error": "Bu gift bo'yicha allaqachon tanlov qilingan"}, status=409)
 
     if action == "stars":
+        if await _gift_claim_has_auto_delivery(claim["id"]):
+            return web.json_response({"error": "Bu gift faqat haqiqiy sovg'a sifatida olinadi!"}, status=403)
         await update_gift_claim_status(claim["id"], "claimed_stars")
         await add_stars(telegram_id, claim["price_stars"])
         message = f"⭐ <b>{claim['item_name']}</b> — {claim['price_stars']} ⭐ ga aylantirildi va balansingizga qo'shildi!"
