@@ -1165,10 +1165,18 @@ async def check_subscriptions(
                 ChatMemberStatus.CREATOR,
                 ChatMemberStatus.RESTRICTED,
             ):
-                # Hali haqiqiy a'zo emas — lekin qo'shilish so'rovi yuborgan
-                # bo'lishi mumkin (join-request kanal/guruh). Shuni tekshiramiz.
+                # E'TIBOR: bu yerda getChatMember MUVAFFAQIYATLI javob berdi —
+                # ya'ni Telegram HOZIRGI holatni ANIQ aytdi (masalan "left",
+                # chunki foydalanuvchi kanaldan chiqib ketgan yoki hech
+                # qachon a'zo bo'lmagan). Shu sabab bu yerda faqat "requested"
+                # (so'rov yuborilgan, join-request kanal) keshini hisobga
+                # olamiz — ESKI "member" keshi (masalan ilgari a'zo bo'lgan,
+                # keyin chiqib ketgan bo'lsa) HECH QACHON shu aniq, yangi
+                # javobni bekor qilmasligi kerak. Aks holda: bir marta a'zo
+                # bo'lgan odam keyin kanaldan chiqib ketsa ham, botni
+                # abadiy ishlata olib qolar edi.
                 cached_status = await get_cached_channel_membership(cache_key, telegram_id)
-                if cached_status in _MEMBERSHIP_PASSING_STATUSES:
+                if cached_status == "requested":
                     continue
                 not_subscribed.append(ch)
         except (TelegramBadRequest, TelegramForbiddenError) as e:
