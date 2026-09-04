@@ -990,6 +990,20 @@ async def get_gift_claim(claim_id: int) -> dict | None:
         return dict(row) if row else None
 
 
+async def get_pending_gift_claims(telegram_id: int) -> list[dict]:
+    """Foydalanuvchining hali tanlov qilinmagan (pending) gift'lari — bu
+    ro'yxat tugamaydi, foydalanuvchi xohlagan vaqtida profilidan kirib,
+    "🎁 Giftni olish" yoki "⭐ ga aylantirish"ni tanlashi mumkin."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM gift_claims WHERE telegram_id = ? AND status = 'pending' ORDER BY created_at DESC",
+            (telegram_id,),
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
 async def update_gift_claim_status(claim_id: int, status: str) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -1611,14 +1625,32 @@ async def profile_handler(message: Message, bot: Bot) -> None:
     bot_username = (await bot.me()).username
     ref_link = f"https://t.me/{bot_username}?start={user['telegram_id']}"
 
+    pending_gifts = await get_pending_gift_claims(user["telegram_id"])
+    gifts_line = (
+        f"\n🎁 Kutilayotgan gift'lar: <b>{len(pending_gifts)}</b> — pastda ko'rsatilgan\n"
+        if pending_gifts else ""
+    )
+
     await message.answer(
         f"👤 <b>Profil</b>\n\n"
         f"🆔 ID: <code>{user['telegram_id']}</code>\n"
         f"⭐ Yulduzlar: <b>{user['balance_stars']}</b>\n"
-        f"👥 Taklif qilganlar: <b>{user['referals_count']}</b>\n\n"
+        f"👥 Taklif qilganlar: <b>{user['referals_count']}</b>\n"
+        f"{gifts_line}\n"
         f"🔗 <b>Shaxsiy havolangiz:</b>\n<code>{ref_link}</code>\n\n"
         f"Shu havolani do'stlaringizga yuboring, ular a'zo bo'lganda bonus olasiz!",
     )
+
+    # Kutilayotgan (hali tanlov qilinmagan) gift'lar — xohlagan vaqtda shu
+    # yerdan "🎁 Giftni olish" yoki "⭐ ga aylantirish"ni tanlash mumkin,
+    # asl yutuq xabari yo'qolib/ko'milib qolgan bo'lsa ham.
+    for claim in pending_gifts:
+        kb = await gift_claim_keyboard(claim["id"], claim["price_stars"])
+        await message.answer(
+            f"🎁 <b>Kutilayotgan gift:</b> {claim['item_name']} ({claim['price_stars']} ⭐)\n"
+            f"Tanlovingizni bosing 👇",
+            reply_markup=kb,
+        )
 
 
 @router.message(F.text == "🔗 Referal")
@@ -1676,7 +1708,9 @@ async def withdraw_handler(message: Message) -> None:
     await message.answer(
         f"💸 <b>Yulduz yechish</b>\n\n"
         f"Balansingiz: <b>{user['balance_stars']} ⭐</b>\n"
-        f"Minimal: <b>{min_withdraw} ⭐</b>\n\n"
+        f"Minimal: <b>{min_withdraw} ⭐</b>\n"
+        f"👥 Taklif qilganlaringiz: <b>{user['referals_count']}</b> "
+        f"(gift sifatida yechish uchun kamida <b>{settings['min_referals_required']}</b> kerak)\n\n"
         f"👇 <b>To'lov turini tanlang:</b>",
         reply_markup=kb.as_markup(),
     )
@@ -1850,6 +1884,16 @@ async def withdraw_gift_callback(call: CallbackQuery) -> None:
         await call.answer("❌ Minimal chegaraga yetmadingiz!", show_alert=True)
         return
 
+    if user["referals_count"] < settings["min_referals_required"]:
+        need = settings["min_referals_required"] - user["referals_count"]
+        await call.answer(
+            f"❌ Gift sifatida yechish uchun kamida {settings['min_referals_required']} ta odam "
+            f"taklif qilishingiz kerak! Sizda {user['referals_count']} ta, yana {need} ta kerak. "
+            f"⭐ Yulduz sifatida yechishingiz mumkin.",
+            show_alert=True,
+        )
+        return
+
     # Balansga yetadigan giftlar (narxi 0 bo'lmagan)
     gifts = [g for g in await get_shop_items("gift") if 0 < g["price_stars"] <= user["balance_stars"]]
 
@@ -1889,6 +1933,13 @@ async def withdraw_gift_confirm(call: CallbackQuery, bot: Bot) -> None:
 
     if not user or not item:
         await call.answer("❌ Xatolik yuz berdi", show_alert=True)
+        return
+
+    settings = await get_settings()
+    if user["referals_count"] < settings["min_referals_required"]:
+        # Faqat ro'yxatni yashirish yetarli emas — callback_data'ni to'g'ridan-to'g'ri
+        # yuborish mumkin, shuning uchun bu yerda ham qaytadan tekshiramiz.
+        await call.answer("❌ Gift sifatida yechish uchun yetarli referal yo'q!", show_alert=True)
         return
 
     if user["balance_stars"] < item["price_stars"]:
@@ -2772,7 +2823,10 @@ async def about_bot_handler(message: Message) -> None:
         "💸 <b>Yulduz yechish</b>\n"
         f"Balansingiz kamida <b>{settings['min_withdraw_stars']} ⭐</b> bo'lsa, ⭐ (real to'lov) "
         "yoki gift sifatida yechib olishingiz mumkin. Ba'zi giftlar avtomatik yuboriladi, "
-        "qolganlari bot egasi tomonidan qo'lda.\n\n"
+        "qolganlari bot egasi tomonidan qo'lda.\n"
+        f"⚠️ <b>Gift sifatida yechish uchun kamida {settings['min_referals_required']} ta odam taklif qilingan "
+        "bo'lishi shart</b> — aks holda so'rov qabul qilinmaydi. Yetarli referalingiz bo'lmasa, "
+        "⭐ yulduz sifatida yechib oling.\n\n"
         "✨ <b>Mini-App do'kon</b>\n"
         "Bir xil do'kon va Jekpot — chiroyli veb-sahifa ko'rinishida, tepadagi 🌙/☀️ "
         "tugmasi bilan dark/light mavzuni almashtirishingiz mumkin.\n\n"
@@ -5933,6 +5987,9 @@ MINI_APP_HTML = """<!doctype html>
       </div>
       <button class="wide-btn" id="refShareBtn">📤 Do'stlarga ulashish</button>
       <p class="hint-p">Har bir yangi a'zo botga qo'shilib, majburiy kanallarga a'zo bo'lganda balansingizga bonus qo'shiladi.</p>
+
+      <div class="section-title" id="profGiftsTitle" hidden>🎁 Kutilayotgan gift'laringiz</div>
+      <div id="profGiftsList"></div>
     </div>
 
     <div class="page" id="page-withdraw">
@@ -5940,10 +5997,12 @@ MINI_APP_HTML = """<!doctype html>
       <div class="withdraw-card">
         <div class="wc-row"><span>Balansingiz</span><b id="wdBalance">0 ⭐</b></div>
         <div class="wc-row"><span>Minimal chegara</span><b id="wdMin">— ⭐</b></div>
+        <div class="wc-row"><span>Referallaringiz (gift uchun)</span><b id="wdRefs">0 / 0</b></div>
         <div class="wc-note" id="wdNote"></div>
         <button class="wide-btn" id="wdStarsBtn">⭐ Yulduz sifatida yechish</button>
       </div>
       <div class="section-title">Yoki gift sifatida yeching</div>
+      <div class="hint-p" id="wdGiftRefHint" hidden></div>
       <div id="wdGiftList" class="gift-list"></div>
     </div>
 
@@ -6085,7 +6144,9 @@ function renderAbout() {
     <p><b>💸 Yulduz yechish</b><br>
     Balansingiz kamida <b>${INFO.min_withdraw_stars || 0} ⭐</b> bo'lsa, ⭐ (real to'lov)
     yoki gift sifatida yechib olishingiz mumkin. Ba'zi giftlar avtomatik yuboriladi,
-    qolganlari bot egasi tomonidan qo'lda.</p>
+    qolganlari bot egasi tomonidan qo'lda.<br>
+    ⚠️ <b>Gift sifatida yechish uchun kamida ${INFO.min_referals_required || 0} ta odam taklif
+    qilingan bo'lishi shart</b> — aks holda so'rov qabul qilinmaydi.</p>
     <p><b>🌙 Dark/Light</b><br>
     Tepadagi 🌙/☀️ tugmasi bilan mavzuni istalgan vaqt almashtirishingiz mumkin —
     tanlovingiz eslab qolinadi.</p>
@@ -6687,7 +6748,7 @@ document.getElementById('uzsSubmit').onclick = async () => {
   }
 };
 
-let INFO = { contacts: [], reviews_url: null, min_withdraw_stars: 0 };
+let INFO = { contacts: [], reviews_url: null, min_withdraw_stars: 0, min_referals_required: 0 };
 
 function switchPage(key) {
   document.querySelectorAll('.page').forEach(p => p.classList.toggle('active', p.id === 'page-' + key));
@@ -6704,12 +6765,16 @@ function renderProfile() {
   const balEl = document.getElementById('profBalance');
   const refsEl = document.getElementById('profRefs');
   const linkEl = document.getElementById('refLinkText');
+  const giftsTitle = document.getElementById('profGiftsTitle');
+  const giftsList = document.getElementById('profGiftsList');
   if (!USER) {
     nameEl.textContent = 'Aniqlanmadi';
     avatarEl.textContent = '?';
     balEl.textContent = '0';
     refsEl.textContent = '0';
     linkEl.textContent = "Botni Telegram ilovasi ichidan oching";
+    giftsTitle.hidden = true;
+    giftsList.innerHTML = '';
     return;
   }
   const name = USER.first_name || 'Foydalanuvchi';
@@ -6718,6 +6783,50 @@ function renderProfile() {
   balEl.textContent = USER.balance_stars;
   refsEl.textContent = USER.referals_count;
   linkEl.textContent = USER.ref_link || '—';
+
+  const pending = USER.pending_gifts || [];
+  giftsTitle.hidden = pending.length === 0;
+  giftsList.innerHTML = '';
+  pending.forEach(g => {
+    const row = document.createElement('div');
+    row.className = 'gift-row';
+    row.innerHTML = `<div><div class="gname">${g.item_name}</div><div class="gprice">${g.price_stars} ⭐</div></div>`;
+    const btnWrap = document.createElement('div');
+    const realBtn = document.createElement('button');
+    realBtn.textContent = '🎁 Olish';
+    const starsBtn = document.createElement('button');
+    starsBtn.textContent = `⭐ ${g.price_stars} ga aylantirish`;
+    const choose = async (action, btn) => {
+      [realBtn, starsBtn].forEach(b => { if (b.parentNode) b.disabled = true; });
+      const old = btn.textContent;
+      btn.textContent = '...';
+      try {
+        const res = await fetch('/api/gift_claim', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ init_data: INIT_DATA, action, claim_id: g.claim_id }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          toast(data.error || 'Xatolik yuz berdi');
+          [realBtn, starsBtn].forEach(b => { if (b.parentNode) b.disabled = false; });
+          btn.textContent = old;
+          return;
+        }
+        toast(data.message.replace(/<[^>]+>/g, ''));
+        await refreshMe();
+      } catch (e) {
+        toast('Tarmoq xatosi, qayta urinib ko\\'ring');
+        [realBtn, starsBtn].forEach(b => { if (b.parentNode) b.disabled = false; });
+        btn.textContent = old;
+      }
+    };
+    realBtn.onclick = () => choose('real', realBtn);
+    starsBtn.onclick = () => choose('stars', starsBtn);
+    btnWrap.appendChild(realBtn);
+    if (!g.has_auto_delivery) btnWrap.appendChild(starsBtn);
+    row.appendChild(btnWrap);
+    giftsList.appendChild(row);
+  });
 }
 
 document.getElementById('refCopyBtn').onclick = async () => {
@@ -6742,6 +6851,9 @@ document.getElementById('refShareBtn').onclick = () => {
 function renderWithdraw() {
   document.getElementById('wdBalance').textContent = (USER ? USER.balance_stars : 0) + ' ⭐';
   document.getElementById('wdMin').textContent = (INFO.min_withdraw_stars || 0) + ' ⭐';
+  const minRefs = INFO.min_referals_required || 0;
+  const myRefs = USER ? (USER.referals_count || 0) : 0;
+  document.getElementById('wdRefs').textContent = `${myRefs} / ${minRefs}`;
   const note = document.getElementById('wdNote');
   const starsBtn = document.getElementById('wdStarsBtn');
   const canWithdraw = USER && USER.balance_stars >= (INFO.min_withdraw_stars || 0);
@@ -6752,8 +6864,19 @@ function renderWithdraw() {
   starsBtn.textContent = `⭐ Yulduz sifatida yechish (${USER ? USER.balance_stars : 0})`;
 
   const list = document.getElementById('wdGiftList');
+  const refHint = document.getElementById('wdGiftRefHint');
   list.innerHTML = '';
-  if (!USER) return;
+  if (!USER) { refHint.hidden = true; return; }
+
+  const canWithdrawGift = myRefs >= minRefs;
+  if (!canWithdrawGift) {
+    refHint.hidden = false;
+    refHint.textContent = `❌ Gift sifatida yechish uchun kamida ${minRefs} ta odam taklif qilishingiz kerak `
+      + `(sizda ${myRefs} ta). ⭐ Yulduz sifatida yechishingiz mumkin.`;
+    return;
+  }
+  refHint.hidden = true;
+
   const gifts = SHOP.items.filter(i => i.cat === 'gift' && i.price_stars > 0 && i.price_stars <= USER.balance_stars);
   if (!gifts.length) {
     list.innerHTML = '<div class="hint-p">Balansingizga hozircha yetadigan gift yo\\'q.</div>';
@@ -6983,6 +7106,17 @@ async def webapp_me_handler(request):
         except Exception:
             ref_link = None
 
+    pending_claims = await get_pending_gift_claims(db_user["telegram_id"])
+    pending_gifts = [
+        {
+            "claim_id": c["id"],
+            "item_name": c["item_name"],
+            "price_stars": c["price_stars"],
+            "has_auto_delivery": await _gift_claim_has_auto_delivery(c["id"]),
+        }
+        for c in pending_claims
+    ]
+
     return web.json_response({
         "telegram_id": db_user["telegram_id"],
         "first_name": tg_user.get("first_name", ""),
@@ -6990,6 +7124,7 @@ async def webapp_me_handler(request):
         "referals_count": db_user["referals_count"],
         "last_daily_box": db_user["last_daily_box"],
         "ref_link": ref_link,
+        "pending_gifts": pending_gifts,
     })
 
 
@@ -7584,6 +7719,12 @@ async def webapp_withdraw_handler(request):
         amount = user["balance_stars"]
         item_name = ""
     elif kind == "gift":
+        if user["referals_count"] < settings["min_referals_required"]:
+            need = settings["min_referals_required"] - user["referals_count"]
+            return web.json_response({
+                "error": f"Gift sifatida yechish uchun kamida {settings['min_referals_required']} ta odam "
+                         f"taklif qilishingiz kerak! Yana {need} ta kerak. ⭐ Yulduz sifatida yechishingiz mumkin.",
+            }, status=403)
         try:
             item = await get_shop_item(int(body.get("item_id")))
         except (TypeError, ValueError):
