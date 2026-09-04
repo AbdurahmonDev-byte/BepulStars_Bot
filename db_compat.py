@@ -26,6 +26,7 @@ ko'rinishida ishlatadi — shu sababli bot.py ichidagi barcha DB funksiyalari
 .fetchall(), .commit(), aiosqlite.OperationalError, aiosqlite.Row) birorta ham
 o'zgarishsiz, xuddi avvalgidek ishlayveradi.
 """
+import asyncio
 import os
 import sqlite3
 
@@ -108,8 +109,9 @@ class _TursoConnection:
         # (avto-commit), shuning uchun bu yerda qo'shimcha ish shart emas.
         pass
 
-    async def close(self):
-        await self._client.close()
+    # Ataylab close() metodi yo'q: bu ulanish butun jarayon uchun umumiy
+    # (shared) — uni bitta so'rov "yopib" qo'ysa, boshqa barcha
+    # foydalanuvchilarning DB so'rovlari ham buzilib qolardi.
 
 
 def _http_url(url: str) -> str:
@@ -135,16 +137,46 @@ def _http_url(url: str) -> str:
     return url
 
 
+_shared_turso_client = None
+_shared_turso_client_lock = None
+
+
+async def _get_shared_turso_client():
+    """Turso mijozini (aiohttp.ClientSession'ni o'z ichiga oladi) BUTUN
+    jarayon davomida bitta marta yaratib, qayta ishlatadi.
+
+    Nega: avval har bir `async with aiosqlite.connect(...)` bloki (ya'ni
+    bot.py'dagi HAR BIR DB so'rovi — get_user, add_stars va h.k.) o'z
+    ichida yangi libsql mijozini (demak, yangi aiohttp.ClientSession va
+    yangi TCP/TLS handshake Turso serveriga) yaratib, so'rov tugagach
+    darhol yopib yuborardi. Bir nechta foydalanuvchi bir vaqtda botdan
+    foydalansa, bu — sekinlikning asosiy sababi bo'lardi: har bir DB
+    so'rovi tarmoq bo'yicha yangi ulanish narxini to'lardi. aiohttp'ning
+    o'zi ham ClientSession'ni butun ilova davomida bitta marta yaratib,
+    qayta ishlatishni tavsiya qiladi — shu yerda xuddi shunday qilinadi."""
+    global _shared_turso_client, _shared_turso_client_lock
+    if _shared_turso_client_lock is None:
+        _shared_turso_client_lock = asyncio.Lock()
+    async with _shared_turso_client_lock:
+        if _shared_turso_client is None or getattr(_shared_turso_client, "closed", False):
+            _shared_turso_client = libsql_client.create_client(
+                url=_http_url(TURSO_DATABASE_URL),
+                auth_token=TURSO_AUTH_TOKEN or None,
+            )
+        return _shared_turso_client
+
+
 class _TursoConnCtx:
     async def __aenter__(self):
-        self._client = libsql_client.create_client(
-            url=_http_url(TURSO_DATABASE_URL),
-            auth_token=TURSO_AUTH_TOKEN or None,
-        )
-        return _TursoConnection(self._client)
+        client = await _get_shared_turso_client()
+        return _TursoConnection(client)
 
     async def __aexit__(self, exc_type, exc, tb):
-        await self._client.close()
+        # Ulanishni ATAYLAB yopmaymiz — u BUTUN jarayon davomida qayta
+        # ishlatiladigan umumiy (shared) mijoz, faqat shu bitta so'rovga
+        # tegishli emas. Yopish keyingi so'rovlarni yana yangi ulanish
+        # ochishga majbur qilib, aynan oldini olmoqchi bo'lgan sekinlikni
+        # qaytarardi.
         return False
 
 
