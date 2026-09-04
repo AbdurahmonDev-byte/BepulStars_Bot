@@ -1128,12 +1128,23 @@ _notified_bad_channels: set[str] = set()
 _MEMBERSHIP_PASSING_STATUSES = {"member", "administrator", "creator", "restricted", "requested"}
 
 
-async def check_subscriptions(bot: Bot, telegram_id: int, channels: list[dict]) -> list[dict]:
+async def check_subscriptions(
+    bot: Bot, telegram_id: int, channels: list[dict], retry: bool = False,
+) -> list[dict]:
     """Foydalanuvchi majburiy kanallarga a'zo ekanligini tekshiradi.
     A'zo bo'lmagan kanallar ro'yxatini qaytaradi.
 
     Adminlar bu tekshiruvdan mustasno — ular botni sinash/boshqarish uchun
-    kanallarga a'zo bo'lishlari shart emas."""
+    kanallarga a'zo bo'lishlari shart emas.
+
+    retry=True: Telegram tomonida a'zolik holati ba'zan bir necha soniya
+    kechikib yangilanadi — foydalanuvchi HOZIRGINA kanalga qo'shilgan bo'lsa
+    ham, getChatMember hali eski ("a'zo emas") holatni qaytarishi mumkin,
+    keyin esa o'zi to'g'irlanadi. Shu sababli, foydalanuvchi ONGLI ravishda
+    "tekshirish" harakatini bajarganda (/start, "✅ Tekshirdim" tugmasi)
+    birinchi urinish muvaffaqiyatsiz bo'lsa, qisqa kutib BIR MARTA qayta
+    tekshiramiz. Har bir oddiy xabar/tugma bosilishida (subscription_check_
+    middleware, Mini App) ishlatilmaydi — aks holda bot sekin tuyulardi."""
     if is_admin(telegram_id):
         return []
     not_subscribed = []
@@ -1198,6 +1209,10 @@ async def check_subscriptions(bot: Bot, telegram_id: int, channels: list[dict]) 
                     except Exception:
                         pass
             not_subscribed.append(ch)
+
+    if retry and not_subscribed:
+        await asyncio.sleep(1.5)
+        return await check_subscriptions(bot, telegram_id, channels, retry=False)
     return not_subscribed
 
 
@@ -1541,7 +1556,7 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext) -> None:
 
     # Majburiy kanallarga a'zolik tekshiruvi
     if channels:
-        not_sub = await check_subscriptions(bot, message.from_user.id, channels)
+        not_sub = await check_subscriptions(bot, message.from_user.id, channels, retry=True)
         if not_sub:
             # Referrer ehtiyojini saqlaymiz — tekshirishdan keyin berish uchun
             if referrer_id and referrer_id != message.from_user.id:
@@ -1594,7 +1609,7 @@ async def check_sub_handler(call: CallbackQuery, bot: Bot, state: FSMContext) ->
     _bot = bot
 
     channels = await get_channels()
-    not_sub = await check_subscriptions(bot, call.from_user.id, channels)
+    not_sub = await check_subscriptions(bot, call.from_user.id, channels, retry=True)
 
     if not_sub:
         await call.answer("❌ Hali ham a'zo bo'lmagansiz!", show_alert=True)
