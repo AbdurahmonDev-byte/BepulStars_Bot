@@ -128,14 +128,6 @@ DEFAULT_GIFT_CAPTION = "🎁 {item} — Stars Bot'dan sovg'a!"
 # Telegram_id -> kutilayotgan referrer (majburiy kanalga a'zolikdan keyin berish uchun)
 pending_ref = {}
 
-# Captcha (nakrutka himoyasi): yangi foydalanuvchi referal bonusini olishdan
-# oldin oddiy matematik misol yechishi kerak. Soxta (bot) akkountlar bilan
-# cheksiz "nakrutka" qilib balans bo'shatishning oldini oladi.
-# user_id -> {"ref": int|None, "answer": int, "attempts": int, "created_at": float}
-captcha_pending: dict[int, dict] = {}
-CAPTCHA_MAX_ATTEMPTS = 3
-CAPTCHA_TTL_SECONDS = 300
-
 # Telegram Stars orqali Mini App'da sotib olingan box/promokod natijasi.
 # To'lov chat safida ochilgani uchun webapp bunga raketani ko'rsatishi kerak.
 # telegram_id -> {"result": dict, "ts": float(mototonic)}
@@ -1234,14 +1226,14 @@ async def subscription_check_middleware(handler, event, data):
     if not tg_user or is_admin(tg_user.id):
         return await handler(event, data)
 
-    # /start va "check_sub"/"captcha:" o'zlari to'liq tekshiruvni allaqachon
-    # bajaradi (referalni saqlash bilan birga) — middleware ularga tegmaydi,
-    # aks holda ikki marta tekshirilib, referal oqimi buzilishi mumkin.
+    # /start va "check_sub" o'zlari to'liq tekshiruvni allaqachon bajaradi
+    # (referalni saqlash bilan birga) — middleware ularga tegmaydi, aks holda
+    # ikki marta tekshirilib, referal oqimi buzilishi mumkin.
     if isinstance(event, Message):
         if event.text and event.text.startswith("/start"):
             return await handler(event, data)
     elif isinstance(event, CallbackQuery):
-        if event.data and (event.data.startswith("check_sub") or event.data.startswith("captcha:")):
+        if event.data and event.data.startswith("check_sub"):
             return await handler(event, data)
 
     channels = await get_channels()
@@ -1422,46 +1414,6 @@ async def bot_notify_pending_referral(referrer_id: int, friend_name: str) -> Non
         pass
 
 
-def _gen_captcha() -> tuple[int, int, int, list[str]]:
-    """Oddiy matematik captcha: 2 ta son yig'indisi + 4 javob varianti."""
-    a = random.randint(2, 9)
-    b = random.randint(2, 9)
-    ans = a + b
-    options = {str(ans)}
-    guard = 0
-    while len(options) < 4 and guard < 60:
-        options.add(str(ans + random.randint(-9, 9)))
-        guard += 1
-    options_list = list(options)[:4]
-    random.shuffle(options_list)
-    return a, b, ans, options_list
-
-
-async def send_captcha(chat_id: int, ref: int | None) -> None:
-    """Yangi foydalanuvchiga referal bonusini to'lashdan oldin captcha yuboradi."""
-    global _bot
-    if _bot is None:
-        return
-    a, b, ans, options = _gen_captcha()
-    captcha_pending[chat_id] = {
-        "ref": ref,
-        "answer": ans,
-        "attempts": 0,
-        "created_at": time.monotonic(),
-    }
-    kb = InlineKeyboardBuilder()
-    for opt in options:
-        kb.button(text=opt, callback_data=f"captcha:{opt}")
-    kb.adjust(2)
-    await _bot.send_message(
-        chat_id,
-        "🤖 <b>Bot emasligingizni tasdiqlang!</b>\n\n"
-        f"<b>{a} + {b} = ?</b>\n\n"
-        "To'g'ri javobni tanlang:",
-        reply_markup=kb.as_markup(),
-    )
-
-
 def main_menu_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     """Asosiy reply klaviaturasi."""
     rows = [
@@ -1543,7 +1495,6 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext) -> None:
     global _bot
     _bot = bot
     await state.clear()
-    captcha_pending.pop(message.from_user.id, None)
 
     # Referal payload: /start <referrer_id>
     referrer_id = None
@@ -1575,7 +1526,7 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext) -> None:
             return
 
     if user:
-        # Qaytgan foydalanuvchi — captcha kerak emas (allaqachon ro'yxatdan o'tgan)
+        # Qaytgan foydalanuvchi
         pending_ref.pop(message.from_user.id, None)
         await message.answer(
             "👋 <b>Xush kelibsiz!</b>\n\n"
@@ -1585,15 +1536,10 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext) -> None:
         )
         return
 
-    # Yangi foydalanuvchi referal havola orqali kirdi — bonusni to'g'ridan-to'g'ri
-    # bermaymiz, avval captcha yechishi kerak (soxta akkountlar bilan nakrutka himoyasi).
-    if referrer_id and referrer_id != message.from_user.id:
-        pending_ref.pop(message.from_user.id, None)
-        await send_captcha(message.from_user.id, referrer_id)
-        return
-
-    # Referalsiz oddiy /start — referal mukofoti yo'q, to'g'ridan-to'g'ri ro'yxatga olamiz
-    await register_user_with_referral(message.from_user.id, None, message.from_user.full_name)
+    # Yangi foydalanuvchi — to'g'ridan-to'g'ri ro'yxatga olamiz (referali
+    # bo'lsa ham, bo'lmasa ham; referal mukofoti kunlik chegara bilan
+    # nakrutkadan himoyalangan — register_user_with_referral'ga qarang).
+    await register_user_with_referral(message.from_user.id, referrer_id, message.from_user.full_name)
     pending_ref.pop(message.from_user.id, None)
     await message.answer(
         "👋 <b>Xush kelibsiz!</b>\n\n"
@@ -1626,18 +1572,7 @@ async def check_sub_handler(call: CallbackQuery, bot: Bot, state: FSMContext) ->
         ref = pending_ref.get(call.from_user.id)
     user = await get_user(call.from_user.id)
     if not user:
-        pending_ref.pop(call.from_user.id, None)
-        if ref:
-            # Yangi foydalanuvchi referal havola orqali keldi — captcha yechishi
-            # kerak (nakrutka himoyasi), keyin bonus to'lanadi.
-            try:
-                await call.message.delete()
-            except TelegramBadRequest:
-                pass
-            await send_captcha(call.from_user.id, ref)
-            await call.answer()
-            return
-        await register_user_with_referral(call.from_user.id, None, call.from_user.full_name)
+        await register_user_with_referral(call.from_user.id, ref, call.from_user.full_name)
     pending_ref.pop(call.from_user.id, None)
 
     try:
@@ -1647,56 +1582,6 @@ async def check_sub_handler(call: CallbackQuery, bot: Bot, state: FSMContext) ->
     await call.message.answer(
         "✅ <b>Tabriklaymiz! Endi botdan foydalanishingiz mumkin.</b>",
         reply_markup=main_menu_keyboard(call.from_user.id),
-    )
-    await call.answer()
-
-
-@router.callback_query(F.data.startswith("captcha:"))
-async def captcha_handler(call: CallbackQuery, bot: Bot) -> None:
-    """Referal captcha: to'g'ri javob tanlansa, bonus bilan ro'yxatga olinadi."""
-    global _bot
-    _bot = bot
-    user_id = call.from_user.id
-    data = captcha_pending.get(user_id)
-    if not data:
-        await call.answer("❌ Captcha muddati tugagan. Iltimos /start ni qayta bosing.", show_alert=True)
-        return
-    if time.monotonic() - data["created_at"] > CAPTCHA_TTL_SECONDS:
-        captcha_pending.pop(user_id, None)
-        await call.answer("❌ Captcha muddati tugagan. Iltimos /start ni qayta bosing.", show_alert=True)
-        return
-
-    choice = call.data.split(":", 1)[1]
-    if choice != str(data["answer"]):
-        data["attempts"] += 1
-        if data["attempts"] >= CAPTCHA_MAX_ATTEMPTS:
-            captcha_pending.pop(user_id, None)
-            try:
-                await call.message.delete()
-            except TelegramBadRequest:
-                pass
-            await call.message.answer(
-                "❌ <b>Juda ko'p noto'g'ri urinish.</b>\n"
-                "Xavfsizlik uchun /start buyrug'ini qayta bosing."
-            )
-            await call.answer()
-            return
-        await call.answer("❌ Noto'g'ri javob!", show_alert=True)
-        return
-
-    # To'g'ri javob — referal bonus bilan ro'yxatga olamiz
-    captcha_pending.pop(user_id, None)
-    ref = data["ref"]
-    user = await get_user(user_id)
-    if not user:
-        await register_user_with_referral(user_id, ref, call.from_user.full_name)
-    try:
-        await call.message.delete()
-    except TelegramBadRequest:
-        pass
-    await call.message.answer(
-        "✅ <b>Tabriklaymiz! Endi botdan foydalanishingiz mumkin.</b>",
-        reply_markup=main_menu_keyboard(user_id),
     )
     await call.answer()
 
