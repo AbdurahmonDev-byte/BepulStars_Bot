@@ -125,8 +125,9 @@ CATEGORIES = {
 # (admin panelda o'zgartirilishi mumkin). {item} — gift nomi bilan almashtiriladi.
 DEFAULT_GIFT_CAPTION = "🎁 {item} — Stars Bot'dan sovg'a!"
 
-# Telegram_id -> kutilayotgan referrer (majburiy kanalga a'zolikdan keyin berish uchun)
-pending_ref = {}
+# Eslatma: kutilayotgan referral endi xotiradagi dict emas, DBdagi
+# pending_referrals jadvalida saqlanadi (bot restart bo'lsa ham yo'qolmasin
+# uchun) — qarang: set_pending_referral / get_pending_referral / clear_pending_referral.
 
 # Telegram Stars orqali Mini App'da sotib olingan box/promokod natijasi.
 # To'lov chat safida ochilgani uchun webapp bunga raketani ko'rsatishi kerak.
@@ -300,6 +301,19 @@ async def db_init() -> None:
                 status TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (channel_id, telegram_id)
+            )
+        """)
+        # Referal "kutilmoqda" holati endi DBda saqlanadi (avval xotiradagi
+        # oddiy dict edi — Render'ning bepul tarifida bot uxlab/qayta ishga
+        # tushganda xotira butunlay tozalanadi, shu sababli foydalanuvchi
+        # kanallarga a'zo bo'lib "✅ A'zo bo'ldim" tugmasi o'rniga oddiy
+        # /start ni qayta yuborsa, referal butunlay yo'qolib qolardi — aynan
+        # "ba'zida referal stars berilmayapti" shikoyatining sababi shu edi).
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS pending_referrals (
+                telegram_id INTEGER PRIMARY KEY,
+                referrer_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL
             )
         """)
         await db.execute("""
@@ -591,6 +605,33 @@ async def get_referrals_today_count(referrer_id: int) -> int:
         )
         row = await cur.fetchone()
         return row["c"] if row else 0
+
+
+async def set_pending_referral(telegram_id: int, referrer_id: int) -> None:
+    """Kanallarga hali a'zo bo'lmagan yangi foydalanuvchi uchun referrerni
+    DBda saqlaydi — bot restart bo'lib qolsa ham (Render bepul tarifi)
+    yo'qolmasligi uchun (avval bu faqat xotiradagi dict edi)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO pending_referrals (telegram_id, referrer_id, created_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(telegram_id) DO UPDATE SET referrer_id = excluded.referrer_id, created_at = excluded.created_at",
+            (telegram_id, referrer_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        await db.commit()
+
+
+async def get_pending_referral(telegram_id: int) -> int | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT referrer_id FROM pending_referrals WHERE telegram_id = ?", (telegram_id,))
+        row = await cur.fetchone()
+        return row["referrer_id"] if row else None
+
+
+async def clear_pending_referral(telegram_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM pending_referrals WHERE telegram_id = ?", (telegram_id,))
+        await db.commit()
 
 
 async def get_all_users() -> list[dict]:
@@ -1457,10 +1498,11 @@ def main_menu_keyboard(user_id: int) -> ReplyKeyboardMarkup:
 def channels_keyboard(channels: list[dict], referrer_id: int | None = None) -> InlineKeyboardMarkup:
     """Majburiy kanallar ro'yxati + tekshirish tugmasi.
 
-    referrer_id callback_data'ning ICHIGA yoziladi (pending_ref xotira
-    lug'atiga emas) — shunda bot qayta ishga tushsa (masalan Render'da
-    bo'sh turganda avtomatik uxlab/qayta uyg'onsa) ham referal
-    yo'qolmaydi, chunki bu qiymat Telegram xabarining o'zida saqlanadi."""
+    referrer_id callback_data'ning ICHIGA yoziladi — shunda bot qayta ishga
+    tushsa (masalan Render'da bo'sh turganda avtomatik uxlab/qayta
+    uyg'onsa) ham referal yo'qolmaydi, chunki bu qiymat Telegram
+    xabarining o'zida saqlanadi (pending_referrals jadvali ham DBda
+    saqlanadi, xuddi shu sababdan — ikkalasi ham restart'ga chidamli)."""
     kb = InlineKeyboardBuilder()
     for i, ch in enumerate(channels, start=1):
         kb.button(text=f"📢 {i}-kanal", url=ch["invite_link"])
@@ -1531,9 +1573,12 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext) -> None:
     if channels:
         not_sub = await check_subscriptions(bot, message.from_user.id, channels, retry=True)
         if not_sub:
-            # Referrer ehtiyojini saqlaymiz — tekshirishdan keyin berish uchun
+            # Referrer ehtiyojini saqlaymiz — tekshirishdan keyin berish uchun.
+            # DBga yoziladi (xotiradagi dict emas), chunki Render bepul
+            # tarifida bot uxlab/qayta ishga tushishi mumkin — shu oraliqda
+            # xotira tozalanib, referal butunlay yo'qolib qolmasligi kerak.
             if referrer_id and referrer_id != message.from_user.id:
-                pending_ref[message.from_user.id] = referrer_id
+                await set_pending_referral(message.from_user.id, referrer_id)
                 # Referrerga xabar: do'st kanallarga a'zo bo'lsagina referal qabul qilinadi
                 referrer = await get_user(referrer_id)
                 if referrer:
@@ -1549,7 +1594,7 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext) -> None:
 
     if user:
         # Qaytgan foydalanuvchi
-        pending_ref.pop(message.from_user.id, None)
+        await clear_pending_referral(message.from_user.id)
         await message.answer(
             "👋 <b>Xush kelibsiz!</b>\n\n"
             "Bu yerda yulduzlar (⭐) yig'ib, do'kondan sovg'alar olasiz va jekpotda qatnashasiz!\n"
@@ -1565,13 +1610,14 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext) -> None:
     # Muhim: agar bu /start'da referal payload bo'lmasa (masalan
     # foydalanuvchi kanallarga a'zo bo'lgandan keyin "✅ Tekshirdim"
     # tugmasini emas, oddiy /start'ni qayta yuborgan bo'lsa), avval
-    # saqlangan pending_ref'dan foydalanamiz — aks holda referal
+    # DBda saqlangan pending referaldan foydalanamiz — aks holda referal
     # butunlay yo'qolib, "referal ba'zida hisoblanmayapti" shikoyatiga
-    # aynan shu sabab bo'lardi.
+    # aynan shu sabab bo'lardi (bot restart bo'lgan bo'lsa ham ishlaydi,
+    # chunki bu endi xotirada emas, DBda saqlanadi).
     if referrer_id is None:
-        referrer_id = pending_ref.get(message.from_user.id)
+        referrer_id = await get_pending_referral(message.from_user.id)
     await register_user_with_referral(message.from_user.id, referrer_id, message.from_user.full_name)
-    pending_ref.pop(message.from_user.id, None)
+    await clear_pending_referral(message.from_user.id)
     await message.answer(
         "👋 <b>Xush kelibsiz!</b>\n\n"
         "Bu yerda yulduzlar (⭐) yig'ib, do'kondan sovg'alar olasiz va jekpotda qatnashasiz!\n"
@@ -1594,17 +1640,18 @@ async def check_sub_handler(call: CallbackQuery, bot: Bot, state: FSMContext) ->
 
     # A'zo bo'ldi — foydalanuvchini ro'yxatga olamiz. Referrer birinchi
     # navbatda callback_data'dan o'qiladi ("check_sub:<id>") — bot qayta
-    # ishga tushgan bo'lsa ham ishlaydi; pending_ref faqat eski (shu
-    # o'zgarishdan oldin yuborilgan) xabarlar uchun zaxira sifatida qoladi.
+    # ishga tushgan bo'lsa ham ishlaydi; DBdagi pending referral faqat eski
+    # (shu o'zgarishdan oldin yuborilgan) xabarlar uchun zaxira sifatida
+    # qoladi.
     parts = call.data.split(":", 1)
     if len(parts) == 2 and parts[1].isdigit() and parts[1] != "0":
         ref = int(parts[1])
     else:
-        ref = pending_ref.get(call.from_user.id)
+        ref = await get_pending_referral(call.from_user.id)
     user = await get_user(call.from_user.id)
     if not user:
         await register_user_with_referral(call.from_user.id, ref, call.from_user.full_name)
-    pending_ref.pop(call.from_user.id, None)
+    await clear_pending_referral(call.from_user.id)
 
     try:
         await call.message.delete()
