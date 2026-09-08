@@ -237,6 +237,13 @@ class AdminUserStates(StatesGroup):
     set_balance = State()
 
 
+class GiftRecipientStates(StatesGroup):
+    """Gift yechishda 'boshqa odamga' yuborish tanlanganda, qabul
+    qiluvchining @username'ini kutish holati (mijoz talabi: gift faqat
+    o'ziga emas, boshqa odamga ham yuborilishi kerak)."""
+    username = State()
+
+
 # ============================================================
 #  MA'LUMOTLAR BAZASI (aiosqlite)
 # ============================================================
@@ -450,6 +457,8 @@ async def db_init() -> None:
             "ALTER TABLE promo_codes ADD COLUMN shop_name TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE promo_redemptions ADD COLUMN redeem_count INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE promo_redemptions ADD COLUMN last_redeemed_at TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE withdrawals ADD COLUMN recipient_telegram_id INTEGER",
+            "ALTER TABLE withdrawals ADD COLUMN recipient_display TEXT DEFAULT ''",
         ):
             try:
                 await db.execute(alter_sql)
@@ -969,12 +978,18 @@ async def update_order_status(order_id: int, status: str) -> None:
 # yubormaydi (status: pending -> paid / rejected).
 
 async def add_withdrawal(telegram_id: int, user_name: str, username: str, kind: str,
-                          amount_stars: int, item_name: str = "") -> int:
+                          amount_stars: int, item_name: str = "",
+                          recipient_telegram_id: int | None = None,
+                          recipient_display: str = "") -> int:
+    """recipient_telegram_id/recipient_display faqat gift boshqa odamga
+    yuborilayotganda to'ldiriladi (yulduz so'rovchining balansidan ayiriladi,
+    lekin gift'ning o'zi shu recipientga yetkaziladi)."""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "INSERT INTO withdrawals (telegram_id, user_name, username, kind, amount_stars, item_name, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO withdrawals (telegram_id, user_name, username, kind, amount_stars, item_name, "
+            "recipient_telegram_id, recipient_display, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (telegram_id, user_name, username, kind, amount_stars, item_name,
+             recipient_telegram_id, recipient_display,
              datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         )
         await db.commit()
@@ -1975,13 +1990,147 @@ async def withdraw_gift_callback(call: CallbackQuery) -> None:
     await call.answer()
 
 
+async def resolve_username_to_id(bot: Bot, username: str) -> tuple[int, str] | None:
+    """@username'ni Telegram chat id'siga aylantiradi — bot u bilan avval
+    hech qachon gaplashmagan bo'lsa ham ishlaydi (username'lar Telegram'da
+    umumiy va qidiriladigan bo'ladi). Gift yechishda "boshqa odamga
+    yuborish" uchun kerak — mijoz talabi: gift faqat o'ziga emas, boshqa
+    odamga ham yuborilishi kerak."""
+    try:
+        chat = await bot.get_chat(f"@{username}")
+        return chat.id, (chat.full_name or f"@{username}")
+    except Exception as e:
+        logger.info("Username '@%s' orqali chat topilmadi: %s", username, e)
+        return None
+
+
+async def _fulfill_gift_withdrawal(
+    bot: Bot,
+    requester_id: int,
+    requester_name: str,
+    requester_username: str,
+    item: dict,
+    recipient_id: int,
+    recipient_display: str,
+    is_self: bool,
+) -> str:
+    """Yulduz allaqachon SO'ROVCHIning balansidan ayirilgan (chaqiruvchi
+    tomonidan) — bu funksiya faqat giftni RECIPIENT'ga (o'zi yoki boshqa
+    odam) yetkazishga harakat qiladi: avtomatik (tg_gift_id bog'langan
+    bo'lsa, bot.send_gift orqali) yoki admin tomonidan qo'lda."""
+    w_id = await add_withdrawal(
+        telegram_id=requester_id,
+        user_name=requester_name,
+        username=requester_username,
+        kind="gift",
+        amount_stars=item["price_stars"],
+        item_name=item["name"],
+        recipient_telegram_id=None if is_self else recipient_id,
+        recipient_display="" if is_self else recipient_display,
+    )
+
+    who_line = "" if is_self else f"🎯 Kimga: <b>{recipient_display}</b> (ID: <code>{recipient_id}</code>)\n"
+
+    # ---- Avtomatik yuborishga urinish (agar tg_gift_id bog'langan bo'lsa) ----
+    auto_sent = False
+    auto_error = None
+    if item["tg_gift_id"]:
+        try:
+            await bot.send_gift(
+                user_id=recipient_id,
+                gift_id=item["tg_gift_id"],
+                text=f"🎁 {item['name']} — Stars Bot'dan sovg'a!",
+            )
+            auto_sent = True
+        except Exception as e:
+            auto_error = str(e)
+            logger.error("send_gift avtomatik yuborilmadi (item=%s, w_id=%s): %s", item["name"], w_id, e)
+
+    if auto_sent:
+        await update_withdrawal_status(w_id, "paid")
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"🎁 <b>GIFT AVTOMATIK YUBORILDI!</b> (so'rov #{w_id})\n\n"
+                    f"👤 So'rovchi: {requester_name} (@{requester_username or '—'})\n"
+                    f"🆔 ID: <code>{requester_id}</code>\n"
+                    f"{who_line}"
+                    f"🎁 Gift: <b>{item['name']}</b>\n"
+                    f"💰 Narxi: <b>{item['price_stars']} ⭐</b> (bot balansidan)\n"
+                    f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                    f"✅ Hech narsa qilish shart emas — allaqachon yuborilgan.",
+                )
+            except TelegramForbiddenError:
+                pass
+
+        if is_self:
+            return (
+                f"🎉 <b>Gift avtomatik yuborildi!</b>\n\n"
+                f"🎁 <b>{item['name']}</b>\n"
+                f"💰 {item['price_stars']} ⭐ ayirildi.\n"
+                f"🧾 So'rov: #{w_id}\n\n"
+                f"Telegram'dagi \"Sovg'alar\" bo'limingizni tekshiring! ✨"
+            )
+        return (
+            f"🎉 <b>Gift {recipient_display}ga avtomatik yuborildi!</b>\n\n"
+            f"🎁 <b>{item['name']}</b>\n"
+            f"💰 {item['price_stars']} ⭐ balansingizdan ayirildi.\n"
+            f"🧾 So'rov: #{w_id}"
+        )
+
+    # Qo'lda tasdiqlash yo'li (tg_gift_id yo'q yoki avto-yuborish xato berdi)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Gift yubordim", callback_data=f"wd_approve:{w_id}")
+    kb.button(text="❌ Bekor qilish (qaytarish)", callback_data=f"wd_reject:{w_id}")
+    kb.adjust(1)
+
+    warn = (
+        f"⚠️ Avtomatik yuborish muvaffaqiyatsiz bo'ldi ({auto_error}) — qo'lda yuboring!\n\n"
+        if auto_error else ""
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🎁 <b>GIFT YECHISH SO'ROVI #{w_id}</b>\n\n"
+                f"{warn}"
+                f"👤 So'rovchi: {requester_name} (@{requester_username or '—'})\n"
+                f"🆔 ID: <code>{requester_id}</code>\n"
+                f"{who_line}"
+                f"🎁 Gift: <b>{item['name']}</b>\n"
+                f"💰 Narxi: <b>{item['price_stars']} ⭐</b>\n"
+                f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"⚠️ Giftni {'foydalanuvchiga' if is_self else 'YUQORIDAGI QABUL QILUVCHIGA'} Telegram'da "
+                f"yuborgach, <b>\"✅ Gift yubordim\"</b> tugmasini bosing — "
+                f"shunda bu so'rov \"bajarildi\" deb belgilanadi va qayta-qayta yuborib yubormaysiz.",
+                reply_markup=kb.as_markup(),
+            )
+        except TelegramForbiddenError:
+            pass
+
+    if is_self:
+        return (
+            f"✅ <b>So'rovingiz qabul qilindi!</b>\n\n"
+            f"🎁 <b>{item['name']}</b>\n"
+            f"💰 {item['price_stars']} ⭐ ayirildi.\n"
+            f"🧾 So'rov: #{w_id}\n\n"
+            f"Gift sizga Telegram'da yuboriladi. Egasi: @Kottabolladan"
+        )
+    return (
+        f"✅ <b>So'rovingiz qabul qilindi!</b>\n\n"
+        f"🎁 <b>{item['name']}</b> — <b>{recipient_display}</b>ga yuboriladi.\n"
+        f"💰 {item['price_stars']} ⭐ balansingizdan ayirildi.\n"
+        f"🧾 So'rov: #{w_id}\n\n"
+        f"Gift {recipient_display}ga Telegram'da yuboriladi. Egasi: @Kottabolladan"
+    )
+
+
 @router.callback_query(F.data.startswith("withdraw_gift:"))
-async def withdraw_gift_confirm(call: CallbackQuery, bot: Bot) -> None:
-    """Gift yechib olish. Agar mahsulotga haqiqiy Telegram gift_id bog'langan
-    bo'lsa (admin panel → 🎁 TG Gift avto-yuborish), bot uni o'zining haqiqiy
-    Stars balansidan DARHOL avtomatik yuboradi — admin qo'lda bosishi shart
-    emas. Bog'lanmagan yoki avto-yuborish muvaffaqiyatsiz bo'lsa, eski
-    qo'lda-tasdiqlash yo'liga qaytiladi (yulduz hech qachon yo'qolmaydi)."""
+async def withdraw_gift_confirm(call: CallbackQuery) -> None:
+    """Foydalanuvchi bitta giftni tanladi — endi kimga yuborishni so'raymiz.
+    Mijoz talabi: gift yechilganda uni faqat o'ziga emas, boshqa odamga ham
+    yuborish mumkin bo'lsin (talab ko'payganini aytishdi)."""
     item_id = int(call.data.split(":")[1])
     user = await get_user(call.from_user.id)
     item = await get_shop_item(item_id)
@@ -2001,100 +2150,129 @@ async def withdraw_gift_confirm(call: CallbackQuery, bot: Bot) -> None:
         await call.answer("❌ Balans yetarli emas!", show_alert=True)
         return
 
-    # Gift yechib olinadi — yulduz ayriladi
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🙋 O'zimga", callback_data=f"giftrecipient:self:{item_id}")
+    kb.button(text="👤 Boshqa odamga", callback_data=f"giftrecipient:other:{item_id}")
+    kb.button(text="🔙 Ortga", callback_data="withdraw:gift")
+    kb.adjust(1)
+    await call.message.edit_text(
+        f"🎁 <b>{item['name']}</b> — <b>{item['price_stars']} ⭐</b>\n\nKimga yubormoqchisiz?",
+        reply_markup=kb.as_markup(),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("giftrecipient:self:"))
+async def gift_recipient_self(call: CallbackQuery, bot: Bot) -> None:
+    """"🙋 O'zimga" tanlandi — avvalgi (yagona) xatti-harakat: gift
+    so'rovchining o'ziga yuboriladi."""
+    item_id = int(call.data.split(":")[2])
+    user = await get_user(call.from_user.id)
+    item = await get_shop_item(item_id)
+    if not user or not item:
+        await call.answer("❌ Xatolik yuz berdi", show_alert=True)
+        return
+
+    settings = await get_settings()
+    if user["referals_count"] < settings["min_referals_required"]:
+        await call.answer("❌ Gift sifatida yechish uchun yetarli referal yo'q!", show_alert=True)
+        return
+    if user["balance_stars"] < item["price_stars"]:
+        await call.answer("❌ Balans yetarli emas!", show_alert=True)
+        return
     if not await deduct_stars(call.from_user.id, item["price_stars"]):
         await call.answer("❌ Balans yetarli emas!", show_alert=True)
         return
-    w_id = await add_withdrawal(
-        telegram_id=call.from_user.id,
-        user_name=call.from_user.first_name or "",
-        username=call.from_user.username or "",
-        kind="gift",
-        amount_stars=item["price_stars"],
-        item_name=item["name"],
+
+    result_text = await _fulfill_gift_withdrawal(
+        bot, call.from_user.id, call.from_user.first_name or "", call.from_user.username or "",
+        item, call.from_user.id, "", is_self=True,
     )
-
-    # ---- Avtomatik yuborishga urinish (agar tg_gift_id bog'langan bo'lsa) ----
-    auto_sent = False
-    auto_error = None
-    if item["tg_gift_id"]:
-        try:
-            await bot.send_gift(
-                user_id=call.from_user.id,
-                gift_id=item["tg_gift_id"],
-                text=f"🎁 {item['name']} — Stars Bot'dan sovg'a!",
-            )
-            auto_sent = True
-        except Exception as e:
-            auto_error = str(e)
-            logger.error("send_gift avtomatik yuborilmadi (item=%s, w_id=%s): %s", item["name"], w_id, e)
-
-    if auto_sent:
-        await update_withdrawal_status(w_id, "paid")
-        for admin_id in ADMIN_IDS:
-            try:
-                await bot.send_message(
-                    admin_id,
-                    f"🎁 <b>GIFT AVTOMATIK YUBORILDI!</b> (so'rov #{w_id})\n\n"
-                    f"👤 Foydalanuvchi: {call.from_user.first_name} (@{call.from_user.username or '—'})\n"
-                    f"🆔 ID: <code>{call.from_user.id}</code>\n"
-                    f"🎁 Gift: <b>{item['name']}</b>\n"
-                    f"💰 Narxi: <b>{item['price_stars']} ⭐</b> (bot balansidan)\n"
-                    f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                    f"✅ Hech narsa qilish shart emas — allaqachon yuborilgan.",
-                )
-            except TelegramForbiddenError:
-                pass
-
-        result_text = (
-            f"🎉 <b>Gift avtomatik yuborildi!</b>\n\n"
-            f"🎁 <b>{item['name']}</b>\n"
-            f"💰 {item['price_stars']} ⭐ ayirildi.\n"
-            f"🧾 So'rov: #{w_id}\n\n"
-            f"Telegram'dagi \"Sovg'alar\" bo'limingizni tekshiring! ✨"
-        )
-    else:
-        # Qo'lda tasdiqlash yo'li (tg_gift_id yo'q yoki avto-yuborish xato berdi)
-        kb = InlineKeyboardBuilder()
-        kb.button(text="✅ Gift yubordim", callback_data=f"wd_approve:{w_id}")
-        kb.button(text="❌ Bekor qilish (qaytarish)", callback_data=f"wd_reject:{w_id}")
-        kb.adjust(1)
-
-        warn = (
-            f"⚠️ Avtomatik yuborish muvaffaqiyatsiz bo'ldi ({auto_error}) — qo'lda yuboring!\n\n"
-            if auto_error else ""
-        )
-        for admin_id in ADMIN_IDS:
-            try:
-                await bot.send_message(
-                    admin_id,
-                    f"🎁 <b>GIFT YECHISH SO'ROVI #{w_id}</b>\n\n"
-                    f"{warn}"
-                    f"👤 Foydalanuvchi: {call.from_user.first_name} (@{call.from_user.username or '—'})\n"
-                    f"🆔 ID: <code>{call.from_user.id}</code>\n"
-                    f"🎁 Gift: <b>{item['name']}</b>\n"
-                    f"💰 Narxi: <b>{item['price_stars']} ⭐</b>\n"
-                    f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                    f"⚠️ Giftni foydalanuvchiga Telegram'da yuborgach, <b>\"✅ Gift yubordim\"</b> tugmasini bosing — "
-                    f"shunda bu so'rov \"bajarildi\" deb belgilanadi va qayta-qayta yuborib yubormaysiz.",
-                    reply_markup=kb.as_markup(),
-                )
-            except TelegramForbiddenError:
-                pass
-
-        result_text = (
-            f"✅ <b>So'rovingiz qabul qilindi!</b>\n\n"
-            f"🎁 <b>{item['name']}</b>\n"
-            f"💰 {item['price_stars']} ⭐ ayirildi.\n"
-            f"🧾 So'rov: #{w_id}\n\n"
-            f"Gift sizga Telegram'da yuboriladi. Egasi: @Kottabolladan"
-        )
-
     try:
         await call.message.edit_text(result_text)
     except TelegramBadRequest:
         await call.message.answer(result_text)
     await call.answer("✅ Yuborildi!", show_alert=False)
+
+
+@router.callback_query(F.data.startswith("giftrecipient:other:"))
+async def gift_recipient_other_start(call: CallbackQuery, state: FSMContext) -> None:
+    """"👤 Boshqa odamga" tanlandi — qabul qiluvchining @username'ini
+    so'raymiz. Yulduz hali ayirilmagan (username topilmasa, hech narsa
+    yo'qolmasligi uchun)."""
+    item_id = int(call.data.split(":")[2])
+    user = await get_user(call.from_user.id)
+    item = await get_shop_item(item_id)
+    if not user or not item:
+        await call.answer("❌ Xatolik yuz berdi", show_alert=True)
+        return
+    settings = await get_settings()
+    if user["referals_count"] < settings["min_referals_required"]:
+        await call.answer("❌ Gift sifatida yechish uchun yetarli referal yo'q!", show_alert=True)
+        return
+    if user["balance_stars"] < item["price_stars"]:
+        await call.answer("❌ Balans yetarli emas!", show_alert=True)
+        return
+
+    await state.set_state(GiftRecipientStates.username)
+    await state.update_data(item_id=item_id)
+    await call.message.edit_text(
+        f"👤 <b>{item['name']}</b> — kimga yuborilsin?\n\n"
+        f"Qabul qiluvchining Telegram <b>@username</b>'ini yozing (masalan: @acme).\n"
+        f"⚠️ Ular Telegram'da mavjud va username to'g'ri bo'lishi kerak."
+    )
+    await call.answer()
+
+
+@router.message(GiftRecipientStates.username)
+async def gift_recipient_other_finish(message: Message, bot: Bot, state: FSMContext) -> None:
+    data = await state.get_data()
+    item_id = data.get("item_id")
+    await state.clear()
+
+    username = (message.text or "").strip().lstrip("@")
+    if not username:
+        await message.answer("❌ Username kiritilmadi. Qaytadan urinib ko'ring: 💸 Yulduz yechish → 🎁 Gift sifatida.")
+        return
+
+    user = await get_user(message.from_user.id)
+    item = await get_shop_item(item_id) if item_id else None
+    if not user or not item:
+        await message.answer("❌ Xatolik yuz berdi, qaytadan urinib ko'ring.")
+        return
+
+    settings = await get_settings()
+    if user["referals_count"] < settings["min_referals_required"]:
+        await message.answer("❌ Gift sifatida yechish uchun yetarli referal yo'q!")
+        return
+    if user["balance_stars"] < item["price_stars"]:
+        await message.answer("❌ Balans yetarli emas!")
+        return
+
+    resolved = await resolve_username_to_id(bot, username)
+    if not resolved:
+        await message.answer(
+            f"❌ @{username} topilmadi. Username to'g'ri yozilganiga ishonch hosil qiling "
+            f"(bu odam Telegram'da mavjud bo'lishi kerak), so'ngra qaytadan urinib ko'ring: "
+            f"💸 Yulduz yechish → 🎁 Gift sifatida."
+        )
+        return
+    recipient_id, _recipient_name = resolved
+    if recipient_id == message.from_user.id:
+        await message.answer("❌ Bu sizning o'z akkountingiz. \"🙋 O'zimga\" tugmasidan foydalaning.")
+        return
+
+    if not await deduct_stars(message.from_user.id, item["price_stars"]):
+        await message.answer("❌ Balans yetarli emas!")
+        return
+
+    recipient_display = f"@{username}"
+
+    result_text = await _fulfill_gift_withdrawal(
+        bot, message.from_user.id, message.from_user.first_name or "", message.from_user.username or "",
+        item, recipient_id, recipient_display, is_self=False,
+    )
+    await message.answer(result_text)
 
 
 @router.message(F.text == "🛍️ Do'kon")
@@ -6112,6 +6290,26 @@ MINI_APP_HTML = """<!doctype html>
     </div>
   </div>
 
+  <div class="overlay" id="giftRecipientOverlay">
+    <div class="modal">
+      <span class="close-x" id="giftRecipientClose">✕</span>
+      <h2>🎁 Kimga yubormoqchisiz?</h2>
+      <div class="sub" id="giftRecipientSub"></div>
+      <div class="actions" id="giftRecipientChoiceRow">
+        <button class="secondary" id="giftRecipientSelfBtn">🙋 O'zimga</button>
+        <button class="primary" id="giftRecipientOtherBtn">👤 Boshqa odamga</button>
+      </div>
+      <div id="giftRecipientUsernameRow" hidden>
+        <label>Qabul qiluvchining Telegram @username'ini kiriting</label>
+        <input type="text" class="promo-input" id="giftRecipientUsernameInput" placeholder="@username">
+        <div class="actions">
+          <button class="secondary" id="giftRecipientBackBtn">Ortga</button>
+          <button class="primary" id="giftRecipientSendBtn">Yuborish</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div class="overlay" id="aboutOverlay">
     <div class="modal">
       <span class="close-x" id="aboutClose">✕</span>
@@ -6941,25 +7139,55 @@ function renderWithdraw() {
     const row = document.createElement('div');
     row.className = 'gift-row';
     row.innerHTML = `<div><div class="gname">${g.name}</div><div class="gprice">${g.price_stars} ⭐</div></div><button>Yechish</button>`;
-    row.querySelector('button').onclick = (e) => withdraw('gift', g.id, e.target);
+    row.querySelector('button').onclick = () => openGiftRecipientChoice(g.id, g.name);
     list.appendChild(row);
   });
 }
 
 document.getElementById('wdStarsBtn').onclick = (e) => withdraw('stars', null, e.target);
 
-async function withdraw(kind, itemId, btnEl) {
+// ---- Gift yechishda "kimga?" tanlovi (mijoz talabi: gift faqat o'ziga
+// emas, boshqa odamga ham yuborilishi kerak) ----
+let pendingGiftItemId = null;
+function openGiftRecipientChoice(itemId, itemName) {
+  pendingGiftItemId = itemId;
+  document.getElementById('giftRecipientSub').textContent = itemName || '';
+  document.getElementById('giftRecipientChoiceRow').hidden = false;
+  document.getElementById('giftRecipientUsernameRow').hidden = true;
+  document.getElementById('giftRecipientUsernameInput').value = '';
+  openOverlay('giftRecipientOverlay');
+}
+document.getElementById('giftRecipientClose').onclick = () => closeOverlay('giftRecipientOverlay');
+document.getElementById('giftRecipientSelfBtn').onclick = (e) => withdraw('gift', pendingGiftItemId, e.target);
+document.getElementById('giftRecipientOtherBtn').onclick = () => {
+  document.getElementById('giftRecipientChoiceRow').hidden = true;
+  document.getElementById('giftRecipientUsernameRow').hidden = false;
+};
+document.getElementById('giftRecipientBackBtn').onclick = () => {
+  document.getElementById('giftRecipientUsernameRow').hidden = true;
+  document.getElementById('giftRecipientChoiceRow').hidden = false;
+};
+document.getElementById('giftRecipientSendBtn').onclick = (e) => {
+  const uname = document.getElementById('giftRecipientUsernameInput').value.trim().replace(/^@/, '');
+  if (!uname) { toast('Username kiriting'); return; }
+  withdraw('gift', pendingGiftItemId, e.target, uname);
+};
+
+async function withdraw(kind, itemId, btnEl, recipientUsername) {
   if (!INIT_DATA) { toast('Bu amal uchun botni Telegram ilovasi ichidan oching'); return; }
   const oldText = btnEl.textContent;
   btnEl.disabled = true; btnEl.textContent = 'Yuborilmoqda...';
   try {
+    const body = { init_data: INIT_DATA, kind, item_id: itemId };
+    if (recipientUsername) body.recipient_username = recipientUsername;
     const res = await fetch('/api/withdraw', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ init_data: INIT_DATA, kind, item_id: itemId }),
+      body: JSON.stringify(body),
     });
     const data = await res.json();
     btnEl.disabled = false; btnEl.textContent = oldText;
     if (!res.ok || !data.ok) { toast(data.error || 'Xatolik yuz berdi'); return; }
+    closeOverlay('giftRecipientOverlay');
     showResult(data.message);
     await refreshMe();
   } catch (e) {
@@ -7770,6 +7998,8 @@ async def webapp_withdraw_handler(request):
             "error": f"Yechish uchun minimal {settings['min_withdraw_stars']} ⭐ kerak. Yana {need} ⭐ kerak.",
         }, status=402)
 
+    recipient_id = None
+    recipient_display = ""
     if kind == "stars":
         amount = user["balance_stars"]
         item_name = ""
@@ -7790,6 +8020,24 @@ async def webapp_withdraw_handler(request):
             return web.json_response({"error": "Balans yetarli emas"}, status=402)
         amount = item["price_stars"]
         item_name = item["name"]
+
+        # Mijoz talabi: gift faqat o'ziga emas, boshqa odamga ham
+        # yuborilishi kerak — Mini App'dan ixtiyoriy recipient_username
+        # yuborilsa, yulduz ayirishdan OLDIN uni chat'ga aylantiramiz
+        # (topilmasa hech narsa yo'qolmasin).
+        recipient_username = (body.get("recipient_username") or "").strip().lstrip("@")
+        if recipient_username:
+            resolved = await resolve_username_to_id(_bot, recipient_username)
+            if not resolved:
+                return web.json_response({
+                    "error": f"@{recipient_username} topilmadi. Username to'g'ri yozilganiga ishonch hosil qiling.",
+                }, status=404)
+            recipient_id, _ = resolved
+            if recipient_id == telegram_id:
+                return web.json_response({
+                    "error": "Bu sizning o'z akkountingiz. Boshqa odam uchun username kiriting yoki bo'sh qoldiring.",
+                }, status=400)
+            recipient_display = f"@{recipient_username}"
     else:
         return web.json_response({"error": "Noma'lum turi"}, status=400)
 
@@ -7798,6 +8046,7 @@ async def webapp_withdraw_handler(request):
     w_id = await add_withdrawal(
         telegram_id=telegram_id, user_name=first_name, username=username,
         kind=kind, amount_stars=amount, item_name=item_name,
+        recipient_telegram_id=recipient_id, recipient_display=recipient_display,
     )
 
     kb = InlineKeyboardBuilder()
@@ -7806,17 +8055,20 @@ async def webapp_withdraw_handler(request):
     kb.adjust(1)
 
     label = f"🎁 Gift: <b>{item_name}</b>" if kind == "gift" else "⭐ Yulduz sifatida"
+    who_line = f"🎯 Kimga: <b>{recipient_display}</b> (ID: <code>{recipient_id}</code>)\n" if recipient_id else ""
     for admin_id in ADMIN_IDS:
         try:
             await _bot.send_message(
                 admin_id,
                 f"💸 <b>YECHISH SO'ROVI #{w_id} (Mini App)</b>\n\n"
-                f"👤 Foydalanuvchi: {first_name} (@{username or '—'})\n"
+                f"👤 So'rovchi: {first_name} (@{username or '—'})\n"
                 f"🆔 ID: <code>{telegram_id}</code>\n"
+                f"{who_line}"
                 f"{label}\n"
                 f"💰 Miqdor: <b>{amount} ⭐</b>\n"
                 f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                f"⚠️ Real to'lovni o'tkazgach \"✅ To'lov qildim\" tugmasini bosing — "
+                f"⚠️ Giftni {'YUQORIDAGI QABUL QILUVCHIGA' if recipient_id else 'foydalanuvchiga'} yuborgach/"
+                f"real to'lovni o'tkazgach \"✅ To'lov qildim\" tugmasini bosing — "
                 f"shunda ikki marta to'lab yubormaysiz.",
                 reply_markup=kb.as_markup(),
             )
@@ -7827,7 +8079,9 @@ async def webapp_withdraw_handler(request):
         f"✅ <b>So'rovingiz qabul qilindi!</b><br><br>"
         f"💰 Miqdor: <b>{amount} ⭐</b><br>"
         f"🧾 So'rov: #{w_id}<br><br>"
-        f"Yulduzlar/gift bot egasi tomonidan tez orada yuboriladi."
+        + (f"Yulduzlar/gift {recipient_display}ga bot egasi tomonidan tez orada yuboriladi."
+           if recipient_id else
+           "Yulduzlar/gift bot egasi tomonidan tez orada yuboriladi.")
     )
     return web.json_response({"ok": True, "message": message})
 
