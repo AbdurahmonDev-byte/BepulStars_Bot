@@ -244,6 +244,13 @@ class GiftRecipientStates(StatesGroup):
     username = State()
 
 
+class StarsRecipientStates(StatesGroup):
+    """Yulduz (⭐) yechishda 'boshqa odamga' yuborish tanlanganda, qabul
+    qiluvchining @username'ini kutish holati — xuddi GiftRecipientStates
+    kabi, lekin ⭐ yechish uchun (mijoz talabi keyinroq kengaytirildi)."""
+    username = State()
+
+
 # ============================================================
 #  MA'LUMOTLAR BAZASI (aiosqlite)
 # ============================================================
@@ -1786,9 +1793,75 @@ async def withdraw_handler(message: Message) -> None:
     )
 
 
+async def _fulfill_stars_withdrawal(
+    bot: Bot,
+    requester_id: int,
+    requester_name: str,
+    requester_username: str,
+    amount: int,
+    recipient_id: int | None,
+    recipient_display: str,
+) -> str:
+    """Yulduz allaqachon SO'ROVCHIning ichki balansidan ayirilgan — bu
+    funksiya so'rovni yozadi va adminni xabardor qiladi: real to'lov (pul
+    yoki haqiqiy Telegram Stars) admin tomonidan RECIPIENT'ga (o'zi yoki
+    mijoz talabi bilan qo'shilgan — boshqa odam) qo'lda o'tkaziladi."""
+    w_id = await add_withdrawal(
+        telegram_id=requester_id,
+        user_name=requester_name,
+        username=requester_username,
+        kind="stars",
+        amount_stars=amount,
+        recipient_telegram_id=recipient_id,
+        recipient_display=recipient_display,
+    )
+
+    who_line = f"🎯 Kimga: <b>{recipient_display}</b> (ID: <code>{recipient_id}</code>)\n" if recipient_id else ""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ To'lov qildim", callback_data=f"wd_approve:{w_id}")
+    kb.button(text="❌ Bekor qilish (qaytarish)", callback_data=f"wd_reject:{w_id}")
+    kb.adjust(1)
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"💸 <b>YULDUZ YECHISH SO'ROVI #{w_id}</b>\n\n"
+                f"👤 So'rovchi: {requester_name} (@{requester_username or '—'})\n"
+                f"🆔 ID: <code>{requester_id}</code>\n"
+                f"{who_line}"
+                f"💰 Miqdor: <b>{amount} ⭐</b>\n"
+                f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"⚠️ {'YUQORIDAGI QABUL QILUVCHIGA' if recipient_id else 'Foydalanuvchiga'} real to'lovni "
+                f"o'tkazgach, <b>\"✅ To'lov qildim\"</b> tugmasini bosing — "
+                f"shunda bu so'rov \"to'langan\" deb belgilanadi va qayta-qayta to'lab yubormaysiz.",
+                reply_markup=kb.as_markup(),
+            )
+        except TelegramForbiddenError:
+            pass
+
+    if recipient_id:
+        return (
+            f"✅ <b>So'rovingiz qabul qilindi!</b>\n\n"
+            f"💰 Miqdor: <b>{amount} ⭐</b>\n"
+            f"🧾 So'rov: #{w_id}\n\n"
+            f"📤 Yulduzlar <b>{recipient_display}</b>ga bot egasi tomonidan o'tkaziladi.\n"
+            f"👑 Ega: <b>@Kottabolladan</b>"
+        )
+    return (
+        f"✅ <b>So'rovingiz qabul qilindi!</b>\n\n"
+        f"💰 Miqdor: <b>{amount} ⭐</b>\n"
+        f"🧾 So'rov: #{w_id}\n\n"
+        f"📤 Yulduzlar bot egasi tomonidan hisobingizga o'tkaziladi.\n"
+        f"👑 Ega: <b>@Kottabolladan</b>"
+    )
+
+
 async def process_stars_withdrawal(call: CallbackQuery, bot: Bot, amount: int) -> None:
-    """Yulduzlar yechiladi: balansdan ayriladi, admin uchun Tasdiqlash/Rad etish
-    tugmali so'rov yaratiladi (holati kuzatiladi — ikki marta to'lanib ketmasin)."""
+    """"🙋 O'zimga" — yulduzlar (haqiqiy to'lov sifatida) so'rovchining
+    o'ziga o'tkaziladi. Balansdan ayriladi, admin uchun Tasdiqlash/Rad etish
+    tugmali so'rov yaratiladi (holati kuzatiladi — ikki marta to'lanib
+    ketmasin)."""
     user = await get_user(call.from_user.id)
     if not user:
         await call.answer("❌ Xatolik", show_alert=True)
@@ -1801,51 +1874,15 @@ async def process_stars_withdrawal(call: CallbackQuery, bot: Bot, amount: int) -
     if not await deduct_stars(call.from_user.id, amount):
         await call.answer("❌ Balans yetarli emas!", show_alert=True)
         return
-    w_id = await add_withdrawal(
-        telegram_id=call.from_user.id,
-        user_name=call.from_user.first_name or "",
-        username=call.from_user.username or "",
-        kind="stars",
-        amount_stars=amount,
+
+    result_text = await _fulfill_stars_withdrawal(
+        bot, call.from_user.id, call.from_user.first_name or "", call.from_user.username or "",
+        amount, None, "",
     )
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ To'lov qildim", callback_data=f"wd_approve:{w_id}")
-    kb.button(text="❌ Bekor qilish (qaytarish)", callback_data=f"wd_reject:{w_id}")
-    kb.adjust(1)
-
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(
-                admin_id,
-                f"💸 <b>YULDUZ YECHISH SO'ROVI #{w_id}</b>\n\n"
-                f"👤 Foydalanuvchi: {call.from_user.first_name} (@{call.from_user.username or '—'})\n"
-                f"🆔 ID: <code>{call.from_user.id}</code>\n"
-                f"💰 Miqdor: <b>{amount} ⭐</b>\n"
-                f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                f"⚠️ Foydalanuvchiga real to'lovni o'tkazgach, <b>\"✅ To'lov qildim\"</b> tugmasini bosing — "
-                f"shunda bu so'rov \"to'langan\" deb belgilanadi va qayta-qayta to'lab yubormaysiz.",
-                reply_markup=kb.as_markup(),
-            )
-        except TelegramForbiddenError:
-            pass
-
     try:
-        await call.message.edit_text(
-            f"✅ <b>So'rovingiz qabul qilindi!</b>\n\n"
-            f"💰 Miqdor: <b>{amount} ⭐</b>\n"
-            f"🧾 So'rov: #{w_id}\n\n"
-            f"📤 Yulduzlar bot egasi tomonidan hisobingizga o'tkaziladi.\n"
-            f"👑 Ega: <b>@Kottabolladan</b>",
-        )
+        await call.message.edit_text(result_text)
     except TelegramBadRequest:
-        await call.message.answer(
-            f"✅ <b>So'rovingiz qabul qilindi!</b>\n\n"
-            f"💰 Miqdor: <b>{amount} ⭐</b>\n"
-            f"🧾 So'rov: #{w_id}\n\n"
-            f"📤 Yulduzlar bot egasi tomonidan hisobingizga o'tkaziladi.\n"
-            f"👑 Ega: <b>@Kottabolladan</b>",
-        )
+        await call.message.answer(result_text)
     await call.answer("✅ Yuborildi!", show_alert=False)
 
 
@@ -1930,7 +1967,9 @@ async def withdrawal_reject_callback(call: CallbackQuery, bot: Bot) -> None:
 
 
 @router.callback_query(F.data == "withdraw:stars")
-async def withdraw_stars_callback(call: CallbackQuery, bot: Bot) -> None:
+async def withdraw_stars_callback(call: CallbackQuery) -> None:
+    """Mijoz talabi bilan kengaytirildi: yulduz yechishda ham (gift kabi)
+    "kimga?" so'raladi — o'ziga yoki boshqa odamga (@username orqali)."""
     user = await get_user(call.from_user.id)
     if not user:
         await call.answer("❌ Avval /start ni bosing!", show_alert=True)
@@ -1939,7 +1978,97 @@ async def withdraw_stars_callback(call: CallbackQuery, bot: Bot) -> None:
     if user["balance_stars"] < settings["min_withdraw_stars"]:
         await call.answer("❌ Minimal chegaraga yetmadingiz!", show_alert=True)
         return
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🙋 O'zimga", callback_data="starsrecipient:self")
+    kb.button(text="👤 Boshqa odamga", callback_data="starsrecipient:other")
+    kb.adjust(1)
+    await call.message.edit_text(
+        f"⭐ <b>Yulduz sifatida yechish</b> — <b>{user['balance_stars']} ⭐</b>\n\nKimga yubormoqchisiz?",
+        reply_markup=kb.as_markup(),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "starsrecipient:self")
+async def stars_recipient_self(call: CallbackQuery, bot: Bot) -> None:
+    """"🙋 O'zimga" tanlandi — avvalgi (yagona) xatti-harakat."""
+    user = await get_user(call.from_user.id)
+    if not user:
+        await call.answer("❌ Xatolik yuz berdi", show_alert=True)
+        return
+    settings = await get_settings()
+    if user["balance_stars"] < settings["min_withdraw_stars"]:
+        await call.answer("❌ Minimal chegaraga yetmadingiz!", show_alert=True)
+        return
     await process_stars_withdrawal(call, bot, user["balance_stars"])
+
+
+@router.callback_query(F.data == "starsrecipient:other")
+async def stars_recipient_other_start(call: CallbackQuery, state: FSMContext) -> None:
+    """"👤 Boshqa odamga" tanlandi — qabul qiluvchining @username'ini
+    so'raymiz. Yulduz hali ayirilmagan (username topilmasa, hech narsa
+    yo'qolmasligi uchun)."""
+    user = await get_user(call.from_user.id)
+    if not user:
+        await call.answer("❌ Xatolik yuz berdi", show_alert=True)
+        return
+    settings = await get_settings()
+    if user["balance_stars"] < settings["min_withdraw_stars"]:
+        await call.answer("❌ Minimal chegaraga yetmadingiz!", show_alert=True)
+        return
+
+    await state.set_state(StarsRecipientStates.username)
+    await call.message.edit_text(
+        f"👤 <b>{user['balance_stars']} ⭐</b> — kimga yuborilsin?\n\n"
+        f"Qabul qiluvchining Telegram <b>@username</b>'ini yozing (masalan: @acme).\n"
+        f"⚠️ Ular Telegram'da mavjud va username to'g'ri bo'lishi kerak."
+    )
+    await call.answer()
+
+
+@router.message(StarsRecipientStates.username)
+async def stars_recipient_other_finish(message: Message, bot: Bot, state: FSMContext) -> None:
+    await state.clear()
+
+    username = (message.text or "").strip().lstrip("@")
+    if not username:
+        await message.answer("❌ Username kiritilmadi. Qaytadan urinib ko'ring: 💸 Yulduz yechish → ⭐ Yulduz sifatida.")
+        return
+
+    user = await get_user(message.from_user.id)
+    if not user:
+        await message.answer("❌ Xatolik yuz berdi, qaytadan urinib ko'ring.")
+        return
+
+    settings = await get_settings()
+    if user["balance_stars"] < settings["min_withdraw_stars"]:
+        await message.answer("❌ Minimal chegaraga yetmadingiz!")
+        return
+
+    resolved = await resolve_username_to_id(bot, username)
+    if not resolved:
+        await message.answer(
+            f"❌ @{username} topilmadi. Username to'g'ri yozilganiga ishonch hosil qiling "
+            f"(bu odam Telegram'da mavjud bo'lishi kerak), so'ngra qaytadan urinib ko'ring: "
+            f"💸 Yulduz yechish → ⭐ Yulduz sifatida."
+        )
+        return
+    recipient_id, _recipient_name = resolved
+    if recipient_id == message.from_user.id:
+        await message.answer("❌ Bu sizning o'z akkountingiz. \"🙋 O'zimga\" tugmasidan foydalaning.")
+        return
+
+    amount = user["balance_stars"]
+    if not await deduct_stars(message.from_user.id, amount):
+        await message.answer("❌ Balans yetarli emas!")
+        return
+
+    result_text = await _fulfill_stars_withdrawal(
+        bot, message.from_user.id, message.from_user.first_name or "", message.from_user.username or "",
+        amount, recipient_id, f"@{username}",
+    )
+    await message.answer(result_text)
 
 
 @router.callback_query(F.data == "withdraw:gift")
@@ -6293,7 +6422,7 @@ MINI_APP_HTML = """<!doctype html>
   <div class="overlay" id="giftRecipientOverlay">
     <div class="modal">
       <span class="close-x" id="giftRecipientClose">✕</span>
-      <h2>🎁 Kimga yubormoqchisiz?</h2>
+      <h2 id="giftRecipientTitle">🎁 Kimga yubormoqchisiz?</h2>
       <div class="sub" id="giftRecipientSub"></div>
       <div class="actions" id="giftRecipientChoiceRow">
         <button class="secondary" id="giftRecipientSelfBtn">🙋 O'zimga</button>
@@ -7139,26 +7268,29 @@ function renderWithdraw() {
     const row = document.createElement('div');
     row.className = 'gift-row';
     row.innerHTML = `<div><div class="gname">${g.name}</div><div class="gprice">${g.price_stars} ⭐</div></div><button>Yechish</button>`;
-    row.querySelector('button').onclick = () => openGiftRecipientChoice(g.id, g.name);
+    row.querySelector('button').onclick = () => openRecipientChoice('gift', g.id, `🎁 ${g.name}`);
     list.appendChild(row);
   });
 }
 
-document.getElementById('wdStarsBtn').onclick = (e) => withdraw('stars', null, e.target);
+document.getElementById('wdStarsBtn').onclick = () => openRecipientChoice('stars', null, `⭐ ${USER ? USER.balance_stars : 0} yulduz`);
 
-// ---- Gift yechishda "kimga?" tanlovi (mijoz talabi: gift faqat o'ziga
-// emas, boshqa odamga ham yuborilishi kerak) ----
-let pendingGiftItemId = null;
-function openGiftRecipientChoice(itemId, itemName) {
-  pendingGiftItemId = itemId;
-  document.getElementById('giftRecipientSub').textContent = itemName || '';
+// ---- Yechishda "kimga?" tanlovi (mijoz talabi: gift HAM, yulduz HAM
+// faqat o'ziga emas, boshqa odamga ham yuborilishi kerak) ----
+let pendingKind = null;
+let pendingItemId = null;
+function openRecipientChoice(kind, itemId, label) {
+  pendingKind = kind;
+  pendingItemId = itemId;
+  document.getElementById('giftRecipientTitle').textContent = kind === 'stars' ? '⭐ Kimga yubormoqchisiz?' : '🎁 Kimga yubormoqchisiz?';
+  document.getElementById('giftRecipientSub').textContent = label || '';
   document.getElementById('giftRecipientChoiceRow').hidden = false;
   document.getElementById('giftRecipientUsernameRow').hidden = true;
   document.getElementById('giftRecipientUsernameInput').value = '';
   openOverlay('giftRecipientOverlay');
 }
 document.getElementById('giftRecipientClose').onclick = () => closeOverlay('giftRecipientOverlay');
-document.getElementById('giftRecipientSelfBtn').onclick = (e) => withdraw('gift', pendingGiftItemId, e.target);
+document.getElementById('giftRecipientSelfBtn').onclick = (e) => withdraw(pendingKind, pendingItemId, e.target);
 document.getElementById('giftRecipientOtherBtn').onclick = () => {
   document.getElementById('giftRecipientChoiceRow').hidden = true;
   document.getElementById('giftRecipientUsernameRow').hidden = false;
@@ -7170,7 +7302,7 @@ document.getElementById('giftRecipientBackBtn').onclick = () => {
 document.getElementById('giftRecipientSendBtn').onclick = (e) => {
   const uname = document.getElementById('giftRecipientUsernameInput').value.trim().replace(/^@/, '');
   if (!uname) { toast('Username kiriting'); return; }
-  withdraw('gift', pendingGiftItemId, e.target, uname);
+  withdraw(pendingKind, pendingItemId, e.target, uname);
 };
 
 async function withdraw(kind, itemId, btnEl, recipientUsername) {
@@ -7998,8 +8130,6 @@ async def webapp_withdraw_handler(request):
             "error": f"Yechish uchun minimal {settings['min_withdraw_stars']} ⭐ kerak. Yana {need} ⭐ kerak.",
         }, status=402)
 
-    recipient_id = None
-    recipient_display = ""
     if kind == "stars":
         amount = user["balance_stars"]
         item_name = ""
@@ -8020,26 +8150,29 @@ async def webapp_withdraw_handler(request):
             return web.json_response({"error": "Balans yetarli emas"}, status=402)
         amount = item["price_stars"]
         item_name = item["name"]
-
-        # Mijoz talabi: gift faqat o'ziga emas, boshqa odamga ham
-        # yuborilishi kerak — Mini App'dan ixtiyoriy recipient_username
-        # yuborilsa, yulduz ayirishdan OLDIN uni chat'ga aylantiramiz
-        # (topilmasa hech narsa yo'qolmasin).
-        recipient_username = (body.get("recipient_username") or "").strip().lstrip("@")
-        if recipient_username:
-            resolved = await resolve_username_to_id(_bot, recipient_username)
-            if not resolved:
-                return web.json_response({
-                    "error": f"@{recipient_username} topilmadi. Username to'g'ri yozilganiga ishonch hosil qiling.",
-                }, status=404)
-            recipient_id, _ = resolved
-            if recipient_id == telegram_id:
-                return web.json_response({
-                    "error": "Bu sizning o'z akkountingiz. Boshqa odam uchun username kiriting yoki bo'sh qoldiring.",
-                }, status=400)
-            recipient_display = f"@{recipient_username}"
     else:
         return web.json_response({"error": "Noma'lum turi"}, status=400)
+
+    # Mijoz talabi: gift HAM, yulduz HAM faqat o'ziga emas, boshqa odamga
+    # ham yuborilishi mumkin bo'lsin — Mini App'dan ixtiyoriy
+    # recipient_username yuborilsa (ikkala kind uchun ham), yulduz
+    # ayirishdan OLDIN uni chat'ga aylantiramiz (topilmasa hech narsa
+    # yo'qolmasin).
+    recipient_id = None
+    recipient_display = ""
+    recipient_username = (body.get("recipient_username") or "").strip().lstrip("@")
+    if recipient_username:
+        resolved = await resolve_username_to_id(_bot, recipient_username)
+        if not resolved:
+            return web.json_response({
+                "error": f"@{recipient_username} topilmadi. Username to'g'ri yozilganiga ishonch hosil qiling.",
+            }, status=404)
+        recipient_id, _ = resolved
+        if recipient_id == telegram_id:
+            return web.json_response({
+                "error": "Bu sizning o'z akkountingiz. Boshqa odam uchun username kiriting yoki bo'sh qoldiring.",
+            }, status=400)
+        recipient_display = f"@{recipient_username}"
 
     if not await deduct_stars(telegram_id, amount):
         return web.json_response({"error": "Balans yetarli emas! Sahifani yangilab qaytadan urinib ko'ring."}, status=402)
