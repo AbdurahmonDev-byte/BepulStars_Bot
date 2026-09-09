@@ -44,7 +44,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     BufferedInputFile,
-    BusinessConnection,
     CallbackQuery,
     ChatJoinRequest,
     ChatMemberUpdated,
@@ -329,21 +328,6 @@ async def db_init() -> None:
                 telegram_id INTEGER PRIMARY KEY,
                 referrer_id INTEGER NOT NULL,
                 created_at TEXT NOT NULL
-            )
-        """)
-        # Telegram Business ulanishlari — bot egasi (yoki kimda ulangan
-        # bo'lsa) o'z shaxsiy akkountini Business Chatbot sifatida ulaganda
-        # saqlanadi. Shu orqali kimdir haqiqiy gift yuborsa, bot uni
-        # avtomatik ⭐ Stars'ga aylantira oladi (agar shu ruxsat berilgan
-        # bo'lsa) — mijozning "gift obmen qilsa bo'ladigan qilamizmi"
-        # so'roviga javoban qo'shildi.
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS business_connections (
-                business_connection_id TEXT PRIMARY KEY,
-                user_chat_id INTEGER NOT NULL,
-                is_enabled INTEGER NOT NULL DEFAULT 1,
-                can_convert_gifts_to_stars INTEGER NOT NULL DEFAULT 0,
-                updated_at TEXT NOT NULL
             )
         """)
         await db.execute("""
@@ -664,33 +648,6 @@ async def clear_pending_referral(telegram_id: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM pending_referrals WHERE telegram_id = ?", (telegram_id,))
         await db.commit()
-
-
-async def upsert_business_connection(
-    connection_id: str, user_chat_id: int, is_enabled: bool, can_convert_gifts_to_stars: bool,
-) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO business_connections "
-            "(business_connection_id, user_chat_id, is_enabled, can_convert_gifts_to_stars, updated_at) "
-            "VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(business_connection_id) DO UPDATE SET "
-            "user_chat_id = excluded.user_chat_id, is_enabled = excluded.is_enabled, "
-            "can_convert_gifts_to_stars = excluded.can_convert_gifts_to_stars, updated_at = excluded.updated_at",
-            (connection_id, user_chat_id, 1 if is_enabled else 0, 1 if can_convert_gifts_to_stars else 0,
-             datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-        )
-        await db.commit()
-
-
-async def get_business_connection(connection_id: str) -> dict | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT * FROM business_connections WHERE business_connection_id = ?", (connection_id,),
-        )
-        row = await cur.fetchone()
-        return dict(row) if row else None
 
 
 async def get_all_users() -> list[dict]:
@@ -2445,86 +2402,6 @@ async def gift_recipient_other_finish(message: Message, bot: Bot, state: FSMCont
         item, recipient_id, recipient_display, is_self=False,
     )
     await message.answer(result_text)
-
-
-# ============================================================
-#  TELEGRAM BUSINESS ULANISH — real gift'larni avtomatik ⭐ ga aylantirish
-# ============================================================
-# Kimdir botni o'z shaxsiy Telegram akkountiga "Business" sifatida ulasa
-# (Sozlamalar → Business → Chatbots), boshqalar unga jo'natgan haqiqiy
-# (unique BO'LMAGAN) Telegram gift'larni bot avtomatik haqiqiy Stars'ga
-# aylantiradi — hech kim qo'lda hech narsa qilishi shart emas. Buning
-# uchun ulanishda "Sovg'alarni Stars'ga aylantirish" ruxsati
-# (can_convert_gifts_to_stars) yoqilgan bo'lishi shart, aks holda faqat
-# ogohlantirish yuboriladi. NOYOB (unique/NFT) gift'lar bu usulda
-# aylantirilmaydi — Telegram ularni faqat sotish/o'tkazish orqali pulga
-# aylantirishga ruxsat beradi, oddiy convert emas.
-
-
-@router.business_connection()
-async def business_connection_handler(event: BusinessConnection, bot: Bot) -> None:
-    can_convert = bool(event.rights and event.rights.can_convert_gifts_to_stars)
-    await upsert_business_connection(event.id, event.user_chat_id, event.is_enabled, can_convert)
-
-    if not event.is_enabled:
-        text = "❌ Bot Business ulanishi o'chirildi/bekor qilindi."
-    elif can_convert:
-        text = (
-            "✅ <b>Bot Business hisobingizga ulandi!</b>\n\n"
-            "Endi kimdir sizga oddiy (unique bo'lmagan) Telegram gift yuborsa, "
-            "bot uni avtomatik ⭐ Stars'ga aylantiradi — hech narsa qilishingiz shart emas."
-        )
-    else:
-        text = (
-            "⚠️ <b>Bot Business hisobingizga ulandi, lekin gift'larni avtomatik "
-            "Stars'ga aylantirish ruxsati yoqilmagan.</b>\n\n"
-            "Yoqish uchun: Telegram Sozlamalar → Business → Chatbots → botingizni tanlang → "
-            "\"Sovg'alar va yulduzlarni ko'rish\" hamda \"Sovg'alarni Stars'ga aylantirish\" "
-            "ruxsatlarini yoqing."
-        )
-    try:
-        await bot.send_message(event.user_chat_id, text)
-    except Exception as e:
-        logger.warning("Business ulanish xabari yuborilmadi: %s", e)
-
-
-@router.business_message(F.gift)
-async def business_gift_received(message: Message, bot: Bot) -> None:
-    """Ulangan Business hisobiga oddiy (unique bo'lmagan) gift kelganda —
-    ruxsat bo'lsa avtomatik ⭐ Stars'ga aylantiradi."""
-    conn_id = message.business_connection_id
-    if not conn_id:
-        return
-    conn = await get_business_connection(conn_id)
-    gift_info = message.gift
-
-    if not conn or not conn["is_enabled"] or not conn["can_convert_gifts_to_stars"]:
-        logger.info("Business gift keldi, lekin ulanish faol/ruxsatli emas (conn=%s)", conn_id)
-        return
-
-    try:
-        await bot.convert_gift_to_stars(
-            business_connection_id=conn_id,
-            owned_gift_id=gift_info.owned_gift_id,
-        )
-    except Exception as e:
-        logger.error("convert_gift_to_stars xato (conn=%s, gift=%s): %s", conn_id, gift_info.owned_gift_id, e)
-        try:
-            await bot.send_message(
-                conn["user_chat_id"],
-                f"⚠️ Yangi gift keldi, lekin uni avtomatik Stars'ga aylantirishda xatolik yuz berdi: {e}",
-            )
-        except Exception:
-            pass
-        return
-
-    try:
-        await bot.send_message(
-            conn["user_chat_id"],
-            f"🎁 Yangi gift avtomatik <b>{gift_info.convert_star_count} ⭐</b> ga aylantirildi!",
-        )
-    except Exception:
-        pass
 
 
 @router.message(F.text == "🛍️ Do'kon")
