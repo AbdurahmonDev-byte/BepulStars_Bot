@@ -466,6 +466,7 @@ async def db_init() -> None:
             "ALTER TABLE promo_redemptions ADD COLUMN last_redeemed_at TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE withdrawals ADD COLUMN recipient_telegram_id INTEGER",
             "ALTER TABLE withdrawals ADD COLUMN recipient_display TEXT DEFAULT ''",
+            "ALTER TABLE shop_items ADD COLUMN is_special INTEGER NOT NULL DEFAULT 0",
         ):
             try:
                 await db.execute(alter_sql)
@@ -4522,6 +4523,13 @@ async def admin_tggift_set_start(call: CallbackQuery, state: FSMContext) -> None
         current = "\n".join(f"• {v['label'] or '—'}: <code>{v['tg_gift_id']}</code>" for v in variants)
     else:
         current = item["tg_gift_id"] or "❌ bog'lanmagan"
+
+    kb = InlineKeyboardBuilder()
+    special_label = "🌟 Noodatiy: YOQILGAN (bosib o'chiring)" if item["is_special"] else "⚪ Noodatiy: O'CHIQ (bosib yoqing)"
+    kb.button(text=special_label, callback_data=f"admin:item_special_toggle:{item_id}")
+    kb.button(text="🔙 Ortga", callback_data="admin:tggifts")
+    kb.adjust(1)
+
     await call.message.edit_text(
         f"🎁 <b>{item['name']}</b>\n\n"
         f"Hozirgi holat:\n{current}\n\n"
@@ -4531,9 +4539,27 @@ async def admin_tggift_set_start(call: CallbackQuery, state: FSMContext) -> None
         f"xohlasangiz nomi bilan yozing:\n"
         f"<code>abc123 🐻 Ayiqcha\ndef456 🧸 Panda</code>\n"
         f"(shunda foydalanuvchi qaysi birini xohlashini o'zi tanlaydi)\n\n"
-        f"O'chirish uchun <code>-</code> yozing.",
+        f"O'chirish uchun <code>-</code> yozing.\n\n"
+        f"🌟 <b>Noodatiy</b> — Mini App'dagi Gift do'konida \"Noodatiy\" yorlig'i "
+        f"bilan alohida ko'rsatiladi (masalan qimmatroq/nodir gift'lar uchun).",
+        reply_markup=kb.as_markup(),
     )
     await call.answer()
+
+
+@router.callback_query(F.data.startswith("admin:item_special_toggle:"))
+async def admin_item_special_toggle(call: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    item_id = int(call.data.split(":")[2])
+    item = await get_shop_item(item_id)
+    if not item:
+        await call.answer("❌ Mahsulot topilmadi", show_alert=True)
+        return
+    await update_shop_item(item_id, is_special=0 if item["is_special"] else 1)
+    await call.answer("✅ Yangilandi")
+    await admin_tggift_set_start(call, state)
 
 
 @router.message(TgGiftStates.gift_id)
@@ -5975,12 +6001,14 @@ MINI_APP_HTML = """<!doctype html>
     --card-border: rgba(255,255,255,0.35); --card-border-top: rgba(255,255,255,0.55);
   }
   :root[data-theme="dark"] {
-    --bg: #101017; --text: #f0f0f5; --hint: #9797a3; --btn: #3aa9ff;
-    --btn-text: #ffffff; --secbg: #1b1b24; --header-bg: #14141b;
-    --card-border: rgba(255,255,255,0.08); --card-border-top: rgba(255,255,255,0.14);
+    --bg: #0a0a0d; --text: #f5f5f7; --hint: #8b8b96; --btn: #3d7fff;
+    --btn-text: #ffffff; --secbg: #18181c; --header-bg: #0a0a0d;
+    --card-border: rgba(255,255,255,0.07); --card-border-top: rgba(255,255,255,0.07);
   }
-  :root[data-theme="dark"] .bg-decor { opacity: 0.6; }
-  :root[data-theme="dark"] .bg-grid { opacity: 0.3; }
+  /* Reference dizayn butunlay tekis (flat) qora fon ishlatadi — bulutsimon
+     "aurora" bezak shu uslubga zid, shuning uchun dark mode'da o'chirilgan. */
+  :root[data-theme="dark"] .bg-decor { opacity: 0; }
+  :root[data-theme="dark"] .bg-grid { opacity: 0; }
   :root[data-theme="dark"] .balance-chip,
   :root[data-theme="dark"] .theme-toggle { box-shadow: 0 2px 8px rgba(0,0,0,0.35); }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -6089,6 +6117,38 @@ MINI_APP_HTML = """<!doctype html>
   }
   .tab.active { background: var(--btn); color: var(--btn-text); border-color: transparent; box-shadow: 0 4px 12px rgba(0,0,0,0.18); }
   .tab.jackpot.active { background: linear-gradient(135deg, #ff9500, #ff2d55); }
+
+  /* ---- Gift do'koni: sub-tab'lar (Barchasi/Oddiy/Noodatiy) ---- */
+  .subtabs { display: flex; gap: 8px; padding: 0 1px 12px; overflow-x: auto; scrollbar-width: none; }
+  .subtabs[hidden] { display: none; }
+  .subtabs::-webkit-scrollbar { display: none; }
+  .subtab {
+    padding: 7px 15px; border-radius: 999px; background: var(--secbg); color: var(--hint);
+    font-size: 12.5px; font-weight: 700; white-space: nowrap; cursor: pointer;
+    border: 1px solid rgba(127,127,127,0.14); transition: all 0.15s ease;
+  }
+  .subtab.active { background: var(--btn); color: var(--btn-text); border-color: transparent; }
+
+  /* ---- Gift do'koni: 3 ustunli rasmli kartalar ---- */
+  .gift-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .gift-card {
+    position: relative; background: var(--secbg); border: 1px solid var(--card-border);
+    border-radius: 16px; padding: 16px 6px 12px; display: flex; flex-direction: column;
+    align-items: center; gap: 5px; cursor: pointer; text-align: center;
+    transition: transform 0.12s ease; animation: fadeIn 0.25s ease both;
+  }
+  .gift-card:active { transform: scale(0.94); }
+  .gift-card .gift-emoji { font-size: 36px; line-height: 1; margin-bottom: 3px; }
+  .gift-card .gift-name {
+    font-size: 11.5px; color: var(--hint); max-width: 100%; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+  }
+  .gift-card .gift-price { font-size: 13px; font-weight: 800; color: var(--btn); }
+  .special-badge {
+    position: absolute; top: 6px; right: 6px; background: linear-gradient(135deg,#ffb020,#ff8a00);
+    color: #201200; font-size: 9px; font-weight: 800; padding: 3px 8px; border-radius: 999px;
+    box-shadow: 0 2px 6px rgba(255,140,0,0.35); z-index: 2;
+  }
 
   /* ---- Section ---- */
   .section-title { font-size: 13px; font-weight: 700; color: var(--hint); margin: 4px 2px 10px; text-transform: uppercase; letter-spacing: 0.03em; }
@@ -6214,6 +6274,32 @@ MINI_APP_HTML = """<!doctype html>
   }
   .modal .actions .primary { background: var(--btn); color: var(--btn-text); }
   .modal .actions .secondary { background: rgba(127,127,127,0.14); color: var(--text); }
+  .modal .stackbtn {
+    width: 100%; padding: 12px; border-radius: 12px; border: none;
+    font-weight: 700; font-size: 13.5px; cursor: pointer; margin-bottom: 8px;
+  }
+  .modal .stackbtn:last-child { margin-bottom: 0; }
+  .modal .stackbtn.primary { background: var(--btn); color: var(--btn-text); }
+  .modal .stackbtn.secondary { background: rgba(127,127,127,0.14); color: var(--text); }
+
+  /* ---- "Kimga?" qatori + qidiruv maydoni (gift/stars boshqa odamga yuborish) ---- */
+  .kimga-row { display: flex; align-items: center; justify-content: space-between; margin: 14px 0 10px; }
+  .kimga-label { font-size: 14px; font-weight: 700; }
+  .pill-toggle {
+    padding: 8px 18px; border-radius: 999px; border: none; background: rgba(127,127,127,0.14);
+    color: var(--text); font-size: 13px; font-weight: 700; cursor: pointer; transition: all 0.15s ease;
+  }
+  .pill-toggle.active { background: var(--btn); color: var(--btn-text); }
+  .search-field {
+    display: flex; align-items: center; gap: 8px; background: var(--secbg);
+    border: 1px solid rgba(127,127,127,0.18); border-radius: 12px; padding: 11px 14px;
+  }
+  .search-field .search-ic { opacity: 0.55; font-size: 14px; }
+  .search-field input {
+    flex: 1; min-width: 0; border: none; background: transparent; color: var(--text);
+    font-size: 13.5px; outline: none;
+  }
+  .search-field input::placeholder { color: var(--hint); }
   .modal .result-body { font-size: 14px; line-height: 1.6; }
   .modal .about-body { max-height: 56vh; overflow-y: auto; padding-right: 2px; }
   .modal .about-body p { margin: 0 0 12px; }
@@ -6437,6 +6523,7 @@ MINI_APP_HTML = """<!doctype html>
       <div class="tabs-sticky">
         <div class="tabs" id="tabs"></div>
       </div>
+      <div class="subtabs" id="giftSubtabs" hidden></div>
       <div class="grid" id="grid"></div>
     </div>
 
@@ -6529,18 +6616,25 @@ MINI_APP_HTML = """<!doctype html>
       <span class="close-x" id="giftRecipientClose">✕</span>
       <h2 id="giftRecipientTitle">🎁 Kimga yubormoqchisiz?</h2>
       <div class="sub" id="giftRecipientSub"></div>
-      <div class="actions" id="giftRecipientChoiceRow">
-        <button class="secondary" id="giftRecipientSelfBtn">🙋 O'zimga</button>
-        <button class="primary" id="giftRecipientOtherBtn">👤 Boshqa odamga</button>
+      <div class="kimga-row">
+        <span class="kimga-label">Kimga?</span>
+        <button class="pill-toggle active" id="giftRecipientSelfPill">O'zimga</button>
       </div>
-      <div id="giftRecipientUsernameRow" hidden>
-        <label>Qabul qiluvchining Telegram ID raqami yoki @username'ini kiriting</label>
-        <input type="text" class="promo-input" id="giftRecipientUsernameInput" placeholder="ID yoki @username">
-        <div class="actions">
-          <button class="secondary" id="giftRecipientBackBtn">Ortga</button>
-          <button class="primary" id="giftRecipientSendBtn">Yuborish</button>
-        </div>
+      <div class="search-field">
+        <span class="search-ic">🔍</span>
+        <input type="text" id="giftRecipientUsernameInput" placeholder="ID yoki @username kiriting...">
       </div>
+      <button class="primary" id="giftRecipientSendBtn" style="width:100%;margin-top:16px;">Yuborish</button>
+    </div>
+  </div>
+
+  <div class="overlay" id="giftDetailOverlay">
+    <div class="modal">
+      <span class="close-x" id="giftDetailClose">✕</span>
+      <div class="icon-tile" id="giftDetailIcon" style="width:56px;height:56px;font-size:28px;margin:0 auto 12px;"></div>
+      <h2 id="giftDetailName" style="text-align:center;"></h2>
+      <div class="sub" id="giftDetailPrice" style="text-align:center;"></div>
+      <div class="btnrow" id="giftDetailBtns" style="margin-top:16px;"></div>
     </div>
   </div>
 
@@ -6769,6 +6863,77 @@ function itemCard(item) {
   return card;
 }
 
+// ---- Gift do'koni: 3 ustunli rasmli kartalar (nomdagi birinchi emoji "rasm" sifatida ishlatiladi) ----
+function firstEmoji(text) {
+  const m = (text || '').match(/^\p{Extended_Pictographic}(️)?/u);
+  return m ? m[0] : '🎁';
+}
+function stripFirstEmoji(text) {
+  return (text || '').replace(/^\p{Extended_Pictographic}(️)?\s*/u, '');
+}
+
+let GIFT_SUBTAB = 'all'; // 'all' | 'normal' | 'special'
+
+function renderGiftSubtabs() {
+  const el = document.getElementById('giftSubtabs');
+  el.hidden = false;
+  const defs = [
+    { key: 'all', label: 'Barchasi' },
+    { key: 'normal', label: 'Oddiy' },
+    { key: 'special', label: 'Noodatiy' },
+  ];
+  el.innerHTML = '';
+  defs.forEach(d => {
+    const t = document.createElement('div');
+    t.className = 'subtab' + (d.key === GIFT_SUBTAB ? ' active' : '');
+    t.textContent = d.label;
+    t.onclick = () => { GIFT_SUBTAB = d.key; renderGiftSubtabs(); renderGrid(); };
+    el.appendChild(t);
+  });
+}
+
+function giftCard(item) {
+  const card = document.createElement('div');
+  card.className = 'gift-card';
+  card.innerHTML = `
+    ${item.is_special ? '<div class="special-badge">Noodatiy</div>' : ''}
+    <div class="gift-emoji">${firstEmoji(item.name)}</div>
+    <div class="gift-name">${stripFirstEmoji(item.name) || item.name}</div>
+    <div class="gift-price">${priceLine(item)}</div>
+  `;
+  card.onclick = () => openGiftDetail(item);
+  return card;
+}
+
+function openGiftDetail(item) {
+  document.getElementById('giftDetailIcon').textContent = firstEmoji(item.name);
+  document.getElementById('giftDetailName').textContent = stripFirstEmoji(item.name) || item.name;
+  document.getElementById('giftDetailPrice').innerHTML = priceLine(item);
+  const btnsEl = document.getElementById('giftDetailBtns');
+  btnsEl.innerHTML = '';
+  if (item.price_stars > 0) {
+    const b1 = document.createElement('button');
+    b1.className = 'stackbtn primary';
+    b1.textContent = `⭐ Balansdan (${item.price_stars})`;
+    b1.onclick = () => buyBalance('item', item.id, b1);
+    btnsEl.appendChild(b1);
+    const b2 = document.createElement('button');
+    b2.className = 'stackbtn secondary';
+    b2.textContent = '✨ Stars bilan';
+    b2.onclick = () => buyStars('item', item.id, b2);
+    btnsEl.appendChild(b2);
+  }
+  if (item.price_uzs > 0) {
+    const b3 = document.createElement('button');
+    b3.className = 'stackbtn secondary';
+    b3.textContent = `💳 Kartadan (${item.price_uzs.toLocaleString('ru-RU')} so'm)`;
+    b3.onclick = () => openUzsModal(item);
+    btnsEl.appendChild(b3);
+  }
+  openOverlay('giftDetailOverlay');
+}
+document.getElementById('giftDetailClose').onclick = () => closeOverlay('giftDetailOverlay');
+
 function boxCard(box) {
   const card = document.createElement('div');
   card.className = 'card jackpot' + (box.locked ? ' locked' : '');
@@ -6867,7 +7032,10 @@ function nftCard() {
 
 function renderGrid() {
   const grid = document.getElementById('grid');
+  const subtabsEl = document.getElementById('giftSubtabs');
   grid.innerHTML = '';
+  grid.className = 'grid';
+  subtabsEl.hidden = true;
 
   if (ACTIVE_CAT === 'nft') {
     grid.appendChild(nftCard());
@@ -6888,6 +7056,22 @@ function renderGrid() {
       empty.textContent = 'Hozircha sotuvda promokod yo\\'q.';
       grid.appendChild(empty);
     }
+    return;
+  }
+  if (ACTIVE_CAT === 'gift') {
+    renderGiftSubtabs();
+    grid.className = 'gift-grid';
+    let items = SHOP.items.filter(i => i.cat === 'gift');
+    if (GIFT_SUBTAB === 'normal') items = items.filter(i => !i.is_special);
+    else if (GIFT_SUBTAB === 'special') items = items.filter(i => i.is_special);
+    if (!items.length) {
+      const empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = 'Bu bo\\'limda hozircha mahsulot yo\\'q.';
+      grid.appendChild(empty);
+      return;
+    }
+    items.forEach(i => grid.appendChild(giftCard(i)));
     return;
   }
   const items = SHOP.items.filter(i => i.cat === ACTIVE_CAT);
@@ -7389,25 +7573,23 @@ function openRecipientChoice(kind, itemId, label) {
   pendingItemId = itemId;
   document.getElementById('giftRecipientTitle').textContent = kind === 'stars' ? '⭐ Kimga yubormoqchisiz?' : '🎁 Kimga yubormoqchisiz?';
   document.getElementById('giftRecipientSub').textContent = label || '';
-  document.getElementById('giftRecipientChoiceRow').hidden = false;
-  document.getElementById('giftRecipientUsernameRow').hidden = true;
+  document.getElementById('giftRecipientSelfPill').classList.add('active');
   document.getElementById('giftRecipientUsernameInput').value = '';
   openOverlay('giftRecipientOverlay');
 }
 document.getElementById('giftRecipientClose').onclick = () => closeOverlay('giftRecipientOverlay');
-document.getElementById('giftRecipientSelfBtn').onclick = (e) => withdraw(pendingKind, pendingItemId, e.target);
-document.getElementById('giftRecipientOtherBtn').onclick = () => {
-  document.getElementById('giftRecipientChoiceRow').hidden = true;
-  document.getElementById('giftRecipientUsernameRow').hidden = false;
+document.getElementById('giftRecipientSelfPill').onclick = () => {
+  document.getElementById('giftRecipientSelfPill').classList.add('active');
+  document.getElementById('giftRecipientUsernameInput').value = '';
 };
-document.getElementById('giftRecipientBackBtn').onclick = () => {
-  document.getElementById('giftRecipientUsernameRow').hidden = true;
-  document.getElementById('giftRecipientChoiceRow').hidden = false;
+document.getElementById('giftRecipientUsernameInput').oninput = () => {
+  document.getElementById('giftRecipientSelfPill').classList.remove('active');
 };
 document.getElementById('giftRecipientSendBtn').onclick = (e) => {
+  const isSelf = document.getElementById('giftRecipientSelfPill').classList.contains('active');
   const uname = document.getElementById('giftRecipientUsernameInput').value.trim().replace(/^@/, '');
-  if (!uname) { toast('Username kiriting'); return; }
-  withdraw(pendingKind, pendingItemId, e.target, uname);
+  if (!isSelf && !uname) { toast('ID/username kiriting yoki "O\\'zimga" tanlang'); return; }
+  withdraw(pendingKind, pendingItemId, e.target, isSelf ? undefined : uname);
 };
 
 async function withdraw(kind, itemId, btnEl, recipientUsername) {
@@ -7682,6 +7864,7 @@ async def webapp_shop_api_handler(request):
             "desc": it["description"] or "",
             "price_stars": it["price_stars"],
             "price_uzs": it["price_uzs"],
+            "is_special": bool(it["is_special"]),
         })
 
     boxes = []
