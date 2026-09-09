@@ -2022,8 +2022,9 @@ async def stars_recipient_other_start(call: CallbackQuery, state: FSMContext) ->
     await state.set_state(StarsRecipientStates.username)
     await call.message.edit_text(
         f"👤 <b>{user['balance_stars']} ⭐</b> — kimga yuborilsin?\n\n"
-        f"Qabul qiluvchining Telegram <b>@username</b>'ini yozing (masalan: @acme).\n"
-        f"⚠️ Ular Telegram'da mavjud va username to'g'ri bo'lishi kerak."
+        f"Qabul qiluvchining Telegram <b>ID raqami</b> yoki <b>@username</b>'ini yozing "
+        f"(masalan: <code>123456789</code> yoki @acme).\n"
+        f"⚠️ Ular Telegram'da mavjud bo'lishi kerak."
     )
     await call.answer()
 
@@ -2032,9 +2033,9 @@ async def stars_recipient_other_start(call: CallbackQuery, state: FSMContext) ->
 async def stars_recipient_other_finish(message: Message, bot: Bot, state: FSMContext) -> None:
     await state.clear()
 
-    username = (message.text or "").strip().lstrip("@")
-    if not username:
-        await message.answer("❌ Username kiritilmadi. Qaytadan urinib ko'ring: 💸 Yulduz yechish → ⭐ Yulduz sifatida.")
+    raw = (message.text or "").strip()
+    if not raw:
+        await message.answer("❌ Hech narsa kiritilmadi. Qaytadan urinib ko'ring: 💸 Yulduz yechish → ⭐ Yulduz sifatida.")
         return
 
     user = await get_user(message.from_user.id)
@@ -2047,15 +2048,15 @@ async def stars_recipient_other_finish(message: Message, bot: Bot, state: FSMCon
         await message.answer("❌ Minimal chegaraga yetmadingiz!")
         return
 
-    resolved = await resolve_username_to_id(bot, username)
+    resolved = await resolve_recipient(bot, raw)
     if not resolved:
         await message.answer(
-            f"❌ @{username} topilmadi. Username to'g'ri yozilganiga ishonch hosil qiling "
+            f"❌ \"{raw}\" topilmadi. ID yoki username to'g'ri yozilganiga ishonch hosil qiling "
             f"(bu odam Telegram'da mavjud bo'lishi kerak), so'ngra qaytadan urinib ko'ring: "
             f"💸 Yulduz yechish → ⭐ Yulduz sifatida."
         )
         return
-    recipient_id, _recipient_name = resolved
+    recipient_id, recipient_display = resolved
     if recipient_id == message.from_user.id:
         await message.answer("❌ Bu sizning o'z akkountingiz. \"🙋 O'zimga\" tugmasidan foydalaning.")
         return
@@ -2067,7 +2068,7 @@ async def stars_recipient_other_finish(message: Message, bot: Bot, state: FSMCon
 
     result_text = await _fulfill_stars_withdrawal(
         bot, message.from_user.id, message.from_user.first_name or "", message.from_user.username or "",
-        amount, recipient_id, f"@{username}",
+        amount, recipient_id, recipient_display,
     )
     await message.answer(result_text)
 
@@ -2120,17 +2121,34 @@ async def withdraw_gift_callback(call: CallbackQuery) -> None:
     await call.answer()
 
 
-async def resolve_username_to_id(bot: Bot, username: str) -> tuple[int, str] | None:
-    """@username'ni Telegram chat id'siga aylantiradi — bot u bilan avval
-    hech qachon gaplashmagan bo'lsa ham ishlaydi (username'lar Telegram'da
-    umumiy va qidiriladigan bo'ladi). Gift yechishda "boshqa odamga
-    yuborish" uchun kerak — mijoz talabi: gift faqat o'ziga emas, boshqa
-    odamga ham yuborilishi kerak."""
+async def resolve_recipient(bot: Bot, raw: str) -> tuple[int, str] | None:
+    """Foydalanuvchi yozgan qabul qiluvchini (Telegram <b>ID raqami</b>
+    YOKI <b>@username</b>) chat id'siga aylantiradi — ikkalasi ham bot
+    u bilan avval hech qachon gaplashmagan bo'lsa ham ishlaydi
+    (username'lar Telegram'da umumiy va qidiriladigan; ID esa
+    getChat orqali tasdiqlanadi). Gift/Stars yechishda "boshqa odamga
+    yuborish" uchun kerak — mijoz talabi: faqat o'ziga emas, boshqa
+    odamga (ID yoki username orqali) ham yuborilishi kerak."""
+    raw = raw.strip().lstrip("@")
+    if not raw:
+        return None
+
+    is_id = raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit())
+    ident = int(raw) if is_id else f"@{raw}"
     try:
-        chat = await bot.get_chat(f"@{username}")
-        return chat.id, (chat.full_name or f"@{username}")
+        chat = await bot.get_chat(ident)
+        if is_id:
+            # ID orqali qidirilganda ko'rsatiladigan ism yo'q — chat'ning
+            # o'z ismini ko'rsatamiz (bo'lmasa ID'ning o'zini).
+            display = chat.full_name or f"ID {raw}"
+        else:
+            # Username orqali qidirilganda — @username admin uchun ko'proq
+            # foydali (bosib ochsa bo'ladi, o'zgaruvchan "full_name"ga
+            # qaraganda ishonchliroq identifikator).
+            display = f"@{raw}"
+        return chat.id, display
     except Exception as e:
-        logger.info("Username '@%s' orqali chat topilmadi: %s", username, e)
+        logger.info("Qabul qiluvchi '%s' orqali topilmadi: %s", raw, e)
         return None
 
 
@@ -2348,8 +2366,9 @@ async def gift_recipient_other_start(call: CallbackQuery, state: FSMContext) -> 
     await state.update_data(item_id=item_id)
     await call.message.edit_text(
         f"👤 <b>{item['name']}</b> — kimga yuborilsin?\n\n"
-        f"Qabul qiluvchining Telegram <b>@username</b>'ini yozing (masalan: @acme).\n"
-        f"⚠️ Ular Telegram'da mavjud va username to'g'ri bo'lishi kerak."
+        f"Qabul qiluvchining Telegram <b>ID raqami</b> yoki <b>@username</b>'ini yozing "
+        f"(masalan: <code>123456789</code> yoki @acme).\n"
+        f"⚠️ Ular Telegram'da mavjud bo'lishi kerak."
     )
     await call.answer()
 
@@ -2360,9 +2379,9 @@ async def gift_recipient_other_finish(message: Message, bot: Bot, state: FSMCont
     item_id = data.get("item_id")
     await state.clear()
 
-    username = (message.text or "").strip().lstrip("@")
-    if not username:
-        await message.answer("❌ Username kiritilmadi. Qaytadan urinib ko'ring: 💸 Yulduz yechish → 🎁 Gift sifatida.")
+    raw = (message.text or "").strip()
+    if not raw:
+        await message.answer("❌ Hech narsa kiritilmadi. Qaytadan urinib ko'ring: 💸 Yulduz yechish → 🎁 Gift sifatida.")
         return
 
     user = await get_user(message.from_user.id)
@@ -2379,15 +2398,15 @@ async def gift_recipient_other_finish(message: Message, bot: Bot, state: FSMCont
         await message.answer("❌ Balans yetarli emas!")
         return
 
-    resolved = await resolve_username_to_id(bot, username)
+    resolved = await resolve_recipient(bot, raw)
     if not resolved:
         await message.answer(
-            f"❌ @{username} topilmadi. Username to'g'ri yozilganiga ishonch hosil qiling "
+            f"❌ \"{raw}\" topilmadi. ID yoki username to'g'ri yozilganiga ishonch hosil qiling "
             f"(bu odam Telegram'da mavjud bo'lishi kerak), so'ngra qaytadan urinib ko'ring: "
             f"💸 Yulduz yechish → 🎁 Gift sifatida."
         )
         return
-    recipient_id, _recipient_name = resolved
+    recipient_id, recipient_display = resolved
     if recipient_id == message.from_user.id:
         await message.answer("❌ Bu sizning o'z akkountingiz. \"🙋 O'zimga\" tugmasidan foydalaning.")
         return
@@ -2395,8 +2414,6 @@ async def gift_recipient_other_finish(message: Message, bot: Bot, state: FSMCont
     if not await deduct_stars(message.from_user.id, item["price_stars"]):
         await message.answer("❌ Balans yetarli emas!")
         return
-
-    recipient_display = f"@{username}"
 
     result_text = await _fulfill_gift_withdrawal(
         bot, message.from_user.id, message.from_user.first_name or "", message.from_user.username or "",
@@ -6517,8 +6534,8 @@ MINI_APP_HTML = """<!doctype html>
         <button class="primary" id="giftRecipientOtherBtn">👤 Boshqa odamga</button>
       </div>
       <div id="giftRecipientUsernameRow" hidden>
-        <label>Qabul qiluvchining Telegram @username'ini kiriting</label>
-        <input type="text" class="promo-input" id="giftRecipientUsernameInput" placeholder="@username">
+        <label>Qabul qiluvchining Telegram ID raqami yoki @username'ini kiriting</label>
+        <input type="text" class="promo-input" id="giftRecipientUsernameInput" placeholder="ID yoki @username">
         <div class="actions">
           <button class="secondary" id="giftRecipientBackBtn">Ortga</button>
           <button class="primary" id="giftRecipientSendBtn">Yuborish</button>
@@ -8242,25 +8259,24 @@ async def webapp_withdraw_handler(request):
         return web.json_response({"error": "Noma'lum turi"}, status=400)
 
     # Mijoz talabi: gift HAM, yulduz HAM faqat o'ziga emas, boshqa odamga
-    # ham yuborilishi mumkin bo'lsin — Mini App'dan ixtiyoriy
-    # recipient_username yuborilsa (ikkala kind uchun ham), yulduz
-    # ayirishdan OLDIN uni chat'ga aylantiramiz (topilmasa hech narsa
-    # yo'qolmasin).
+    # (ID raqami YOKI username orqali) ham yuborilishi mumkin bo'lsin —
+    # Mini App'dan ixtiyoriy recipient_username yuborilsa (ikkala kind
+    # uchun ham), yulduz ayirishdan OLDIN uni chat'ga aylantiramiz
+    # (topilmasa hech narsa yo'qolmasin).
     recipient_id = None
     recipient_display = ""
-    recipient_username = (body.get("recipient_username") or "").strip().lstrip("@")
-    if recipient_username:
-        resolved = await resolve_username_to_id(_bot, recipient_username)
+    recipient_raw = (body.get("recipient_username") or "").strip()
+    if recipient_raw:
+        resolved = await resolve_recipient(_bot, recipient_raw)
         if not resolved:
             return web.json_response({
-                "error": f"@{recipient_username} topilmadi. Username to'g'ri yozilganiga ishonch hosil qiling.",
+                "error": f"\"{recipient_raw}\" topilmadi. ID yoki username to'g'ri yozilganiga ishonch hosil qiling.",
             }, status=404)
-        recipient_id, _ = resolved
+        recipient_id, recipient_display = resolved
         if recipient_id == telegram_id:
             return web.json_response({
-                "error": "Bu sizning o'z akkountingiz. Boshqa odam uchun username kiriting yoki bo'sh qoldiring.",
+                "error": "Bu sizning o'z akkountingiz. Boshqa odam uchun ID/username kiriting yoki bo'sh qoldiring.",
             }, status=400)
-        recipient_display = f"@{recipient_username}"
 
     if not await deduct_stars(telegram_id, amount):
         return web.json_response({"error": "Balans yetarli emas! Sahifani yangilab qaytadan urinib ko'ring."}, status=402)
