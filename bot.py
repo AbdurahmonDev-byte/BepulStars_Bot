@@ -4368,6 +4368,31 @@ async def admin_tggifts_menu(call: CallbackQuery) -> None:
     await call.answer()
 
 
+async def _tggift_catalog_chunks(gifts_list) -> list[str]:
+    """Barcha mavjud Telegram gift'larni matn qatorlariga aylantiradi va
+    Telegram'ning ~4096 belgi xabar chegarasiga qarab bir nechta xabarga
+    bo'lib chiqadi. AVVAL faqat birinchi 40tasi ko'rsatilardi — mijoz
+    ro'yxatning oxiridagi (yangi qo'shilgan) gift'larni topa olmay, ularni
+    bog'lay olmagan edi ("Shu emojilani tashlab bo'lmas ekan botga"). Endi
+    HAMMASI ko'rsatiladi, qanchalik ko'p bo'lishidan qat'i nazar."""
+    header = "📋 <b>Mavjud Telegram gift'lar</b>\n(ID'ni nusxalab, mahsulotga bog'lang)\n\n"
+    MAX_CHARS = 3500  # 4096 dan xavfsiz kamroq
+    chunks = []
+    current = header
+    for g in gifts_list:
+        emoji = g.sticker.emoji if g.sticker and g.sticker.emoji else "🎁"
+        limit = f" (qolgan {g.remaining_count}/{g.total_count})" if g.total_count else " (cheksiz)"
+        line = f"{emoji} <code>{g.id}</code> — {g.star_count} ⭐{limit}\n"
+        if len(current) + len(line) > MAX_CHARS and current not in (header, ""):
+            chunks.append(current)
+            current = line
+        else:
+            current += line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 @router.callback_query(F.data == "admin:tggift_catalog")
 async def admin_tggift_catalog(call: CallbackQuery, bot: Bot) -> None:
     if not is_admin(call.from_user.id):
@@ -4381,19 +4406,22 @@ async def admin_tggift_catalog(call: CallbackQuery, bot: Bot) -> None:
         await call.answer("❌ Telegram'dan gift ro'yxatini olib bo'lmadi.", show_alert=True)
         return
 
-    if not gifts.gifts:
-        text = "📋 <b>Mavjud Telegram gift'lar</b>\n\nHozircha ro'yxat bo'sh."
-    else:
-        lines = ["📋 <b>Mavjud Telegram gift'lar</b>\n(ID'ni nusxalab, mahsulotga bog'lang)\n"]
-        for g in gifts.gifts[:40]:
-            emoji = g.sticker.emoji if g.sticker and g.sticker.emoji else "🎁"
-            limit = f" (qolgan {g.remaining_count}/{g.total_count})" if g.total_count else " (cheksiz)"
-            lines.append(f"{emoji} <code>{g.id}</code> — {g.star_count} ⭐{limit}")
-        text = "\n".join(lines)
-
     kb = InlineKeyboardBuilder()
     kb.button(text="🔙 Ortga", callback_data="admin:tggifts")
-    await call.message.edit_text(text, reply_markup=kb.as_markup())
+
+    if not gifts.gifts:
+        await call.message.edit_text(
+            "📋 <b>Mavjud Telegram gift'lar</b>\n\nHozircha ro'yxat bo'sh.",
+            reply_markup=kb.as_markup(),
+        )
+        await call.answer()
+        return
+
+    chunks = await _tggift_catalog_chunks(gifts.gifts)
+    await call.message.edit_text(chunks[0], reply_markup=kb.as_markup() if len(chunks) == 1 else None)
+    for i, chunk in enumerate(chunks[1:], start=1):
+        is_last = i == len(chunks) - 1
+        await call.message.answer(chunk, reply_markup=kb.as_markup() if is_last else None)
     await call.answer()
 
 
