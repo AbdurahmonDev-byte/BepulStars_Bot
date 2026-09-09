@@ -684,13 +684,14 @@ async def get_shop_item(item_id: int) -> dict | None:
         return dict(row) if row else None
 
 
-async def add_shop_item(category: str, name: str, price_stars: int, price_uzs: int, description: str = "", image_file_id: str | None = None, deliver_stars: int = 0) -> None:
+async def add_shop_item(category: str, name: str, price_stars: int, price_uzs: int, description: str = "", image_file_id: str | None = None, deliver_stars: int = 0) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
+        cur = await db.execute(
             "INSERT INTO shop_items (category, name, price_stars, price_uzs, description, image_file_id, deliver_stars) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (category, name, price_stars, price_uzs, description, image_file_id, deliver_stars),
         )
         await db.commit()
+        return cur.lastrowid
 
 
 async def delete_shop_item(item_id: int) -> None:
@@ -4346,6 +4347,7 @@ async def admin_tggifts_menu(call: CallbackQuery) -> None:
             mark = "❌"
         kb.button(text=f"{mark} {g['name']}", callback_data=f"admin:tggift_set:{g['id']}")
     kb.button(text="📋 Mavjud Telegram gift'lar", callback_data="admin:tggift_catalog")
+    kb.button(text="➕ Barchasini do'konga qo'shish", callback_data="admin:tggift_bulk_add")
     kb.button(text="🔙 Ortga", callback_data="admin")
     kb.adjust(1)
 
@@ -4361,9 +4363,67 @@ async def admin_tggifts_menu(call: CallbackQuery) -> None:
         "\"🐻/🧸\" — ikkalasi ham), foydalanuvchi sotib olganda yoki yutib "
         "olganda aynan qaysi birini xohlashini o'zi tanlaydi.\n\n"
         "✅ — gift ID bog'langan (bitta), ✅ (N tur) — bir nechta tur "
-        "bog'langan (foydalanuvchi tanlaydi), ❌ — bog'lanmagan.\n"
+        "bog'langan (foydalanuvchi tanlaydi), ❌ — bog'lanmagan.\n\n"
+        "➕ \"Barchasini do'konga qo'shish\" — Telegram'ning hozirgi "
+        "TO'LIQ gift kataloididagi (📋 ro'yxatdagi) har bir gift uchun "
+        "avtomatik yangi mahsulot yaratadi va bog'laydi (allaqachon "
+        "qo'shilganlarini o'tkazib yuboradi) — ID'larni qo'lda "
+        "nusxalashning hojati qolmaydi.\n\n"
         "Mahsulotni tanlang:"
     )
+    await call.message.edit_text(text, reply_markup=kb.as_markup())
+    await call.answer()
+
+
+@router.callback_query(F.data == "admin:tggift_bulk_add")
+async def admin_tggift_bulk_add(call: CallbackQuery, bot: Bot) -> None:
+    """Telegram'ning HOZIRGI to'liq gift kataloigidagi har bir gift uchun
+    avtomatik yangi do'kon mahsuloti yaratadi va bog'laydi — ID'larni
+    qo'lda ko'chirib-yozish xatosiga yo'l qo'ymaslik uchun har doim
+    to'g'ridan-to'g'ri Telegram'ning o'zidan (jonli) olinadi, skrinshotdan
+    yoki qo'lda kiritilgan raqamlardan emas."""
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+
+    try:
+        gifts = await bot.get_available_gifts()
+    except Exception as e:
+        logger.error("get_available_gifts xato: %s", e)
+        await call.answer("❌ Telegram'dan gift ro'yxatini olib bo'lmadi.", show_alert=True)
+        return
+
+    existing = await get_all_shop_items()
+    existing_gift_ids = {i["tg_gift_id"] for i in existing if i["tg_gift_id"]}
+
+    added, skipped = [], []
+    for g in gifts.gifts:
+        if g.id in existing_gift_ids:
+            skipped.append(g)
+            continue
+        emoji = g.sticker.emoji if g.sticker and g.sticker.emoji else "🎁"
+        # Ichki (virtual) narx: haqiqiy Stars narxidan 2x — bot bu gift'ni
+        # o'zining haqiqiy Stars balansidan yuborishi kerak bo'lgani uchun
+        # oddiy margin sifatida. Bu shunchaki BOSHLANG'ICH qiymat — admin
+        # xohlagan payt "🛍️ Do'kon" bo'limidan narxni o'zgartira oladi.
+        internal_price = g.star_count * 2
+        new_id = await add_shop_item(
+            category="gift", name=f"{emoji} Gift ({g.star_count}⭐)",
+            price_stars=internal_price, price_uzs=0,
+        )
+        await update_shop_item(new_id, tg_gift_id=g.id)
+        added.append(g)
+
+    lines = [f"✅ <b>{len(added)} ta yangi gift do'konga qo'shildi</b> (allaqachon bor {len(skipped)} tasi o'tkazib yuborildi).\n"]
+    if added:
+        lines.append("Boshlang'ich narxlar (2x margin bilan) — xohlasangiz \"🛍️ Do'kon\" bo'limidan o'zgartiring:")
+        for g in added:
+            emoji = g.sticker.emoji if g.sticker and g.sticker.emoji else "🎁"
+            lines.append(f"{emoji} {g.star_count * 2} ⭐ (real narxi: {g.star_count} ⭐)")
+    text = "\n".join(lines)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔙 Ortga", callback_data="admin:tggifts")
     await call.message.edit_text(text, reply_markup=kb.as_markup())
     await call.answer()
 
