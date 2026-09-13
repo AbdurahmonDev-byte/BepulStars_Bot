@@ -1,0 +1,7 @@
+# Bu yerga o'zingizning domeningizni (yoki domen o'rniga sslip.io manzilini —
+# DEPLOY_VPS.md'ga qarang) yozing. Caddy shu domen uchun HTTPS sertifikatini
+# (Let's Encrypt) o'zi avtomatik oladi va yangilab turadi — qo'lda hech narsa
+# qilish shart emas.
+your-domain.com {
+    reverse_proxy bot:8000
+}
