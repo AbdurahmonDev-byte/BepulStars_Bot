@@ -1,4 +1,3 @@
-cat > docker-compose.yml <<'EOF'
 services:
   stars_bot:
     build: .
@@ -11,4 +10,3 @@ services:
 networks:
   deploy_default:
     external: true
-EOF
