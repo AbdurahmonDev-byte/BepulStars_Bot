@@ -597,6 +597,15 @@ async def set_user_balance(telegram_id: int, amount: int) -> None:
         await db.commit()
 
 
+async def reset_all_users_balance() -> int:
+    """Barcha foydalanuvchilarning ⭐ balansini 0 ga tushiradi.
+    O'zgargan foydalanuvchilar sonini qaytaradi."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("UPDATE users SET balance_stars = 0 WHERE balance_stars != 0")
+        await db.commit()
+        return cur.rowcount
+
+
 async def set_user_banned(telegram_id: int, banned: bool) -> None:
     """Foydalanuvchini botdan foydalanishdan ban qiladi/ban'ni bekor qiladi."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -4096,6 +4105,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     kb.button(text="🔋 Bot balansini to'ldirish", callback_data="admin:topup")
     kb.button(text="💰 Bot Stars balansi", callback_data="admin:starbalance")
     kb.button(text="👤 Foydalanuvchini boshqarish", callback_data="admin:usersearch")
+    kb.button(text="🔄 Barchani balansini 0 qilish", callback_data="admin:reset_all_balances:confirm")
     kb.adjust(2)
     return kb.as_markup()
 
@@ -4132,6 +4142,38 @@ async def _show_user_profile(target, telegram_id: int) -> None:
         f"📅 Qo'shilgan: {user['joined_at']}\n\n"
         f"Quyidagi tugmalar orqali balansni/ruxsatini boshqarishingiz mumkin:",
         reply_markup=_user_manage_keyboard(telegram_id, bool(user["is_banned"])),
+    )
+
+
+@router.callback_query(F.data == "admin:reset_all_balances:confirm")
+async def admin_reset_all_balances_confirm(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⚠️ HA, BARCHASINI 0 QILISH", callback_data="admin:reset_all_balances:execute")
+    kb.button(text="❌ Bekor qilish", callback_data="admin")
+    kb.adjust(1)
+    await call.message.edit_text(
+        "⚠️ <b>DIQQAT! Barcha foydalanuvchilar balansini 0 ga tushirish</b>\n\n"
+        "Rostdan ham bazadagi <b>BARCHA foydalanuvchilarning ⭐ balansini 0 ga</b> tushirmoqchimisiz?\n\n"
+        "Bu amalni ortga qaytarib bo'lmaydi!",
+        reply_markup=kb.as_markup(),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "admin:reset_all_balances:execute")
+async def admin_reset_all_balances_execute(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    count = await reset_all_users_balance()
+    await call.answer("✅ Barcha foydalanuvchilar balansi 0 ga tushirildi!", show_alert=True)
+    await call.message.edit_text(
+        f"✅ <b>Muvaffaqiyatli bajarildi!</b>\n\n"
+        f"Jami <b>{count} ta</b> foydalanuvchining balansi <b>0 ⭐</b> ga tushirildi.",
+        reply_markup=admin_keyboard(),
     )
 
 
