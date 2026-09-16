@@ -4,8 +4,15 @@ services:
     container_name: stars_bot
     restart: unless-stopped
     env_file: .env
+    expose:
+      - "8000"
     networks:
-      - deploy_default
+      deploy_default:
+        aliases:
+          - stars_bot
+          - bot
+          - stars
+          - starsbot
 
 networks:
   deploy_default:
