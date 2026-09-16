@@ -1307,8 +1307,16 @@ async def subscription_check_middleware(handler, event, data):
     Muhim istisno: allaqachon amalga oshgan Telegram Stars to'lovi
     (successful_payment) hech qachon bloklanmaydi — pul yechilib bo'lgan,
     mahsulot baribir yetkazilishi shart."""
-    if isinstance(event, Message) and event.successful_payment:
-        return await handler(event, data)
+    # Faqat shaxsiy chatlarda (private) tekshiriladi — guruh, superguruh yoki kanallarga spam qilmaslik uchun
+    if isinstance(event, Message):
+        if event.chat.type != "private":
+            return await handler(event, data)
+        if event.successful_payment:
+            return await handler(event, data)
+    elif isinstance(event, CallbackQuery):
+        if event.message and event.message.chat.type != "private":
+            return await handler(event, data)
+
     tg_user = getattr(event, "from_user", None)
     if not tg_user or is_admin(tg_user.id):
         return await handler(event, data)
@@ -1580,6 +1588,8 @@ def shop_items_keyboard(category: str) -> InlineKeyboardMarkup:
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, bot: Bot, state: FSMContext) -> None:
+    if message.chat.type != "private":
+        return
     global _bot
     _bot = bot
     await state.clear()
@@ -1759,40 +1769,46 @@ async def referral_handler(message: Message, bot: Bot) -> None:
 
 @router.message(F.text == "💸 Yulduz yechish")
 async def withdraw_handler(message: Message) -> None:
+    if message.chat.type != "private":
+        return
     user = await get_user(message.from_user.id)
     if not user:
         await message.answer("❌ Avval /start ni bosing!")
         return
 
     settings = await get_settings()
-    min_withdraw = settings["min_withdraw_stars"]
-
-    if user["balance_stars"] < min_withdraw:
-        need = min_withdraw - user["balance_stars"]
-        await message.answer(
-            f"💸 <b>Yulduz yechish</b>\n\n"
-            f"Balansingiz: <b>{user['balance_stars']} ⭐</b>\n\n"
-            f"❌ Yechib olish uchun minimal <b>{min_withdraw} ⭐</b> bo'lishi kerak.\n"
-            f"Sizga yana <b>{need} ⭐</b> kerak.\n"
-            f"Yana odam taklif qiling yoki bot egasi bilan bog'laning: @Kottabolladan",
-        )
-        return
+    balance = user["balance_stars"]
 
     # To'lov turini tanlash
     kb = InlineKeyboardBuilder()
     kb.button(text="🎁 Gift sifatida", callback_data="withdraw:gift")
-    kb.button(text="⭐ Yulduz sifatida", callback_data="withdraw:stars")
+    # Faqat 50 ta stars yig'gandagina "⭐ Yulduz sifatida" ko'rinadi
+    if balance >= 50:
+        kb.button(text="⭐ Yulduz sifatida", callback_data="withdraw:stars")
     kb.adjust(1)
 
-    await message.answer(
-        f"💸 <b>Yulduz yechish</b>\n\n"
-        f"Balansingiz: <b>{user['balance_stars']} ⭐</b>\n"
-        f"Minimal: <b>{min_withdraw} ⭐</b>\n"
-        f"👥 Taklif qilganlaringiz: <b>{user['referals_count']}</b> "
-        f"(gift sifatida yechish uchun kamida <b>{settings['min_referals_required']}</b> kerak)\n\n"
-        f"👇 <b>To'lov turini tanlang:</b>",
-        reply_markup=kb.as_markup(),
-    )
+    if balance < 50:
+        need = 50 - balance
+        await message.answer(
+            f"💸 <b>Yulduz yechish</b>\n\n"
+            f"Balansingiz: <b>{balance} ⭐</b>\n"
+            f"👥 Taklif qilganlaringiz: <b>{user['referals_count']} ta</b> "
+            f"(gift yechish uchun kamida <b>{settings['min_referals_required']} ta</b> do'st kerak)\n\n"
+            f"ℹ️ <b>Yulduz (Stars) yechib olish uchun kamida 50 ⭐ kerak.</b>\n"
+            f"(Sizga yana {need} ⭐ kerak)\n\n"
+            f"🎁 Hozircha mavjud yulduzlaringizga <b>Gift (Sovg'a)</b> olishingiz mumkin 👇",
+            reply_markup=kb.as_markup(),
+        )
+    else:
+        await message.answer(
+            f"💸 <b>Yulduz yechish</b>\n\n"
+            f"Balansingiz: <b>{balance} ⭐</b>\n"
+            f"Minimal stars yechish: <b>50 ⭐</b>\n"
+            f"👥 Taklif qilganlaringiz: <b>{user['referals_count']} ta</b> "
+            f"(gift yechish uchun kamida <b>{settings['min_referals_required']} ta</b> do'st kerak)\n\n"
+            f"👇 <b>To'lov turini tanlang:</b>",
+            reply_markup=kb.as_markup(),
+        )
 
 
 async def _fulfill_stars_withdrawal(
@@ -1968,6 +1984,48 @@ async def withdrawal_reject_callback(call: CallbackQuery, bot: Bot) -> None:
     await call.answer("❌ Bekor qilindi, balans qaytarildi!", show_alert=False)
 
 
+@router.callback_query(F.data == "withdraw:menu")
+async def withdraw_menu_callback(call: CallbackQuery) -> None:
+    user = await get_user(call.from_user.id)
+    if not user:
+        await call.answer("❌ Avval /start ni bosing!", show_alert=True)
+        return
+    settings = await get_settings()
+    balance = user["balance_stars"]
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🎁 Gift sifatida", callback_data="withdraw:gift")
+    if balance >= 50:
+        kb.button(text="⭐ Yulduz sifatida", callback_data="withdraw:stars")
+    kb.adjust(1)
+
+    if balance < 50:
+        need = 50 - balance
+        text = (
+            f"💸 <b>Yulduz yechish</b>\n\n"
+            f"Balansingiz: <b>{balance} ⭐</b>\n"
+            f"👥 Taklif qilganlaringiz: <b>{user['referals_count']} ta</b> "
+            f"(gift yechish uchun kamida <b>{settings['min_referals_required']} ta</b> do'st kerak)\n\n"
+            f"ℹ️ <b>Yulduz (Stars) yechib olish uchun kamida 50 ⭐ kerak.</b>\n"
+            f"(Sizga yana {need} ⭐ kerak)\n\n"
+            f"🎁 Hozircha mavjud yulduzlaringizga <b>Gift (Sovg'a)</b> olishingiz mumkin 👇"
+        )
+    else:
+        text = (
+            f"💸 <b>Yulduz yechish</b>\n\n"
+            f"Balansingiz: <b>{balance} ⭐</b>\n"
+            f"Minimal stars yechish: <b>50 ⭐</b>\n"
+            f"👥 Taklif qilganlaringiz: <b>{user['referals_count']} ta</b> "
+            f"(gift yechish uchun kamida <b>{settings['min_referals_required']} ta</b> do'st kerak)\n\n"
+            f"👇 <b>To'lov turini tanlang:</b>"
+        )
+    try:
+        await call.message.edit_text(text, reply_markup=kb.as_markup())
+    except TelegramBadRequest:
+        pass
+    await call.answer()
+
+
 @router.callback_query(F.data == "withdraw:stars")
 async def withdraw_stars_callback(call: CallbackQuery) -> None:
     """Mijoz talabi bilan kengaytirildi: yulduz yechishda ham (gift kabi)
@@ -1977,13 +2035,15 @@ async def withdraw_stars_callback(call: CallbackQuery) -> None:
         await call.answer("❌ Avval /start ni bosing!", show_alert=True)
         return
     settings = await get_settings()
-    if user["balance_stars"] < settings["min_withdraw_stars"]:
-        await call.answer("❌ Minimal chegaraga yetmadingiz!", show_alert=True)
+    min_stars = max(50, settings["min_withdraw_stars"])
+    if user["balance_stars"] < min_stars:
+        await call.answer(f"❌ Yulduz (Stars) yechish uchun kamida {min_stars} ⭐ kerak!", show_alert=True)
         return
 
     kb = InlineKeyboardBuilder()
     kb.button(text="🙋 O'zimga", callback_data="starsrecipient:self")
     kb.button(text="👤 Boshqa odamga", callback_data="starsrecipient:other")
+    kb.button(text="🔙 Ortga", callback_data="withdraw:menu")
     kb.adjust(1)
     await call.message.edit_text(
         f"⭐ <b>Yulduz sifatida yechish</b> — <b>{user['balance_stars']} ⭐</b>\n\nKimga yubormoqchisiz?",
@@ -2000,8 +2060,9 @@ async def stars_recipient_self(call: CallbackQuery, bot: Bot) -> None:
         await call.answer("❌ Xatolik yuz berdi", show_alert=True)
         return
     settings = await get_settings()
-    if user["balance_stars"] < settings["min_withdraw_stars"]:
-        await call.answer("❌ Minimal chegaraga yetmadingiz!", show_alert=True)
+    min_stars = max(50, settings["min_withdraw_stars"])
+    if user["balance_stars"] < min_stars:
+        await call.answer(f"❌ Minimal {min_stars} ⭐ to'planmagan!", show_alert=True)
         return
     await process_stars_withdrawal(call, bot, user["balance_stars"])
 
@@ -2016,8 +2077,9 @@ async def stars_recipient_other_start(call: CallbackQuery, state: FSMContext) ->
         await call.answer("❌ Xatolik yuz berdi", show_alert=True)
         return
     settings = await get_settings()
-    if user["balance_stars"] < settings["min_withdraw_stars"]:
-        await call.answer("❌ Minimal chegaraga yetmadingiz!", show_alert=True)
+    min_stars = max(50, settings["min_withdraw_stars"])
+    if user["balance_stars"] < min_stars:
+        await call.answer(f"❌ Minimal {min_stars} ⭐ to'planmagan!", show_alert=True)
         return
 
     await state.set_state(StarsRecipientStates.username)
@@ -2045,8 +2107,9 @@ async def stars_recipient_other_finish(message: Message, bot: Bot, state: FSMCon
         return
 
     settings = await get_settings()
-    if user["balance_stars"] < settings["min_withdraw_stars"]:
-        await message.answer("❌ Minimal chegaraga yetmadingiz!")
+    min_stars = max(50, settings["min_withdraw_stars"])
+    if user["balance_stars"] < min_stars:
+        await message.answer(f"❌ Yulduz (Stars) yechish uchun kamida {min_stars} ⭐ kerak!")
         return
 
     resolved = await resolve_recipient(bot, raw)
@@ -2082,16 +2145,12 @@ async def withdraw_gift_callback(call: CallbackQuery) -> None:
         return
 
     settings = await get_settings()
-    if user["balance_stars"] < settings["min_withdraw_stars"]:
-        await call.answer("❌ Minimal chegaraga yetmadingiz!", show_alert=True)
-        return
 
     if user["referals_count"] < settings["min_referals_required"]:
         need = settings["min_referals_required"] - user["referals_count"]
         await call.answer(
-            f"❌ Gift sifatida yechish uchun kamida {settings['min_referals_required']} ta odam "
-            f"taklif qilishingiz kerak! Sizda {user['referals_count']} ta, yana {need} ta kerak. "
-            f"⭐ Yulduz sifatida yechishingiz mumkin.",
+            f"❌ Gift sifatida yechish uchun kamida {settings['min_referals_required']} ta do'st "
+            f"taklif qilishingiz kerak! Sizda {user['referals_count']} ta, yana {need} ta kerak.",
             show_alert=True,
         )
         return
@@ -2101,7 +2160,7 @@ async def withdraw_gift_callback(call: CallbackQuery) -> None:
 
     if not gifts:
         await call.answer(
-            "Gift uchun yulduzlaringiz yetarli emas. Yulduz sifatida yechib oling!",
+            f"❌ Gift olish uchun yulduzlaringiz yetarli emas (Balans: {user['balance_stars']} ⭐).",
             show_alert=True,
         )
         return
@@ -2109,8 +2168,9 @@ async def withdraw_gift_callback(call: CallbackQuery) -> None:
     kb = InlineKeyboardBuilder()
     for g in gifts:
         kb.button(text=f"{g['name']} — {g['price_stars']} ⭐", callback_data=f"withdraw_gift:{g['id']}")
-    kb.button(text="⭐ Yulduz sifatida yechish", callback_data="withdraw:stars")
-    kb.button(text="🔙 Ortga", callback_data="withdraw:gift")
+    if user["balance_stars"] >= 50:
+        kb.button(text="⭐ Yulduz sifatida yechish", callback_data="withdraw:stars")
+    kb.button(text="🔙 Ortga", callback_data="withdraw:menu")
     kb.adjust(1)
 
     await call.message.edit_text(
@@ -7525,14 +7585,13 @@ function renderWithdraw() {
   const minRefs = INFO.min_referals_required || 0;
   const myRefs = USER ? (USER.referals_count || 0) : 0;
   document.getElementById('wdRefs').textContent = `${myRefs} / ${minRefs}`;
-  const note = document.getElementById('wdNote');
-  const starsBtn = document.getElementById('wdStarsBtn');
-  const canWithdraw = USER && USER.balance_stars >= (INFO.min_withdraw_stars || 0);
-  note.textContent = canWithdraw
-    ? "Butun balansingiz yechiladi (yulduz yoki gift sifatida)."
-    : `Yechish uchun kamida ${INFO.min_withdraw_stars} ⭐ kerak.`;
-  starsBtn.disabled = !canWithdraw;
+  const canWithdrawStars = USER && USER.balance_stars >= 50;
+  starsBtn.style.display = canWithdrawStars ? 'block' : 'none';
+  starsBtn.disabled = !canWithdrawStars;
   starsBtn.textContent = `⭐ Yulduz sifatida yechish (${USER ? USER.balance_stars : 0})`;
+  note.textContent = canWithdrawStars
+    ? "Butun balansingiz yechiladi (yulduz yoki gift sifatida)."
+    : "ℹ️ Yulduz (Stars) yechish uchun kamida 50 ⭐ to'plashingiz kerak. Mavjud yulduzlaringizga pastdagi Gift (Sovg'a) larni olishingiz mumkin.";
 
   const list = document.getElementById('wdGiftList');
   const refHint = document.getElementById('wdGiftRefHint');
@@ -8412,13 +8471,14 @@ async def webapp_withdraw_handler(request):
     username = tg_user.get("username", "")
     settings = await get_settings()
 
-    if user["balance_stars"] < settings["min_withdraw_stars"]:
-        need = settings["min_withdraw_stars"] - user["balance_stars"]
-        return web.json_response({
-            "error": f"Yechish uchun minimal {settings['min_withdraw_stars']} ⭐ kerak. Yana {need} ⭐ kerak.",
-        }, status=402)
+    min_stars = max(50, settings["min_withdraw_stars"])
 
     if kind == "stars":
+        if user["balance_stars"] < min_stars:
+            need = min_stars - user["balance_stars"]
+            return web.json_response({
+                "error": f"Yulduz (Stars) yechish uchun minimal {min_stars} ⭐ kerak. Yana {need} ⭐ kerak.",
+            }, status=402)
         amount = user["balance_stars"]
         item_name = ""
     elif kind == "gift":
@@ -8426,7 +8486,7 @@ async def webapp_withdraw_handler(request):
             need = settings["min_referals_required"] - user["referals_count"]
             return web.json_response({
                 "error": f"Gift sifatida yechish uchun kamida {settings['min_referals_required']} ta odam "
-                         f"taklif qilishingiz kerak! Yana {need} ta kerak. ⭐ Yulduz sifatida yechishingiz mumkin.",
+                         f"taklif qilishingiz kerak! Yana {need} ta kerak.",
             }, status=403)
         try:
             item = await get_shop_item(int(body.get("item_id")))
