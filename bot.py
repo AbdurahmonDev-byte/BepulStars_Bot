@@ -467,6 +467,7 @@ async def db_init() -> None:
             "ALTER TABLE withdrawals ADD COLUMN recipient_telegram_id INTEGER",
             "ALTER TABLE withdrawals ADD COLUMN recipient_display TEXT DEFAULT ''",
             "ALTER TABLE shop_items ADD COLUMN is_special INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN referral_tickets INTEGER NOT NULL DEFAULT 0",
         ):
             try:
                 await db.execute(alter_sql)
@@ -595,6 +596,28 @@ async def set_user_balance(telegram_id: int, amount: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE users SET balance_stars = ? WHERE telegram_id = ?", (amount, telegram_id))
         await db.commit()
+
+
+async def add_referral_ticket(telegram_id: int, amount: int = 1) -> None:
+    """Referal orqali qozonilgan bepul jekpot (oddiy box) chiptasini qo'shadi."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET referral_tickets = referral_tickets + ? WHERE telegram_id = ?",
+            (amount, telegram_id),
+        )
+        await db.commit()
+
+
+async def use_referral_ticket(telegram_id: int) -> bool:
+    """Bitta referal chiptasini sarflaydi — deduct_stars kabi ATOMIK: yetarli
+    chipta bo'lmasa hech narsa o'zgarmaydi va False qaytadi."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE users SET referral_tickets = referral_tickets - 1 WHERE telegram_id = ? AND referral_tickets >= 1",
+            (telegram_id,),
+        )
+        await db.commit()
+        return cur.rowcount > 0
 
 
 async def reset_all_balances() -> int:
@@ -1469,8 +1492,16 @@ async def register_user_with_referral(telegram_id: int, referrer_id: int | None,
         reward = settings["ref_reward_stars"]
         await add_stars(referrer["telegram_id"], reward)
         await increment_referals(referrer["telegram_id"])
+
+        # Har 2 ta referalga — 1 ta bepul "oddiy" Jekpot (Gift box) chiptasi.
+        # Yulduz mukofotidan TASHQARI beriladi (mavjud sovg'a kamaymaydi).
+        updated_referrer = await get_user(referrer["telegram_id"])
+        ticket_awarded = bool(updated_referrer and updated_referrer["referals_count"] % 2 == 0)
+        if ticket_awarded:
+            await add_referral_ticket(referrer["telegram_id"])
+
         try:
-            await bot_notify_referrer(referrer["telegram_id"], friend_name or str(telegram_id), reward)
+            await bot_notify_referrer(referrer["telegram_id"], friend_name or str(telegram_id), reward, ticket_awarded)
         except Exception as e:
             logger.warning("Referrer ogohlantirish xatosi: %s", e)
 
@@ -1481,16 +1512,21 @@ async def register_user_with_referral(telegram_id: int, referrer_id: int | None,
 _bot: Bot | None = None
 
 
-async def bot_notify_referrer(referrer_id: int, friend_name: str, reward: int) -> None:
+async def bot_notify_referrer(referrer_id: int, friend_name: str, reward: int, ticket_awarded: bool = False) -> None:
     """Referal qabul qilinganda referrerga xabar (ism-familiya bilan)."""
     if _bot is None:
         return
+    ticket_line = (
+        "\n🎟 Bonus: 2 ta referalga yetdingiz — 1 ta bepul \"🎁 Gift box\" chiptasi qo'shildi! "
+        "Uni 🎰 Jekpot bo'limidan bepul ochishingiz mumkin."
+        if ticket_awarded else ""
+    )
     try:
         await _bot.send_message(
             referrer_id,
             f"🎉 <b>Tabriklaymiz!</b>\n"
             f"Yangicha taklif qildingiz: <b>{friend_name}</b>\n"
-            f"Bonus: <b>+{reward} ⭐</b>",
+            f"Bonus: <b>+{reward} ⭐</b>{ticket_line}",
         )
     except TelegramForbiddenError:
         pass
@@ -1719,12 +1755,17 @@ async def profile_handler(message: Message, bot: Bot) -> None:
         f"\n🎁 Kutilayotgan gift'lar: <b>{len(pending_gifts)}</b> — pastda ko'rsatilgan\n"
         if pending_gifts else ""
     )
+    tickets_line = (
+        f"🎟 Bepul Jekpot chiptalari: <b>{user['referral_tickets']}</b>\n"
+        if user["referral_tickets"] > 0 else ""
+    )
 
     await message.answer(
         f"👤 <b>Profil</b>\n\n"
         f"🆔 ID: <code>{user['telegram_id']}</code>\n"
         f"⭐ Yulduzlar: <b>{user['balance_stars']}</b>\n"
         f"👥 Taklif qilganlar: <b>{user['referals_count']}</b>\n"
+        f"{tickets_line}"
         f"{gifts_line}\n"
         f"🔗 <b>Shaxsiy havolangiz:</b>\n<code>{ref_link}</code>\n\n"
         f"Shu havolani do'stlaringizga yuboring, ular a'zo bo'lganda bonus olasiz!",
@@ -2449,6 +2490,11 @@ async def shop_handler(message: Message) -> None:
 # eng arzon N ta giftdan biri, gift toifasi, kunlik cheklov, tavsif.
 
 
+# Referal orqali qozonilgan bepul chipta faqat shu ("oddiy") boxni ochishda
+# ishlatilishi mumkin — narxi eng arzon pullik box (mega/nft'dan farqli).
+TICKET_BOX_ID = "gift"
+
+
 async def roll_box(box: dict, via_tgstars: bool = False) -> dict:
     """Box ochish natijasini hisoblaydi. {'kind': 'stars'|'gifts', 'amount', 'gifts'}
 
@@ -2483,6 +2529,8 @@ async def show_boxes(answer_func, telegram_id: int, result_text: str | None = No
     today = datetime.now().strftime("%Y-%m-%d")
     boxes = await get_all_boxes()
 
+    tickets = user["referral_tickets"] if user else 0
+
     kb = InlineKeyboardBuilder()
     for b in boxes:
         kb.button(text=f"{b['name']} — {b['cost']} ⭐ (balans)", callback_data=f"box_open:{b['box_id']}")
@@ -2490,11 +2538,18 @@ async def show_boxes(answer_func, telegram_id: int, result_text: str | None = No
             bonus = b.get("tgstars_bonus_percent") or 0
             star_label = f"🚀 {b['name']} — {b['cost_tgstars']} 💫 (katta imkoniyat!)" if bonus > 0 else f"{b['name']} — {b['cost_tgstars']} 💫 (Telegram Stars)"
             kb.button(text=star_label, callback_data=f"box_open_tgstars:{b['box_id']}")
+        if b["box_id"] == TICKET_BOX_ID and tickets > 0:
+            kb.button(text=f"🎟 Chipta bilan bepul ochish ({tickets} ta bor)", callback_data=f"box_open_ticket:{b['box_id']}")
     kb.button(text="🎟️ Promokod box", callback_data="promo_redeem_start")
     kb.button(text="🔙 Bosh menyu", callback_data="main_menu")
     kb.adjust(1)
 
     text = "🎰 <b>BOXLAR</b>\n\nQaysi boxni ochasiz?\n\n"
+    if tickets > 0:
+        text += (
+            f"🎟 Sizda <b>{tickets}</b> ta bepul chipta bor — har 2 ta referalga 1 tadan "
+            f"qo'shiladi, \"🎁 Gift box\"ni ⭐ sarflamasdan ocha olasiz!\n\n"
+        )
     for b in boxes:
         price_line = f"{b['cost']} ⭐ (balans)"
         bonus = b.get("tgstars_bonus_percent") or 0
@@ -3134,6 +3189,47 @@ async def box_open_callback(call: CallbackQuery, bot: Bot) -> None:
     )
 
     await call.answer("🎉 Box ochildi!", show_alert=False)
+    try:
+        await call.message.delete()
+    except TelegramBadRequest:
+        pass
+    if result["claim_id"]:
+        await call.message.answer(
+            result["text"],
+            reply_markup=await gift_claim_keyboard(result["claim_id"], result["gift_price_stars"]),
+        )
+        await show_boxes(call.message.answer, call.from_user.id)
+    else:
+        await show_boxes(call.message.answer, call.from_user.id, result["text"])
+
+
+@router.callback_query(F.data.startswith("box_open_ticket:"))
+async def box_open_ticket_callback(call: CallbackQuery, bot: Bot) -> None:
+    """Referal orqali qozonilgan bepul chipta bilan (⭐ sarflamasdan) 'oddiy'
+    boxni ochish."""
+    box_id = call.data.split(":")[1]
+    if box_id != TICKET_BOX_ID:
+        await call.answer("❌ Bu box uchun chipta ishlatib bo'lmaydi!", show_alert=True)
+        return
+    box = await get_box(box_id)
+    if not box:
+        await call.answer("❌ Box topilmadi!", show_alert=True)
+        return
+
+    user = await get_user(call.from_user.id)
+    if not user:
+        await call.answer("❌ Avval /start ni bosing!", show_alert=True)
+        return
+
+    if not await use_referral_ticket(call.from_user.id):
+        await call.answer("❌ Sizda bepul chipta yo'q!", show_alert=True)
+        return
+
+    result = await open_box_and_award(
+        bot, box, call.from_user.id, call.from_user.first_name, call.from_user.username,
+    )
+
+    await call.answer("🎉 Box chipta bilan ochildi!", show_alert=False)
     try:
         await call.message.delete()
     except TelegramBadRequest:
@@ -4078,6 +4174,7 @@ async def _show_user_profile(target, telegram_id: int) -> None:
         f"{status_line}"
         f"🆔 ID: <code>{user['telegram_id']}</code>\n"
         f"⭐ Ichki balans: <b>{user['balance_stars']}</b>\n"
+        f"🎟 Jekpot chiptalari: <b>{user['referral_tickets']}</b>\n"
         f"🔗 Referallar: <b>{user['referals_count']}</b>\n"
         f"👥 Taklif qilgan: <code>{user['referrer_id'] or '—'}</code>\n"
         f"📅 Qo'shilgan: {user['joined_at']}\n\n"
@@ -7867,6 +7964,7 @@ async def webapp_me_handler(request):
         "first_name": tg_user.get("first_name", ""),
         "balance_stars": db_user["balance_stars"],
         "referals_count": db_user["referals_count"],
+        "referral_tickets": db_user["referral_tickets"],
         "last_daily_box": db_user["last_daily_box"],
         "ref_link": ref_link,
         "pending_gifts": pending_gifts,
