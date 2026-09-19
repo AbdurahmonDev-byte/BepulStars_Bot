@@ -251,6 +251,20 @@ class StarsRecipientStates(StatesGroup):
     username = State()
 
 
+class PhoneVerifyStates(StatesGroup):
+    """Yangi foydalanuvchi birinchi marta kirganda telefon raqamini
+    yuborishi uchun holat. Maqsad: soxta (fake) akkauntlar bilan cheksiz
+    referal yig'ib, bot balansini bo'shatishning oldini olish — bitta
+    telefon raqamiga faqat bitta akkaunt ro'yxatga olinadi.
+
+    Telegram bot API orqali foydalanuvchining real IP manzilini olish
+    IMKONI YO'Q (Telegram barcha xabarlarni o'z serverlaridan proksi
+    qiladi), shuning uchun "bir qurilma/bitta telefon = bir akkaunt"
+    cheklovi ishonchli tarzda faqat telefon raqami tasdiqlash orqali
+    amalga oshiriladi."""
+    waiting_phone = State()
+
+
 # ============================================================
 #  MA'LUMOTLAR BAZASI (aiosqlite)
 # ============================================================
@@ -439,6 +453,7 @@ async def db_init() -> None:
         # Eski DB bo'lsa, yangi ustunlarni qo'shamiz (migratsiya)
         for alter_sql in (
             "ALTER TABLE users ADD COLUMN last_daily_box TEXT DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN phone_number TEXT DEFAULT ''",
             "ALTER TABLE users ADD COLUMN last_free_ticket TEXT DEFAULT ''",
             "ALTER TABLE users ADD COLUMN is_banned INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE settings ADD COLUMN min_withdraw_stars INTEGER NOT NULL DEFAULT 100",
@@ -556,13 +571,45 @@ async def get_user(telegram_id: int) -> dict | None:
         return dict(row) if row else None
 
 
-async def add_user(telegram_id: int, referrer_id: int | None = None) -> None:
+async def add_user(telegram_id: int, referrer_id: int | None = None, phone_number: str = "") -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO users (telegram_id, referrer_id, joined_at) VALUES (?, ?, ?)",
-            (telegram_id, referrer_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            "INSERT INTO users (telegram_id, referrer_id, phone_number, joined_at) VALUES (?, ?, ?, ?)",
+            (telegram_id, referrer_id, phone_number, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         )
         await db.commit()
+
+
+def normalize_phone(raw: str) -> str:
+    """Telefon raqamni yagona ko'rinishga keltiradi: probel, tire, qavs va
+    '+' belgilari olib tashlanadi (raqamlar qoladi). Shu tufayli
+    +998 90 123 45 67 / 998901234567 / +998901234567 bir xil hisoblanadi."""
+    return "".join(ch for ch in raw if ch.isdigit())
+
+
+async def set_user_phone(telegram_id: int, phone: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET phone_number = ? WHERE telegram_id = ?",
+            (normalize_phone(phone), telegram_id),
+        )
+        await db.commit()
+
+
+async def get_user_by_phone(phone: str) -> dict | None:
+    """Bu telefon raqami oldin ro'yxatdan o'tganmi? — 'bitta telefon = bitta
+    akkaunt' cheklovi aynan shu funksiya orqali amalga oshiriladi."""
+    normalized = normalize_phone(phone)
+    if not normalized:
+        return None
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM users WHERE phone_number = ? AND phone_number != '' COLLATE NOCASE",
+            (normalized,),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
 
 
 async def add_stars(telegram_id: int, amount: int) -> None:
@@ -1441,10 +1488,12 @@ async def channel_join_request_handler(event: ChatJoinRequest) -> None:
     await upsert_channel_membership(keys, event.from_user.id, "requested")
 
 
-async def register_user_with_referral(telegram_id: int, referrer_id: int | None, friend_name: str = "") -> dict:
+async def register_user_with_referral(telegram_id: int, referrer_id: int | None, friend_name: str = "", phone_number: str = "") -> dict:
     """Yangi foydalanuvchini ro'yxatga oladi va referal mukofotini to'laydi."""
     user = await get_user(telegram_id)
     if user:
+        if phone_number and not user["phone_number"]:
+            await set_user_phone(telegram_id, phone_number)
         return user, False
 
     # Referrer mavjudligini tekshiramiz (o'z-o'ziga referal bo'lmasin)
@@ -1452,7 +1501,7 @@ async def register_user_with_referral(telegram_id: int, referrer_id: int | None,
     if referrer_id and referrer_id != telegram_id:
         referrer = await get_user(referrer_id)
 
-    await add_user(telegram_id, referrer["telegram_id"] if referrer else None)
+    await add_user(telegram_id, referrer["telegram_id"] if referrer else None, phone_number=phone_number)
     user = await get_user(telegram_id)
 
     # Referal mukofoti: referrerning hisobiga yulduz + referals_count.
@@ -1595,6 +1644,35 @@ def shop_items_keyboard(category: str) -> InlineKeyboardMarkup:
 #  /start VA MAJBURIY A'ZOLIK
 # ============================================================
 
+def phone_verify_keyboard() -> ReplyKeyboardMarkup:
+    """Telefon raqamni yuborish tugmasi. Telegram'da bu tugma foydalanuvchining
+    qurilmasidagi haqiqiy telefon raqamini (SIM kartasi) botga yuboradi —
+    bitta telefon raqamiga faqat bitta akkaunt ro'yxatga olinishi shu orqali
+    ta'minlanadi."""
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Telefon raqamini yuborish", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    return kb
+
+
+async def prompt_phone_verification(message: Message, state: FSMContext) -> None:
+    """Yangi/tekshirilmagan foydalanuvchidan telefon raqamini so'raydi.
+
+    Nega kerak: Telegram bot API orqali real IP ko'rinmagani uchun soxta
+    akkauntlar bilan cheksiz referal yig'ishning oldini olishning ishonchli
+    yo'li — telefon raqami. Taklif qiluvchi (referrer) referal tugaguncha
+    FSM xotirasida saqlanadi va raqam tasdiqlangach ishlatiladi."""
+    await state.set_state(PhoneVerifyStates.waiting_phone)
+    await message.answer(
+        "📱 <b>Raqamingizni tasdiqlang</b>\n\n"
+        "Soxta akkauntlar bilan bot balansini bo'shatilishining oldini olish "
+        "uchun bitta telefon raqamiga faqat bitta akkaunt ro'yxatga olinadi.\n\n"
+        "Quyidagi tugmani bosing — raqamingiz avtomatik yuboriladi 👇",
+        reply_markup=phone_verify_keyboard(),
+    )
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, bot: Bot, state: FSMContext) -> None:
     if message.chat.type != "private":
@@ -1636,6 +1714,17 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext) -> None:
             return
 
     if user:
+        # Ro'yxatdan o'tgan foydalanuvchi. Telefon raqami hali tasdiqlanmagan
+        # bo'lsa (bu funksiya ishga tushishidan oldin ro'yxatdan o'tganlar) —
+        # bir marta tasdiqlatamiz, keyin botdan foydalanadi. Referal payload
+        # bo'lsa ham saqlab qo'yamiz (agar hali hisoblanmagan bo'lsa).
+        if not user.get("phone_number"):
+            if referrer_id and referrer_id != message.from_user.id:
+                await set_pending_referral(message.from_user.id, referrer_id)
+            await state.update_data(phone_pending_referrer=referrer_id or 0)
+            await prompt_phone_verification(message, state)
+            return
+
         # Qaytgan foydalanuvchi
         await clear_pending_referral(message.from_user.id)
         await message.answer(
@@ -1646,27 +1735,17 @@ async def cmd_start(message: Message, bot: Bot, state: FSMContext) -> None:
         )
         return
 
-    # Yangi foydalanuvchi — to'g'ridan-to'g'ri ro'yxatga olamiz (referali
-    # bo'lsa ham, bo'lmasa ham; referal mukofoti kunlik chegara bilan
-    # nakrutkadan himoyalangan — register_user_with_referral'ga qarang).
-    #
-    # Muhim: agar bu /start'da referal payload bo'lmasa (masalan
-    # foydalanuvchi kanallarga a'zo bo'lgandan keyin "✅ Tekshirdim"
-    # tugmasini emas, oddiy /start'ni qayta yuborgan bo'lsa), avval
-    # DBda saqlangan pending referaldan foydalanamiz — aks holda referal
-    # butunlay yo'qolib, "referal ba'zida hisoblanmayapti" shikoyatiga
-    # aynan shu sabab bo'lardi (bot restart bo'lgan bo'lsa ham ishlaydi,
-    # chunki bu endi xotirada emas, DBda saqlanadi).
+    # Yangi foydalanuvchi: avval telefon raqamini tasdiqlaydi, SHUNDAN KEYIN
+    # ro'yxatga olinadi va referal mukofoti to'lanadi. Bu soxta akkauntlar
+    # bilan cheksiz referal yig'ishni keskin qiyinlashtiradi (har bir yangi
+    # akkaunt uchun yangi telefon raqami kerak). Referal payload (agar bo'lsa)
+    # DBga yoziladi — telefon tasdiqlangach ishlatamiz.
     if referrer_id is None:
         referrer_id = await get_pending_referral(message.from_user.id)
-    await register_user_with_referral(message.from_user.id, referrer_id, message.from_user.full_name)
-    await clear_pending_referral(message.from_user.id)
-    await message.answer(
-        "👋 <b>Xush kelibsiz!</b>\n\n"
-        "Bu yerda yulduzlar (⭐) yig'ib, do'kondan sovg'alar olasiz va jekpotda qatnashasiz!\n"
-        "Taklif qilgan har bir do'stingiz uchun bonus oling. 🎁",
-        reply_markup=main_menu_keyboard(message.from_user.id),
-    )
+    if referrer_id and referrer_id != message.from_user.id:
+        await set_pending_referral(message.from_user.id, referrer_id)
+    await state.update_data(phone_pending_referrer=referrer_id or 0)
+    await prompt_phone_verification(message, state)
 
 
 @router.callback_query(F.data.startswith("check_sub"))
@@ -1691,20 +1770,107 @@ async def check_sub_handler(call: CallbackQuery, bot: Bot, state: FSMContext) ->
         ref = int(parts[1])
     else:
         ref = await get_pending_referral(call.from_user.id)
-    user = await get_user(call.from_user.id)
-    if not user:
-        await register_user_with_referral(call.from_user.id, ref, call.from_user.full_name)
-    await clear_pending_referral(call.from_user.id)
 
     try:
         await call.message.delete()
     except TelegramBadRequest:
         pass
+
+    user = await get_user(call.from_user.id)
+    # Ro'yxatdan o'tmagan yoki telefon raqami hali tasdiqlanmagan foydalanuvchi
+    # ('bitta telefon = bitta akkaunt' himoyasi) — avval raqam so'raymiz.
+    if not user or not user.get("phone_number"):
+        if ref and ref != call.from_user.id:
+            await set_pending_referral(call.from_user.id, ref)
+        await state.update_data(phone_pending_referrer=ref or 0)
+        await prompt_phone_verification(call.message, state)
+        await call.answer()
+        return
+
+    await clear_pending_referral(call.from_user.id)
+
     await call.message.answer(
         "✅ <b>Tabriklaymiz! Endi botdan foydalanishingiz mumkin.</b>",
         reply_markup=main_menu_keyboard(call.from_user.id),
     )
     await call.answer()
+
+
+async def _finish_phone_verification(message: Message, state: FSMContext, phone_raw: str, friend_name: str) -> None:
+    """Telefon raqam qabul qilindi — 'bitta telefon = bitta akkaunt' tekshiruvi
+    va (yangi bo'lsa) ro'yxatga olish + referal mukofoti shu yerda yakunlanadi."""
+    phone = normalize_phone(phone_raw)
+    if len(phone) < 7:
+        await message.answer(
+            "❌ <b>Raqam to'liq qabul qilinmadi.</b>\n\n"
+            "SIMSiz bor raqamingizni <i>telefon raqamini yuborish</i> tugmasi orqali "
+            "yuboring yoki quyidagi ko'rinishda yozing: <code>901234567</code> 👇",
+            reply_markup=phone_verify_keyboard(),
+        )
+        return
+
+    # Soxta akkaunt himoyasi: bu raqam oldin boshqa akkauntda ishlatilgan bo'lsa —
+    # ro'yxatga olinmaydi va referal ham to'lanmaydi.
+    existing = await get_user_by_phone(phone)
+    if existing and existing["telegram_id"] != message.from_user.id:
+        logger.warning(
+            "Fake akkaunt blocklandi: from=%s phone=%s existing=%s",
+            message.from_user.id, phone, existing["telegram_id"],
+        )
+        await state.clear()
+        await message.answer(
+            "🚫 <b>Bu telefon raqami allaqachon botda ro'yxatdan o'tgan.</b>\n\n"
+            "Qoidalarga ko'ra <b>bitta telefon raqamiga faqat bitta akkaunt</b> "
+            "ro'yxatga olinadi. Iltimos, haqiqiy (boshqa) raqamingiz yoki "
+            "avvalgi akkauntingiz bilan davom eting.",
+        )
+        return
+
+    data = await state.get_data()
+    referrer_id = data.get("phone_pending_referrer") or 0
+    if not referrer_id:
+        referrer_id = await get_pending_referral(message.from_user.id)
+    await state.clear()
+
+    await register_user_with_referral(
+        message.from_user.id,
+        referrer_id or None,
+        friend_name or message.from_user.full_name,
+        phone_number=phone,
+    )
+    await clear_pending_referral(message.from_user.id)
+
+    await message.answer(
+        "👋 <b>Xush kelibsiz!</b>\n\n"
+        "Bu yerda yulduzlar (⭐) yig'ib, do'kondan sovg'alar olasiz va jekpotda qatnashasiz!\n"
+        "Taklif qilgan har bir do'stingiz uchun bonus oling. 🎁",
+        reply_markup=main_menu_keyboard(message.from_user.id),
+    )
+
+
+@router.message(PhoneVerifyStates.waiting_phone)
+async def phone_verification_handler(message: Message, state: FSMContext) -> None:
+    """Telefon tasdiqlash bosqichidagi barcha xabarlarni qabul qiladi: tugma
+    orqali yuborilgan kontaktni yoki qo'lda yozilgan raqamni."""
+    if message.chat.type != "private":
+        return
+
+    # Tugma orqali yuborilgan telefon raqami (Telegram kontakt formati)
+    if message.contact and message.contact.phone_number:
+        await _finish_phone_verification(message, state, message.contact.phone_number, message.from_user.full_name)
+        return
+
+    # Qo'lda yozib yuborilgan raqam (fallback — kontakt tugmasi ishlamasa)
+    if message.text and any(ch.isdigit() for ch in message.text):
+        phone = normalize_phone(message.text)
+        if phone.isdigit() and 7 <= len(phone) <= 15:
+            await _finish_phone_verification(message, state, phone, message.from_user.full_name)
+            return
+
+    await message.answer(
+        "📱 Iltimos, quyidagi tugmani bosing yoki raqamingizni yozib yuboring 👇",
+        reply_markup=phone_verify_keyboard(),
+    )
 
 
 # ============================================================
