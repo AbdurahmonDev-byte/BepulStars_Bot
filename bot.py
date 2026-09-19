@@ -31,6 +31,7 @@ from datetime import datetime, timedelta
 from urllib.parse import parse_qsl, quote
 
 import db_compat as aiosqlite  # noqa: N812 — Turso (doimiy tashqi baza) yoki lokal SQLite'ga
+import fragment_api  # fragment-api.uz orqali real Telegram Stars avtomatik yuborish
                                 # shaffof ulanish uchun moslashtiruvchi qatlam (pastdagi
                                 # izohga qarang: MA'LUMOTLARNI DOIMIY SAQLASH).
 from dotenv import load_dotenv
@@ -1994,11 +1995,83 @@ async def _fulfill_stars_withdrawal(
     amount: int,
     recipient_id: int | None,
     recipient_display: str,
+    recipient_username: str | None = None,
 ) -> str:
     """Yulduz allaqachon SO'ROVCHIning ichki balansidan ayirilgan — bu
-    funksiya so'rovni yozadi va adminni xabardor qiladi: real to'lov (pul
-    yoki haqiqiy Telegram Stars) admin tomonidan RECIPIENT'ga (o'zi yoki
-    mijoz talabi bilan qo'shilgan — boshqa odam) qo'lda o'tkaziladi."""
+    funksiya real to'lovni amalga oshiradi.
+
+    Agar fragment-api.uz sozlangan bo'lsa (FRAGMENT_API_KEY) VA summa paket
+    qadamiga (50) bo'linsa VA qabul qiluvchining @username'i ma'lum bo'lsa —
+    real Telegram Stars avtomatik yuboriladi (to'lov loyihaning o'z
+    hamyonidan), so'rov 'paid' bo'lib belgilanadi va admin audit xabari oladi.
+
+    Aks holda (username yo'q / summa mos emas / API xato qilsa) — eski
+    ishonchli tartib saqlanadi: so'rov 'pending' bo'ladi va real to'lovni
+    admin qo'lda amalga oshirib "✅ To'lov qildim" tugmasini bosadi."""
+    # Avto-send imkoniyati: fragment API yoqilgan + summa paketga to'g'ri
+    # keladi + qabul qiluvchining username'i bor.
+    target_username = (recipient_username or requester_username or "").strip().lstrip("@")
+    if fragment_api.can_auto_send(amount) and target_username:
+        ok, result = await fragment_api.buy_stars(target_username, amount)
+        if ok:
+            w_id = await add_withdrawal(
+                telegram_id=requester_id,
+                user_name=requester_name,
+                username=requester_username,
+                kind="stars",
+                amount_stars=amount,
+                recipient_telegram_id=recipient_id,
+                recipient_display=recipient_display or f"@{target_username}",
+            )
+            await update_withdrawal_status(w_id, "paid")
+
+            # Foydalanuvchiga xabar: avtomatik yuborildi
+            who_text = (
+                f"📤 Qabul qiluvchi: <b>@{target_username}</b>\n"
+                if recipient_id and recipient_username
+                else ""
+            )
+            try:
+                await bot.send_message(
+                    requester_id,
+                    f"✅ <b>Yulduzlar avtomatik yuborildi!</b>\n\n"
+                    f"🧾 So'rov: #{w_id}\n"
+                    f"💰 Miqdor: <b>{amount} ⭐</b>\n"
+                    f"{who_text}"
+                    f"⚡ fragment-api.uz orqali real Telegram Stars sifatida o'tkazildi.",
+                )
+            except TelegramForbiddenError:
+                pass
+
+            # Admin audit (money chiqimi — hamma admin ko'rsin)
+            for admin_id in ADMIN_IDS:
+                try:
+                    await bot.send_message(
+                        admin_id,
+                        f"💸 <b>AVTOMATIK STARS CHIQIMI #{w_id}</b>\n\n"
+                        f"👤 Foydalanuvchi: {requester_name} (@{requester_username or '—'})\n"
+                        f"🆔 ID: <code>{requester_id}</code>\n"
+                        f"🎯 Kimga: <b>@{target_username}</b>\n"
+                        f"💰 Miqdor: <b>{amount} ⭐</b>\n"
+                        f"⚡ fragment-api.uz orqali avtomatik o'tkazildi.\n"
+                        f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    )
+                except TelegramForbiddenError:
+                    pass
+
+            return (
+                f"✅ <b>Yulduzlar avtomatik yuborildi!</b>\n\n"
+                f"💰 Miqdor: <b>{amount} ⭐</b>\n"
+                f"📤 Qabul qiluvchi: <b>@{target_username}</b>\n"
+                f"🧾 So'rov: #{w_id}\n\n"
+                f"⚡ fragment-api.uz orqali real Telegram Stars o'tkazildi."
+            )
+        # API xato qildi — avvalgi (qo'lda) tartibga o'tamiz, hech narsa yo'qolmaydi
+        logger.warning(
+            "Stars avto-send bajarilmadi (%s ⭐ → @%s): %s — qo'lda tartibga o'tilmoqda",
+            amount, target_username, result,
+        )
+
     w_id = await add_withdrawal(
         telegram_id=requester_id,
         user_name=requester_name,
@@ -2070,7 +2143,7 @@ async def process_stars_withdrawal(call: CallbackQuery, bot: Bot, amount: int) -
 
     result_text = await _fulfill_stars_withdrawal(
         bot, call.from_user.id, call.from_user.first_name or "", call.from_user.username or "",
-        amount, None, "",
+        amount, None, "", recipient_username=call.from_user.username or "",
     )
     try:
         await call.message.edit_text(result_text)
@@ -2305,9 +2378,14 @@ async def stars_recipient_other_finish(message: Message, bot: Bot, state: FSMCon
         await message.answer("❌ Balans yetarli emas!")
         return
 
+    # Fragment avto-send uchun username kerak: agar "ID raqami" orqali
+    # qidirilgan bo'lsa, username noma'lum → eski (qo'lda) tartib saqlanadi.
+    search = raw.strip().lstrip("@")
+    recipient_username = "" if (search.isdigit() or search.startswith("-")) else search
+
     result_text = await _fulfill_stars_withdrawal(
         bot, message.from_user.id, message.from_user.first_name or "", message.from_user.username or "",
-        amount, recipient_id, recipient_display,
+        amount, recipient_id, recipient_display, recipient_username=recipient_username,
     )
     await message.answer(result_text)
 
@@ -4878,6 +4956,39 @@ async def admin_panel(message: Message) -> None:
         await message.answer("❌ Siz admin emassiz!")
         return
     await message.answer("👑 <b>Admin panel</b>\n\nQuyidagi bo'limlardan birini tanlang:", reply_markup=admin_keyboard())
+
+
+@router.message(Command("fragment"))
+async def admin_fragment_status(message: Message) -> None:
+    """fragment-api.uz holati: yoqingmi, avto-send qadam, hamyon balansi."""
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Siz admin emassiz!")
+        return
+    enabled = fragment_api.is_enabled()
+    step = fragment_api.FRAGMENT_STARS_STEP
+    text = (
+        f"⚡ <b>fragment-api.uz</b>\n\n"
+        f"🔌 Holat: <b>{'YAQILGAN' if enabled else 'O‘CHIRILGAN'}</b>\n"
+        f"🌐 URL: <code>{fragment_api.FRAGMENT_API_URL}</code>\n"
+        f"🔢 Avto-send qadami: <b>{step}</b> ⭐ (50 ga karrati)\n"
+    )
+    if not enabled:
+        text += "\nℹ️ FRAGMENT_API_KEY .env ga qo‘yilmagan — yulduz yechish eski (qo‘lda) tartibda ishlaydi."
+        await message.answer(text)
+        return
+    ok, result = await fragment_api.wallet_balance()
+    if ok:
+        result = result or {}
+        text += (
+            f"\n💼 <b>Hamyon balansi:</b>\n"
+            f"• TON: <b>{result.get('balance_ton') or '—'}</b>\n"
+            f"• USDT: <b>{result.get('balance_usdt') or '—'}</b>\n"
+            f"• Manzil: <code>{result.get('address') or '—'}</code>\n"
+            f"• Tarmoq: {result.get('network') or ''} ({result.get('wallet_version') or ''})"
+        )
+    else:
+        text += f"\n❌ Balans olib bo‘lmadi: <code>{str(result)[:200]}</code>"
+    await message.answer(text)
 
 
 @router.callback_query(F.data == "admin:stats")
