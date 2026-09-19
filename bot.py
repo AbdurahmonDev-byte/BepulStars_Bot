@@ -2000,16 +2000,18 @@ async def _fulfill_stars_withdrawal(
     """Yulduz allaqachon SO'ROVCHIning ichki balansidan ayirilgan — bu
     funksiya real to'lovni amalga oshiradi.
 
-    Agar fragment-api.uz sozlangan bo'lsa (FRAGMENT_API_KEY) VA summa paket
-    qadamiga (50) bo'linsa VA qabul qiluvchining @username'i ma'lum bo'lsa —
-    real Telegram Stars avtomatik yuboriladi (to'lov loyihaning o'z
-    hamyonidan), so'rov 'paid' bo'lib belgilanadi va admin audit xabari oladi.
+    Agar fragment-api.uz sozlangan bo'lsa (FRAGMENT_API_KEY) VA qabul
+    qiluvchining @username'i ma'lum bo'lsa — real Telegram Stars avtomatik
+    yuboriladi (to'lov loyihaning o'z hamyonidan), so'rov 'paid' bo'lib
+    belgilanadi va admin audit xabari oladi. Summaga QO'SHIMCHA cheklov yo'q
+    (istalgan miqdor yuboriladi); faqat FRAGMENT_STARS_STEP > 0 qilib
+    qo'yilgan bo'lsa, unday summalar ham step'ga bo'linishi kerak.
 
-    Aks holda (username yo'q / summa mos emas / API xato qilsa) — eski
-    ishonchli tartib saqlanadi: so'rov 'pending' bo'ladi va real to'lovni
-    admin qo'lda amalga oshirib "✅ To'lov qildim" tugmasini bosadi."""
-    # Avto-send imkoniyati: fragment API yoqilgan + summa paketga to'g'ri
-    # keladi + qabul qiluvchining username'i bor.
+    Aks holda (username yo'q / API xato qilsa) — eski ishonchli tartib
+    saqlanadi: so'rov 'pending' bo'ladi va real to'lovni admin qo'lda
+    amalga oshirib "✅ To'lov qildim" tugmasini bosadi."""
+    # Avto-send imkoniyati: fragment API yoqilgan + summa avto-sendga mos
+    # (step=0 bo'lsa istalgan summa) + qabul qiluvchining username'i bor.
     target_username = (recipient_username or requester_username or "").strip().lstrip("@")
     if fragment_api.can_auto_send(amount) and target_username:
         ok, result = await fragment_api.buy_stars(target_username, amount)
@@ -4966,11 +4968,12 @@ async def admin_fragment_status(message: Message) -> None:
         return
     enabled = fragment_api.is_enabled()
     step = fragment_api.FRAGMENT_STARS_STEP
+    step_line = "— (istalgan summa)" if step <= 0 else f"— faqat {step} ga karrati"
     text = (
         f"⚡ <b>fragment-api.uz</b>\n\n"
         f"🔌 Holat: <b>{'YAQILGAN' if enabled else 'O‘CHIRILGAN'}</b>\n"
         f"🌐 URL: <code>{fragment_api.FRAGMENT_API_URL}</code>\n"
-        f"🔢 Avto-send qadami: <b>{step}</b> ⭐ (50 ga karrati)\n"
+        f"🔢 Avto-send cheklovi: <b>{step}</b> {step_line}\n"
     )
     if not enabled:
         text += "\nℹ️ FRAGMENT_API_KEY .env ga qo‘yilmagan — yulduz yechish eski (qo‘lda) tartibda ishlaydi."

@@ -7,11 +7,14 @@ yulduzlarini yechmoqchi bo'lganda, fragment-api.uz API'si orqali real Telegram
 Stars buyurtma qilinadi va to'g'ridan-to'g'ri qabul qiluvchining @username'iga
 yuboriladi. To'lov loyihaning o'z TON/USDT hamyonidan amalga oshiriladi.
 
-Sozlash (.env / Render env):
+Sozlash (.env / host env):
     FRAGMENT_API_KEY   — fragment-api.uz dashboard'idan olingan API kalit.
     FRAGMENT_API_URL   — ixtiyoriy, standart: https://fragment-api.uz
-    FRAGMENT_STARS_STEP— Telegram Stars paket qadami (standart 50). Avto-send
-                         faqat bu qiymatga bo'linadigan summalar uchun yoqiladi.
+    FRAGMENT_STARS_STEP— ixtiyoriy cheklov. Standart 0 = ISTALGAN summa
+                         avtomatik yuboriladi. Agar fragment'ingiz faqat
+                         ma'lum paketlarni (masalan 50 ga karrati) qo'llab-
+                         quvvatlasa, shu qiymatni yozing — o'shanda faqat
+                         unga bo'linadigan summalargina avto-send bo'ladi.
 
 Xavfsizlik: API kalit faqat .env da saqlanadi, repo'ga kirmaydi (qarang .env.example).
 """
@@ -24,7 +27,8 @@ logger = logging.getLogger(__name__)
 
 FRAGMENT_API_URL = os.getenv("FRAGMENT_API_URL", "https://fragment-api.uz").rstrip("/")
 FRAGMENT_API_KEY = os.getenv("FRAGMENT_API_KEY", "").strip()
-FRAGMENT_STARS_STEP = int(os.getenv("FRAGMENT_STARS_STEP", "50") or "0")
+# 0 = cheklov yo'q (istalgan summa). >0 bo'lsa — faqat shu qiymatga karrati.
+FRAGMENT_STARS_STEP = int(os.getenv("FRAGMENT_STARS_STEP", "0") or "0")
 
 
 def is_enabled() -> bool:
@@ -35,13 +39,17 @@ def is_enabled() -> bool:
 def can_auto_send(amount: int) -> bool:
     """Bu summa fragment orqali avtomatik yuborishga mosmi?
 
-    Telegram real Stars fragmentda odatda 50 ga karrati bo'lgan paketlarda
-    sotiladi, shuning uchun step'ga bo'linmaydigan summalarda avto-send
-    yoqilmaydi — o'sha holatda bot eski tartibda (admin qo'lda tasdiqlaydi)
-    ishlayveradi, hech narsa yo'qolmaydi."""
+    Standart holatda HECH QANDAY summa cheklanmaydi (fragment-api.uz ixtiyoriy
+    miqdorlarni qabul qiladi, hatto misolda 60 ⭐ ishlatilgan). Faqat
+    FRAGMENT_STARS_STEP > 0 qilib qo'yilgan bo'lsa, step'ga bo'linmaydigan
+    summalar avto-send o'rniga eski (qo'lda) tartibda qoladi."""
     if not is_enabled():
         return False
-    return FRAGMENT_STARS_STEP > 0 and isinstance(amount, int) and amount > 0 and amount % FRAGMENT_STARS_STEP == 0
+    if not isinstance(amount, int) or amount <= 0:
+        return False
+    if FRAGMENT_STARS_STEP > 0:
+        return amount % FRAGMENT_STARS_STEP == 0
+    return True
 
 
 async def _post(path: str, payload: dict | None = None, *, timeout: int = 25):
