@@ -163,6 +163,7 @@ dp = Dispatcher()
 class SettingsStates(StatesGroup):
     """Admin sozlamalarni matn orqali o'zgartirishi uchun."""
     ref_reward = State()      # bitta referal uchun yulduz
+    ref_spin = State()        # har nechta referalga 1 ta aylantirish
     min_referals = State()    # xarid uchun minimal referallar
     min_withdraw = State()    # yulduz yechish uchun minimal
     pay_card = State()        # to'lov karta raqami
@@ -1527,8 +1528,9 @@ async def register_user_with_referral(telegram_id: int, referrer_id: int | None,
     await add_user(telegram_id, referrer["telegram_id"] if referrer else None, phone_number=phone_number)
     user = await get_user(telegram_id)
 
-    # Referal mukofoti: referrerning hisobiga erkin jekpot aylantirish (har
-    # refs_per_spin referalga 1 ta) + referals_count.
+    # Referal mukofoti: referrerning hisobiga yulduz (ref_reward_stars) +
+    # referals_count; qo'shimcha ravishda har refs_per_spin referalga 1 ta
+    # erkin jekpot aylantirish (free_spins).
     # Kunlik chegara — bitta odam soxta akkountlar bilan cheksiz "nakrutka"
     # qilib bot balansini bo'shatib qo'yishining oldini oladi: chegaradan
     # oshgan referallar RO'YXATGA OLINADI (statistikada ko'rinadi), lekin
@@ -1546,13 +1548,15 @@ async def register_user_with_referral(telegram_id: int, referrer_id: int | None,
                 )
                 return user, True
 
+        reward = settings["ref_reward_stars"]
+        await add_stars(referrer["telegram_id"], reward)
         refs_per_spin = settings.get("refs_per_spin") or 0
         new_count = referrer["referals_count"] + 1
         await increment_referals(referrer["telegram_id"])
         if refs_per_spin > 0 and new_count % refs_per_spin == 0:
             await add_free_spins(referrer["telegram_id"], 1)
         try:
-            await bot_notify_referrer(referrer["telegram_id"], friend_name or str(telegram_id), refs_per_spin, new_count)
+            await bot_notify_referrer(referrer["telegram_id"], friend_name or str(telegram_id), reward, refs_per_spin, new_count)
         except Exception as e:
             logger.warning("Referrer ogohlantirish xatosi: %s", e)
 
@@ -1563,26 +1567,24 @@ async def register_user_with_referral(telegram_id: int, referrer_id: int | None,
 _bot: Bot | None = None
 
 
-async def bot_notify_referrer(referrer_id: int, friend_name: str, refs_per_spin: int, ref_count: int) -> None:
+async def bot_notify_referrer(referrer_id: int, friend_name: str, reward_stars: int, refs_per_spin: int, ref_count: int) -> None:
     """Referal qabul qilinganda referrerga xabar (ism-familiya bilan).
 
-    refs_per_spin har nechta referalga bitta jekpot aylantirish berilishini
-    bildiradi. Aylantirish sovrin o'tganida alohida xabar yuboriladi."""
+    Referal ⭐ bonus beradi, qo'shimcha ravishda har refs_per_spin referalga
+    bitta 🎡 jekpot aylantirish yig'iladi. Aylantirish sovrin o'tganida
+    alohida satr bilan xabar beriladi."""
     if _bot is None:
         return
-    if refs_per_spin > 0 and ref_count % refs_per_spin == 0:
-        text = (
-            f"🎉 <b>Tabriklaymiz!</b>\n"
-            f"Yangi referal: <b>{friend_name}</b>\n"
-            f"🎡 <b>Jekpot aylantirish: +1</b> (har {refs_per_spin} referal uchun)"
-        )
-    else:
-        remaining = refs_per_spin - (ref_count % refs_per_spin) if refs_per_spin > 0 else 0
-        text = (
-            f"🔔 <b>Yangi referal!</b>\n"
-            f"Do'stingiz <b>{friend_name}</b> qabul qilindi.\n"
-            f"Aylantirish uchun yana <b>{remaining}</b> referal kerak ({ref_count % refs_per_spin}/{refs_per_spin})"
-        )
+    text = (
+        f"🎉 <b>Tabriklaymiz!</b>\n"
+        f"Yangi referal: <b>{friend_name}</b>\n"
+        f"Bonus: <b>+{reward_stars} ⭐</b>"
+    )
+    if refs_per_spin > 0:
+        if ref_count % refs_per_spin == 0:
+            text += f"\n🎡 <b>Jekpot aylantirish: +1</b> (har {refs_per_spin} referal uchun)"
+        else:
+            text += f"\n🎡 Aylantirish uchun yana <b>{refs_per_spin - (ref_count % refs_per_spin)}</b> referal kerak ({ref_count % refs_per_spin}/{refs_per_spin})"
     try:
         await _bot.send_message(referrer_id, text)
     except TelegramForbiddenError:
@@ -3599,7 +3601,8 @@ async def about_bot_handler(message: Message) -> None:
         "ℹ️ <b>Bot haqida — qanday ishlaydi?</b>\n\n"
         "⭐ <b>Yulduz qanday topiladi?</b>\n"
         f"• Do'stlaringizni <b>🔗 Referal</b> havolangiz orqali taklif qiling — "
-        f"har <b>{settings['refs_per_spin']}</b> referal uchun <b>1 ta 🎡 Jekpot aylantirish</b> olasiz "
+        f"har biri uchun <b>{settings['ref_reward_stars']} ⭐</b> olasiz, har "
+        f"<b>{settings['refs_per_spin']}</b> referal uchun <b>1 ta 🎡 Jekpot aylantirish</b> ham beriladi "
         f"(do'stingiz majburiy kanallarga a'zo bo'lishi shart).\n"
         "• <b>🎰 Jekpot</b> boxlarini oching — tasodifiy miqdorda ⭐ yoki gift yutib olasiz.\n\n"
         "🛍️ <b>Do'kon</b>\n"
@@ -5102,6 +5105,7 @@ async def admin_stats(call: CallbackQuery) -> None:
     text = (
         f"📊 <b>Statistika</b>\n\n"
         f"👥 Jami foydalanuvchilar: <b>{len(users)}</b>\n"
+        f"⭐ Referal mukofoti: {settings['ref_reward_stars']}\n"
         f"🎡 Aylantirish: har {settings['refs_per_spin']} referalga 1 ta\n"
         f"👥 Min. referallar: {settings['min_referals_required']}\n"
         f"💸 Yechish minimumi: {settings['min_withdraw_stars']}"
@@ -5120,7 +5124,8 @@ def back_to_admin_keyboard() -> InlineKeyboardMarkup:
 
 def settings_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="🎡 Referal aylantirish (har nechta)", callback_data="admin:set:ref_reward")
+    kb.button(text="⭐ Referal mukofoti", callback_data="admin:set:ref_reward")
+    kb.button(text="🎡 Referalni aylantirish (har nechta)", callback_data="admin:set:ref_spin")
     kb.button(text="👥 Min. referallar", callback_data="admin:set:min_ref")
     kb.button(text="🚫 Kunlik referal chegarasi", callback_data="admin:set:max_ref_daily")
     kb.button(text="💸 Yulduz yechish minimumi", callback_data="admin:set:min_withdraw")
@@ -5144,6 +5149,7 @@ async def admin_settings(call: CallbackQuery) -> None:
     gift_caption_display = s["gift_caption"] or DEFAULT_GIFT_CAPTION
     text = (
         f"⚙️ <b>Sozlamalar</b>\n\n"
+        f"⭐ Referal mukofoti: <b>{s['ref_reward_stars']} ⭐</b>\n"
         f"🎡 Aylantirish: har <b>{s['refs_per_spin']}</b> referalga 1 ta\n"
         f"👥 Xarid uchun min. referallar: <b>{s['min_referals_required']}</b>\n"
         f"🚫 Kunlik referal chegarasi: <b>{s['max_referrals_per_day'] if s['max_referrals_per_day'] > 0 else 'cheklanmagan'}</b>\n"
@@ -5165,6 +5171,34 @@ async def set_ref_reward(call: CallbackQuery, state: FSMContext) -> None:
         return
     await state.set_state(SettingsStates.ref_reward)
     await call.message.edit_text(
+        "✏️ <b>Yangi referal mukofotini yozing:</b>\n"
+        "(1 ta referal uchun nechta yulduz beriladi)",
+    )
+    await call.answer()
+
+
+@router.message(SettingsStates.ref_reward)
+async def ref_reward_input(message: Message, state: FSMContext) -> None:
+    try:
+        value = int(message.text)
+    except ValueError:
+        await message.answer("❌ Iltimos, butun son kiriting!")
+        return
+    if value < 0:
+        await message.answer("❌ Mukofot manfiy bo'lishi mumkin emas!")
+        return
+    await update_settings(ref_reward_stars=value)
+    await state.clear()
+    await message.answer(f"✅ Referal mukofoti <b>{value} ⭐</b> qilib o'rnatildi.", reply_markup=admin_keyboard())
+
+
+@router.callback_query(F.data == "admin:set:ref_spin")
+async def set_ref_spin(call: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    await state.set_state(SettingsStates.ref_spin)
+    await call.message.edit_text(
         "✏️ <b>Har nechta referalga 1 ta aylantirish berishini yozing:</b>\n"
         "(masalan 2 — har 2 referal uchun 1 ta 🎡 aylantirish)\n"
         "0 kiritsangiz — aylantirish berilmaydi",
@@ -5172,8 +5206,8 @@ async def set_ref_reward(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
 
 
-@router.message(SettingsStates.ref_reward)
-async def ref_reward_input(message: Message, state: FSMContext) -> None:
+@router.message(SettingsStates.ref_spin)
+async def ref_spin_input(message: Message, state: FSMContext) -> None:
     try:
         value = int(message.text)
     except ValueError:
@@ -7192,9 +7226,10 @@ function renderAbout() {
   const body = document.getElementById('aboutBody');
   body.innerHTML = `
     <p><b>⭐ Yulduz qanday topiladi?</b><br>
-    Do'stlaringizni referal havolangiz orqali taklif qiling — har
-    <b>${INFO.refs_per_spin || 2}</b> referal uchun <b>1 ta 🎡 Jekpot aylantirish</b>
-    olasiz. Shuningdek 🎰 Jekpot boxlarini oching —
+    Do'stlaringizni referal havolangiz orqali taklif qiling — har biri uchun
+    <b>${INFO.ref_reward_stars || 0} ⭐</b> olasiz, har
+    <b>${INFO.refs_per_spin || 2}</b> referal uchun <b>1 ta 🎡 Jekpot aylantirish</b> ham
+    beriladi. Shuningdek 🎰 Jekpot boxlarini oching —
     tasodifiy miqdorda ⭐ yoki gift yutib olasiz.</p>
     <p><b>🛍️ Do'kon</b><br>
     Gift, Premium va boshqa mahsulotlarni 3 xil usulda sotib olish mumkin: ichki ⭐
@@ -8324,6 +8359,7 @@ async def webapp_info_handler(request):
         "contacts": [{"label": c["label"], "username": c["username"].lstrip("@")} for c in contacts],
         "reviews_url": channel_url(s["reviews_channel"]) if s["reviews_channel"] else None,
         "min_withdraw_stars": s["min_withdraw_stars"],
+        "ref_reward_stars": s["ref_reward_stars"],
         "refs_per_spin": s["refs_per_spin"],
         "min_referals_required": s["min_referals_required"],
     })
