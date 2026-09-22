@@ -254,15 +254,8 @@ class StarsRecipientStates(StatesGroup):
 
 class PhoneVerifyStates(StatesGroup):
     """Yangi foydalanuvchi birinchi marta kirganda telefon raqamini
-    yuborishi uchun holat. Maqsad: soxta (fake) akkauntlar bilan cheksiz
-    referal yig'ib, bot balansini bo'shatishning oldini olish — bitta
-    telefon raqamiga faqat bitta akkaunt ro'yxatga olinadi.
-
-    Telegram bot API orqali foydalanuvchining real IP manzilini olish
-    IMKONI YO'Q (Telegram barcha xabarlarni o'z serverlaridan proksi
-    qiladi), shuning uchun "bir qurilma/bitta telefon = bir akkaunt"
-    cheklovi ishonchli tarzda faqat telefon raqami tasdiqlash orqali
-    amalga oshiriladi."""
+    yuborishi uchun holat. Telefon raqam tasdiqlash uchun so'raladi;
+    har bir Telegram akkaunti o'z raqamiga ega — takroriy raqam cheklovi yo'q."""
     waiting_phone = State()
 
 
@@ -608,8 +601,7 @@ async def set_user_phone(telegram_id: int, phone: str) -> None:
 
 
 async def get_user_by_phone(phone: str) -> dict | None:
-    """Bu telefon raqami oldin ro'yxatdan o'tganmi? — 'bitta telefon = bitta
-    akkaunt' cheklovi aynan shu funksiya orqali amalga oshiriladi."""
+    """Telefon raqami bo'yicha foydalanuvchini topish (statistika/admin uchun)."""
     normalized = normalize_phone(phone)
     if not normalized:
         return None
@@ -1689,9 +1681,9 @@ def shop_items_keyboard(category: str) -> InlineKeyboardMarkup:
 
 def phone_verify_keyboard() -> ReplyKeyboardMarkup:
     """Telefon raqamni yuborish tugmasi. Telegram'da bu tugma foydalanuvchining
-    qurilmasidagi haqiqiy telefon raqamini (SIM kartasi) botga yuboradi —
-    bitta telefon raqamiga faqat bitta akkaunt ro'yxatga olinishi shu orqali
-    ta'minlanadi."""
+    qurilmasidagi haqiqiy telefon raqamini (SIM kartasi) botga yuboradi.
+    Har bir Telegram akkaunti o'z raqamiga ega — bitta raqam bilan istalgancha
+    akkaunt ochish mumkin (chegara yo'q)."""
     kb = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="📱 Telefon raqamini yuborish", request_contact=True)]],
         resize_keyboard=True,
@@ -1703,15 +1695,13 @@ def phone_verify_keyboard() -> ReplyKeyboardMarkup:
 async def prompt_phone_verification(message: Message, state: FSMContext) -> None:
     """Yangi/tekshirilmagan foydalanuvchidan telefon raqamini so'raydi.
 
-    Nega kerak: Telegram bot API orqali real IP ko'rinmagani uchun soxta
-    akkauntlar bilan cheksiz referal yig'ishning oldini olishning ishonchli
-    yo'li — telefon raqami. Taklif qiluvchi (referrer) referal tugaguncha
-    FSM xotirasida saqlanadi va raqam tasdiqlangach ishlatiladi."""
+    Raqam faqat tasdiqlash uchun so'raladi (kontakt sifatida) — 'bitta telefon =
+    bitta akkaunt' cheklovi endi yo'q. Taklif qiluvchi (referrer) referal
+    tugaguncha FSM xotirasida saqlanadi va raqam tasdiqlangach ishlatiladi."""
     await state.set_state(PhoneVerifyStates.waiting_phone)
     await message.answer(
         "📱 <b>Raqamingizni tasdiqlang</b>\n\n"
-        "Soxta akkauntlar bilan bot balansini bo'shatilishining oldini olish "
-        "uchun bitta telefon raqamiga faqat bitta akkaunt ro'yxatga olinadi.\n\n"
+        "Botdan to'liq foydalanish uchun telefon raqamingizni tasdiqlash zarur.\n\n"
         "Quyidagi tugmani bosing — raqamingiz avtomatik yuboriladi 👇",
         reply_markup=phone_verify_keyboard(),
     )
@@ -1821,7 +1811,7 @@ async def check_sub_handler(call: CallbackQuery, bot: Bot, state: FSMContext) ->
 
     user = await get_user(call.from_user.id)
     # Ro'yxatdan o'tmagan yoki telefon raqami hali tasdiqlanmagan foydalanuvchi
-    # ('bitta telefon = bitta akkaunt' himoyasi) — avval raqam so'raymiz.
+    # — avval raqam so'raymiz.
     if not user or not user.get("phone_number"):
         if ref and ref != call.from_user.id:
             await set_pending_referral(call.from_user.id, ref)
@@ -1840,8 +1830,9 @@ async def check_sub_handler(call: CallbackQuery, bot: Bot, state: FSMContext) ->
 
 
 async def _finish_phone_verification(message: Message, state: FSMContext, phone_raw: str, friend_name: str) -> None:
-    """Telefon raqam qabul qilindi — 'bitta telefon = bitta akkaunt' tekshiruvi
-    va (yangi bo'lsa) ro'yxatga olish + referal mukofoti shu yerda yakunlanadi."""
+    """Telefon raqam qabul qilindi — (yangi bo'lsa) ro'yxatga olish + referal
+    mukofoti shu yerda yakunlanadi. Bitta raqam bilan istalgancha akkaunt
+    ochish mumkin (har bir TG akkaunti o'z raqamiga ega)."""
     phone = normalize_phone(phone_raw)
     if len(phone) < 7:
         await message.answer(
@@ -1852,23 +1843,8 @@ async def _finish_phone_verification(message: Message, state: FSMContext, phone_
         )
         return
 
-    # Soxta akkaunt himoyasi: bu raqam oldin boshqa akkauntda ishlatilgan bo'lsa —
-    # ro'yxatga olinmaydi va referal ham to'lanmaydi.
-    existing = await get_user_by_phone(phone)
-    if existing and existing["telegram_id"] != message.from_user.id:
-        logger.warning(
-            "Fake akkaunt blocklandi: from=%s phone=%s existing=%s",
-            message.from_user.id, phone, existing["telegram_id"],
-        )
-        await state.clear()
-        await message.answer(
-            "🚫 <b>Bu telefon raqami allaqachon botda ro'yxatdan o'tgan.</b>\n\n"
-            "Qoidalarga ko'ra <b>bitta telefon raqamiga faqat bitta akkaunt</b> "
-            "ro'yxatga olinadi. Iltimos, haqiqiy (boshqa) raqamingiz yoki "
-            "avvalgi akkauntingiz bilan davom eting.",
-        )
-        return
-
+    # Telefon raqam saqlanadi, lekin endi 'bitta telefon = bitta akkaunt'
+    # chegarasi yo'q — har bir Telegram akkaunti o'z raqamiga ega.
     data = await state.get_data()
     referrer_id = data.get("phone_pending_referrer") or 0
     if not referrer_id:
