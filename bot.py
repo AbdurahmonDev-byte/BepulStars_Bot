@@ -162,7 +162,7 @@ dp = Dispatcher()
 
 class SettingsStates(StatesGroup):
     """Admin sozlamalarni matn orqali o'zgartirishi uchun."""
-    ref_spin = State()        # har nechta referalga 1 ta aylantirish
+    ref_reward = State()      # har bir referal uchun ⭐ mukofot
     min_referals = State()    # xarid uchun minimal referallar
     min_withdraw = State()    # yulduz yechish uchun minimal
     pay_card = State()        # to'lov karta raqami
@@ -274,7 +274,7 @@ async def db_init() -> None:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
-                ref_reward_stars INTEGER NOT NULL DEFAULT 5,
+                ref_reward_stars INTEGER NOT NULL DEFAULT 2,
                 min_referals_required INTEGER NOT NULL DEFAULT 3,
                 min_withdraw_stars INTEGER NOT NULL DEFAULT 100,
                 pay_card TEXT NOT NULL DEFAULT '9860180104681937',
@@ -478,11 +478,17 @@ async def db_init() -> None:
             except aiosqlite.OperationalError:
                 pass  # ustun allaqachon mavjud
 
+        # Endi referal mukofoti ⭐ bilan to'lanadi: eski 'defolt 5' o'rniga
+        # yangi defolt 2 qo'yiladi (admin panelda o'zgartiriladi).
+        await db.execute(
+            "UPDATE settings SET ref_reward_stars = 2 WHERE id = 1 AND ref_reward_stars = 5"
+        )
+
         # Default sozlamalar (faqat birinchi marta)
         await db.execute("""
             INSERT OR IGNORE INTO settings (id, ref_reward_stars, min_referals_required,
                                             min_withdraw_stars, pay_card)
-            VALUES (1, 5, 3, 100, '9860180104681937')
+            VALUES (1, 2, 3, 100, '9860180104681937')
         """)
 
         # Default boxlar (faqat birinchi marta)
@@ -494,16 +500,12 @@ async def db_init() -> None:
                 ('daily', '📦 Kunlik box', 1, 0, 10, 0.0, 1, 'gift', 1, 'Mukofot: 0–10 ⭐'),
                 ('gift', '🎁 Gift box', 50, 10, 60, 0.5, 2, 'gift', 0, 'Mukofot: 10–60 ⭐ yoki arzonroq 2 giftdan biri'),
                 ('nft', '🖼 NFT box', 100, 60, 120, 0.5, 4, 'gift', 0, 'Mukofot: 60–120 ⭐ yoki arzonroq 4 giftdan biri'),
-                ('mega', '💎 Mega box', 200, 120, 250, 0.5, 4, 'premium', 0, 'Mukofot: 120–250 ⭐ yoki premium'),
-                ('spin', '📦 Referal box', 0, 5, 20, 0.15, 1, 'gift', 0, 'Referal evaziga ochiladi — yutuq: 5–20 ⭐ yoki gift')
+                ('mega', '💎 Mega box', 200, 120, 250, 0.5, 4, 'premium', 0, 'Mukofot: 120–250 ⭐ yoki premium')
         """)
 
-        # Eski DB'larda '🎡 Jekpot aylantirish' nomi qolgan bo'lishi mumkin — qayta nomlash
-        await db.execute("""
-            UPDATE boxes SET name = '📦 Referal box',
-                            desc_text = 'Referal evaziga ochiladi — yutuq: 5–20 ⭐ yoki gift'
-            WHERE box_id = 'spin'
-        """)
+        # 'Referal box' (spin) tizimi olib tashlandi — eski DB'larda qolgan
+        # qator ham o'chiriladi (referal mukofoti endi to'g'ridan-to'g'ri ⭐).
+        await db.execute("DELETE FROM boxes WHERE box_id = 'spin'")
 
         # Namuna mahsulotlar (faqat birinchi marta)
         await db.execute("""
@@ -544,7 +546,7 @@ async def get_settings() -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT ref_reward_stars, min_referals_required, min_withdraw_stars, pay_card, reviews_channel, nft_group, gift_caption, max_referrals_per_day, refs_per_spin FROM settings WHERE id = 1"
+            "SELECT ref_reward_stars, min_referals_required, min_withdraw_stars, pay_card, reviews_channel, nft_group, gift_caption, max_referrals_per_day FROM settings WHERE id = 1"
         )
         row = await cur.fetchone()
         return dict(row) if row else None
@@ -671,25 +673,6 @@ async def increment_referals(telegram_id: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE users SET referals_count = referals_count + 1 WHERE telegram_id = ?", (telegram_id,))
         await db.commit()
-
-
-async def add_free_spins(telegram_id: int, count: int) -> None:
-    """Foydalanuvchiga erkin jekpot aylantirishlar sonini qo'shadi."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET free_spins = free_spins + ? WHERE telegram_id = ?", (count, telegram_id))
-        await db.commit()
-
-
-async def consume_free_spin(telegram_id: int) -> bool:
-    """Bitta erkin aylantirishni konsum qiladi — ATOMIK (WHERE free_spins > 0).
-    Yetarli aylantirish bo'lmasa False qaytaradi, ayirish ham qilmaydi."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "UPDATE users SET free_spins = free_spins - 1 WHERE telegram_id = ? AND free_spins > 0",
-            (telegram_id,),
-        )
-        await db.commit()
-        return cur.rowcount > 0
 
 
 async def get_referrals_today_count(referrer_id: int) -> int:
@@ -1530,8 +1513,9 @@ async def register_user_with_referral(telegram_id: int, referrer_id: int | None,
     await add_user(telegram_id, referrer["telegram_id"] if referrer else None, phone_number=phone_number)
     user = await get_user(telegram_id)
 
-    # Referal mukofoti: ⭐ emas — erkin jekpot aylantirish (free_spins) har
-    # refs_per_spin referalga 1 ta beriladi + referals_count.
+    # Referal mukofoti: har bir qabul qilingan do'st uchun settings'dagi
+    # ref_reward_stars (default 2) ⭐ referrer balansiga qo'shiladi — qiymatni
+    # admin panelning Sozlamalar bo'limida o'zgartirish mumkin.
     # Kunlik chegara — bitta odam soxta akkountlar bilan cheksiz "nakrutka"
     # qilib bot balansini bo'shatib qo'yishining oldini oladi: chegaradan
     # oshgan referallar RO'YXATGA OLINADI (statistikada ko'rinadi), lekin
@@ -1549,13 +1533,13 @@ async def register_user_with_referral(telegram_id: int, referrer_id: int | None,
                 )
                 return user, True
 
-        refs_per_spin = settings.get("refs_per_spin") or 0
+        reward = settings.get("ref_reward_stars") or 0
         new_count = referrer["referals_count"] + 1
         await increment_referals(referrer["telegram_id"])
-        if refs_per_spin > 0 and new_count % refs_per_spin == 0:
-            await add_free_spins(referrer["telegram_id"], 1)
+        if reward > 0:
+            await add_stars(referrer["telegram_id"], reward)
         try:
-            await bot_notify_referrer(referrer["telegram_id"], friend_name or str(telegram_id), refs_per_spin, new_count)
+            await bot_notify_referrer(referrer["telegram_id"], friend_name or str(telegram_id), reward, new_count)
         except Exception as e:
             logger.warning("Referrer ogohlantirish xatosi: %s", e)
 
@@ -1566,24 +1550,22 @@ async def register_user_with_referral(telegram_id: int, referrer_id: int | None,
 _bot: Bot | None = None
 
 
-async def bot_notify_referrer(referrer_id: int, friend_name: str, refs_per_spin: int, ref_count: int) -> None:
-    """Referal qabul qilinganda referrerga xabar (ism-familiya bilan).
-
-    Referal ⭐ bermaydi — har refs_per_spin referalga bitta 📦 Referal box
-    ochish bepul yig'iladi."""
+async def bot_notify_referrer(referrer_id: int, friend_name: str, reward_stars: int, ref_count: int) -> None:
+    """Referal qabul qilinganda referrerga xabar (ism + ⭐ mukofot)."""
     if _bot is None:
         return
-    if refs_per_spin > 0 and ref_count % refs_per_spin == 0:
+    if reward_stars and reward_stars > 0:
         text = (
             f"🎉 <b>Tabriklaymiz!</b>\n"
             f"Yangi referal: <b>{friend_name}</b>\n"
-            f"📦 <b>Referal box: +1</b> (har {refs_per_spin} referalga 1 marta bepul)"
+            f"💰 Balansingizga <b>+{reward_stars} ⭐</b> qo'shildi!\n"
+            f"👥 Jami referallar: <b>{ref_count}</b>"
         )
     else:
         text = (
             f"🔔 <b>Yangi referal!</b>\n"
             f"Do'stingiz <b>{friend_name}</b> qabul qilindi.\n"
-            f"📦 Referal box uchun yana <b>{refs_per_spin - (ref_count % refs_per_spin)}</b> referal kerak ({ref_count % refs_per_spin}/{refs_per_spin})"
+            f"👥 Jami referallar: <b>{ref_count}</b>"
         )
     try:
         await _bot.send_message(referrer_id, text)
@@ -1867,10 +1849,13 @@ async def referral_handler(message: Message, bot: Bot) -> None:
     kb.button(text="📤 Do'stlarga ulashish", url=share_url)
     kb.button(text="🔗 Havolani nusxalash", copy_text=CopyTextButton(text=ref_link))
 
+    settings = await get_settings()
+
     await message.answer(
         f"🔗 <b>Referal havolangiz</b>\n\n"
         f"{ref_link}\n\n"
-        f"Shu havolani do'stlaringizga yuboring. Har bir yangi a'zo uchun bonus olasiz! ⭐",
+        f"Shu havolani do'stlaringizga yuboring. Har bir yangi a'zo uchun "
+        f"balansingizga <b>{settings['ref_reward_stars']} ⭐</b> qo'shiladi!",
         reply_markup=kb.as_markup(),
     )
 
@@ -2719,17 +2704,9 @@ async def show_boxes(answer_func, telegram_id: int, result_text: str | None = No
     user = await get_user(telegram_id)
     today = datetime.now().strftime("%Y-%m-%d")
     boxes = await get_all_boxes()
-    refs_per_spin = (await get_settings()).get("refs_per_spin") or 0
 
     kb = InlineKeyboardBuilder()
     for b in boxes:
-        if b["box_id"] == "spin":
-            if user:
-                kb.button(
-                    text=f"{b['name']} — {user['free_spins']} marta bepul",
-                    callback_data="box_open:spin",
-                )
-            continue
         kb.button(text=f"{b['name']} — {b['cost']} ⭐ (balans)", callback_data=f"box_open:{b['box_id']}")
         if b["cost_tgstars"] > 0:
             bonus = b.get("tgstars_bonus_percent") or 0
@@ -2741,13 +2718,6 @@ async def show_boxes(answer_func, telegram_id: int, result_text: str | None = No
 
     text = "🎰 <b>BOXLAR</b>\n\nQaysi boxni ochasiz?\n\n"
     for b in boxes:
-        if b["box_id"] == "spin":
-            spins = user["free_spins"] if user else 0
-            line = f"{b['name']} — <b>{spins} marta bepul</b>\n{b['desc_text']}"
-            if refs_per_spin > 0:
-                line += f"\n(har {refs_per_spin} referalga +1)"
-            text += f"{line}\n\n"
-            continue
         price_line = f"{b['cost']} ⭐ (balans)"
         bonus = b.get("tgstars_bonus_percent") or 0
         if b["cost_tgstars"] > 0:
@@ -3352,8 +3322,7 @@ async def gift_variant_choice_callback(call: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(F.data.startswith("box_open:"))
 async def box_open_callback(call: CallbackQuery, bot: Bot) -> None:
-    """Boxni bot balansidagi (ichki) ⭐ bilan ochish. 'spin' (Referal box)
-    pul talab qilmaydi — referal evaziga yig'ilgan bepul marta konsum qilinadi."""
+    """Boxni bot balansidagi (ichki) ⭐ bilan ochish."""
     box_id = call.data.split(":")[1]
     box = await get_box(box_id)
     if not box:
@@ -3371,30 +3340,20 @@ async def box_open_callback(call: CallbackQuery, bot: Bot) -> None:
             await call.answer("❌ Kunlik boxni bugun ishlatgansiz! Ertaga qayta oching.", show_alert=True)
             return
 
-    if box_id == "spin":
-        if not await consume_free_spin(call.from_user.id):
-            refs_per_spin = (await get_settings()).get("refs_per_spin") or 0
-            hint = f" Har {refs_per_spin} referalga +1." if refs_per_spin > 0 else ""
-            await call.answer(f"❌ Referal box uchun bepul marta yetarli emas!{hint}", show_alert=True)
-            return
-        result = await open_box_and_award(
-            bot, box, call.from_user.id, call.from_user.first_name, call.from_user.username,
-        )
-    else:
-        if user["balance_stars"] < box["cost"]:
-            await call.answer(f"❌ Balans yetarli emas! Kerak: {box['cost']} ⭐", show_alert=True)
-            return
+    if user["balance_stars"] < box["cost"]:
+        await call.answer(f"❌ Balans yetarli emas! Kerak: {box['cost']} ⭐", show_alert=True)
+        return
 
-        # Box narxini ayiramiz
-        if not await deduct_stars(call.from_user.id, box["cost"]):
-            await call.answer(f"❌ Balans yetarli emas! Kerak: {box['cost']} ⭐", show_alert=True)
-            return
-        if box["once_per_day"]:
-            await set_daily_box_used(call.from_user.id, today)
+    # Box narxini ayiramiz
+    if not await deduct_stars(call.from_user.id, box["cost"]):
+        await call.answer(f"❌ Balans yetarli emas! Kerak: {box['cost']} ⭐", show_alert=True)
+        return
+    if box["once_per_day"]:
+        await set_daily_box_used(call.from_user.id, today)
 
-        result = await open_box_and_award(
-            bot, box, call.from_user.id, call.from_user.first_name, call.from_user.username,
-        )
+    result = await open_box_and_award(
+        bot, box, call.from_user.id, call.from_user.first_name, call.from_user.username,
+    )
 
     await call.answer("🎉 Box ochildi!", show_alert=False)
     try:
@@ -3416,9 +3375,6 @@ async def box_open_tgstars_callback(call: CallbackQuery, bot: Bot) -> None:
     """Boxni haqiqiy Telegram Stars bilan ochish uchun invoys yuboradi —
     to'lov muvaffaqiyatli o'tgach, box successful_payment_handler'da ochiladi."""
     box_id = call.data.split(":")[1]
-    if box_id == "spin":
-        await call.answer("❌ Bu aylantirish faqat '🎡 Aylantirish' tugmasi orqali ishlaydi!", show_alert=True)
-        return
     box = await get_box(box_id)
     if not box:
         await call.answer("❌ Box topilmadi!", show_alert=True)
@@ -3455,25 +3411,6 @@ async def box_open_tgstars_callback(call: CallbackQuery, bot: Bot) -> None:
     await call.answer()
 
 
-async def _get_spin_box() -> dict:
-    """Referal evaziga ochiladigan box (ichki nomi 'spin')."""
-    box = await get_box("spin")
-    if box:
-        return box
-    return {
-        "box_id": "spin",
-        "name": "📦 Referal box",
-        "cost": 0,
-        "star_min": 5,
-        "star_max": 20,
-        "gift_drop_prob": 0.15,
-        "gift_pool_size": 1,
-        "gift_category": "gift",
-        "once_per_day": 0,
-        "desc_text": "Referal evaziga ochiladi",
-    }
-
-
 @router.message(F.text == "ℹ️ Bot haqida")
 async def about_bot_handler(message: Message) -> None:
     """Bot va Mini App qanday ishlashi haqida qisqa qo'llanma."""
@@ -3482,8 +3419,8 @@ async def about_bot_handler(message: Message) -> None:
         "ℹ️ <b>Bot haqida — qanday ishlaydi?</b>\n\n"
         "⭐ <b>Yulduz qanday topiladi?</b>\n"
         f"• Do'stlaringizni <b>🔗 Referal</b> havolangiz orqali taklif qiling — "
-        f"har <b>{settings['refs_per_spin']}</b> referal uchun <b>📦 Referal box</b> ochish "
-        f"(5–20 ⭐ yoki gift) bepul beriladi "
+        f"har bir qabul qilingan do'st uchun balansingizga "
+        f"<b>{settings['ref_reward_stars']} ⭐</b> qo'shiladi "
         f"(do'stingiz majburiy kanallarga a'zo bo'lishi shart).\n"
         "• <b>🎰 Jekpot</b> boxlarini oching — tasodifiy miqdorda ⭐ yoki gift yutib olasiz.\n\n"
         "🛍️ <b>Do'kon</b>\n"
@@ -4986,7 +4923,7 @@ async def admin_stats(call: CallbackQuery) -> None:
     text = (
         f"📊 <b>Statistika</b>\n\n"
         f"👥 Jami foydalanuvchilar: <b>{len(users)}</b>\n"
-        f"📦 Referal box: har {settings['refs_per_spin']} referalga 1 marta\n"
+        f"⭐ Referal mukofoti: <b>{settings['ref_reward_stars']} ⭐</b>/referal\n"
         f"👥 Min. referallar: {settings['min_referals_required']}\n"
         f"💸 Yechish minimumi: {settings['min_withdraw_stars']}"
     )
@@ -5004,7 +4941,7 @@ def back_to_admin_keyboard() -> InlineKeyboardMarkup:
 
 def settings_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="📦 Referal box (har nechta referalga)", callback_data="admin:set:ref_spin")
+    kb.button(text="⭐ Referal mukofoti (⭐/referal)", callback_data="admin:set:ref_reward")
     kb.button(text="👥 Min. referallar", callback_data="admin:set:min_ref")
     kb.button(text="🚫 Kunlik referal chegarasi", callback_data="admin:set:max_ref_daily")
     kb.button(text="💸 Yulduz yechish minimumi", callback_data="admin:set:min_withdraw")
@@ -5028,7 +4965,7 @@ async def admin_settings(call: CallbackQuery) -> None:
     gift_caption_display = s["gift_caption"] or DEFAULT_GIFT_CAPTION
     text = (
         f"⚙️ <b>Sozlamalar</b>\n\n"
-        f"📦 Referal box: har <b>{s['refs_per_spin']}</b> referalga 1 marta bepul\n"
+        f"⭐ Referal mukofoti: har bir referal uchun <b>{s['ref_reward_stars']} ⭐</b>\n"
         f"👥 Xarid uchun min. referallar: <b>{s['min_referals_required']}</b>\n"
         f"🚫 Kunlik referal chegarasi: <b>{s['max_referrals_per_day'] if s['max_referrals_per_day'] > 0 else 'cheklanmagan'}</b>\n"
         f"💸 Yulduz yechish minimumi: <b>{s['min_withdraw_stars']} ⭐</b>\n"
@@ -5042,22 +4979,22 @@ async def admin_settings(call: CallbackQuery) -> None:
     await call.answer()
 
 
-@router.callback_query(F.data == "admin:set:ref_spin")
-async def set_ref_spin(call: CallbackQuery, state: FSMContext) -> None:
+@router.callback_query(F.data == "admin:set:ref_reward")
+async def set_ref_reward(call: CallbackQuery, state: FSMContext) -> None:
     if not is_admin(call.from_user.id):
         await call.answer("❌ Siz admin emassiz!", show_alert=True)
         return
-    await state.set_state(SettingsStates.ref_spin)
+    await state.set_state(SettingsStates.ref_reward)
     await call.message.edit_text(
-        "✏️ <b>Har nechta referalga 1 marta Referal box berishini yozing:</b>\n"
-        "(masalan 2 — har 2 referal uchun 1 marta bepul 📦 Referal box)\n"
-        "0 kiritsangiz — Referal box berilmaydi",
+        "✏️ <b>Har bir yangi referal uchun nechta ⭐ berilishini yozing:</b>\n"
+        "(masalan 2 — har bir taklif qilingan do'st uchun balansga 2 ⭐)\n"
+        "0 kiritsangiz — referal mukofoti berilmaydi",
     )
     await call.answer()
 
 
-@router.message(SettingsStates.ref_spin)
-async def ref_spin_input(message: Message, state: FSMContext) -> None:
+@router.message(SettingsStates.ref_reward)
+async def ref_reward_input(message: Message, state: FSMContext) -> None:
     try:
         value = int(message.text)
     except ValueError:
@@ -5066,10 +5003,10 @@ async def ref_spin_input(message: Message, state: FSMContext) -> None:
     if value < 0:
         await message.answer("❌ Manfiy bo'lishi mumkin emas!")
         return
-    await update_settings(refs_per_spin=value)
+    await update_settings(ref_reward_stars=value)
     await state.clear()
     await message.answer(
-        f"✅ Referal box sozlandi: har <b>{value}</b> referalga 1 marta bepul"
+        f"✅ Referal mukofoti sozlandi: har bir referal uchun <b>{value} ⭐</b>"
         + (" (0 — berilmaydi)" if value == 0 else ""),
         reply_markup=admin_keyboard(),
     )
@@ -7076,9 +7013,9 @@ function renderAbout() {
   const body = document.getElementById('aboutBody');
   body.innerHTML = `
     <p><b>⭐ Yulduz qanday topiladi?</b><br>
-    Do'stlaringizni referal havolangiz orqali taklif qiling — har
-    <b>${INFO.refs_per_spin || 2}</b> referal uchun <b>1 ta 🎡 Jekpot aylantirish</b>
-    olasiz. Shuningdek 🎰 Jekpot boxlarini oching —
+    Do'stlaringizni referal havolangiz orqali taklif qiling — har bir qabul
+    qilingan do'st uchun balansingizga <b>${INFO.ref_reward_stars || 2} ⭐</b>
+    qo'shiladi. Shuningdek 🎰 Jekpot boxlarini oching —
     tasodifiy miqdorda ⭐ yoki gift yutib olasiz.</p>
     <p><b>🛍️ Do'kon</b><br>
     Gift, Premium va boshqa mahsulotlarni 3 xil usulda sotib olish mumkin: ichki ⭐
@@ -7307,13 +7244,8 @@ function boxCard(box) {
   const card = document.createElement('div');
   card.className = 'card jackpot' + (box.locked ? ' locked' : '');
   const hasBonus = box.cost_tgstars > 0 && box.tgstars_bonus_percent > 0;
-  const isSpin = box.id === 'spin';
-  const spins = isSpin ? ((USER && USER.free_spins) || 0) : 0;
-  const refsPer = (SHOP.settings && SHOP.settings.refs_per_spin) || 2;
   let buttons = '';
-  if (isSpin) {
-    buttons = `<button data-act="balance">🎡 Aylantirish (${spins})</button>`;
-  } else if (!box.locked) {
+  if (!box.locked) {
     buttons += `<button data-act="balance">⭐ Ochish (${box.cost})</button>`;
     if (box.cost_tgstars > 0) {
       buttons += hasBonus
@@ -7321,18 +7253,16 @@ function boxCard(box) {
         : `<button data-act="tgstars" class="stars">✨ Stars (${box.cost_tgstars})</button>`;
     }
   }
-  let statusLine = `<div class="btnrow">${buttons}</div>`;
+let statusLine = `<div class="btnrow">${buttons}</div>`;
   if (box.locked) {
     statusLine = '<div class="lock-badge">✅ Bugun ishlatilgan — ertaga qayta oching</div>';
-  } else if (isSpin && !(spins > 0)) {
-    statusLine = '<div class="lock-badge">📦 Referal taklif qilib erkin marta yig\\'ing</div>';
   }
   card.innerHTML = `
     <div class="icon-tile">🎰</div>
     <div class="name">${box.name}</div>
     <div class="desc">${box.desc || ''}</div>
-    ${hasBonus && !isSpin ? `<div class="bonus-badge">🚀 Telegram Stars bilan olsangiz — gift yutish imkoniyati +${box.tgstars_bonus_percent}% katta!</div>` : ''}
-    <div class="price">${isSpin ? `${spins} ta erkin aylantirish<small>har ${refsPer} referalga +1</small>` : `${box.cost} ⭐${box.cost_tgstars > 0 ? ` <small>yoki</small> ${box.cost_tgstars} 💫` : ''}`}</div>
+    ${hasBonus ? `<div class="bonus-badge">🚀 Telegram Stars bilan olsangiz — gift yutish imkoniyati +${box.tgstars_bonus_percent}% katta!</div>` : ''}
+    <div class="price">${box.cost} ⭐${box.cost_tgstars > 0 ? ` <small>yoki</small> ${box.cost_tgstars} 💫` : ''}</div>
     ${statusLine}
   `;
   card.querySelectorAll('button').forEach(btn => {
@@ -8248,7 +8178,7 @@ async def webapp_info_handler(request):
         "contacts": [{"label": c["label"], "username": c["username"].lstrip("@")} for c in contacts],
         "reviews_url": channel_url(s["reviews_channel"]) if s["reviews_channel"] else None,
         "min_withdraw_stars": s["min_withdraw_stars"],
-        "refs_per_spin": s["refs_per_spin"],
+        "ref_reward_stars": s["ref_reward_stars"],
         "min_referals_required": s["min_referals_required"],
     })
 
@@ -8305,7 +8235,7 @@ async def webapp_shop_api_handler(request):
         "boxes": boxes,
         "shop_promos": shop_promos,
         "nft": {"group_url": channel_url(s["nft_group"]) if s["nft_group"] else None},
-        "settings": {"pay_card": format_card(s["pay_card"]), "refs_per_spin": s["refs_per_spin"]},
+        "settings": {"pay_card": format_card(s["pay_card"])},
         "server_date": datetime.now().strftime("%Y-%m-%d"),
     })
 
@@ -8473,27 +8403,17 @@ async def webapp_buy_balance_handler(request):
         if box["once_per_day"] and user["last_daily_box"] == today:
             return web.json_response({"error": "Kunlik boxni bugun ishlatgansiz! Ertaga qayta oching."}, status=403)
 
-        if box["box_id"] == "spin":
-            if not await consume_free_spin(telegram_id):
-                refs_per_spin = (await get_settings()).get("refs_per_spin") or 0
-                hint = f" Har {refs_per_spin} referalga +1." if refs_per_spin > 0 else ""
-                return web.json_response({
-                    "error": f"Referal box uchun bepul marta yetarli emas!{hint}",
-                }, status=400)
-            result = await open_box_and_award(_bot, box, telegram_id, first_name, username)
-        else:
-            if user["balance_stars"] < box["cost"]:
-                return web.json_response({"error": f"Balans yetarli emas! Kerak: {box['cost']} ⭐"}, status=402)
+        if user["balance_stars"] < box["cost"]:
+            return web.json_response({"error": f"Balans yetarli emas! Kerak: {box['cost']} ⭐"}, status=402)
 
-            if not await deduct_stars(telegram_id, box["cost"]):
-                return web.json_response({"error": f"Balans yetarli emas! Kerak: {box['cost']} ⭐"}, status=402)
-            if box["once_per_day"]:
-                await set_daily_box_used(telegram_id, today)
+        if not await deduct_stars(telegram_id, box["cost"]):
+            return web.json_response({"error": f"Balans yetarli emas! Kerak: {box['cost']} ⭐"}, status=402)
+        if box["once_per_day"]:
+            await set_daily_box_used(telegram_id, today)
 
-            result = await open_box_and_award(_bot, box, telegram_id, first_name, username)
+        result = await open_box_and_award(_bot, box, telegram_id, first_name, username)
 
         has_auto_delivery = await _gift_claim_has_auto_delivery(result["claim_id"]) if result["claim_id"] else False
-        db_user = await get_user(telegram_id)
         return web.json_response({
             "ok": True,
             "message": result["text"],
@@ -8502,7 +8422,6 @@ async def webapp_buy_balance_handler(request):
             "claim_id": result["claim_id"],
             "gift_price_stars": result["gift_price_stars"],
             "has_auto_delivery": has_auto_delivery,
-            "free_spins": db_user["free_spins"] if db_user else 0,
         })
 
     return web.json_response({"error": "Noma'lum turi"}, status=400)
